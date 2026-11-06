@@ -1,0 +1,107 @@
+#pragma once
+#include <string>
+
+//! Solid hands and held weapons ([Gameplay] HandCollision / WeaponCollision / PushObjects).
+//!
+//! The real controller cannot be stopped, so the DRAWN hand -- and the sword or gun in it, as one rigid piece -- stops
+//! at what it meets and catches up when the real hand comes back. Two halves:
+//!  - the game thread (Tick, once a frame from HandAimHook's aim update, where GunRay already traces): each point of a
+//!    hand (the palm) and of its item (samples along the weapon model's box) is swept with the game's own Havok ray
+//!    casts (hknpWorld::castRay, exe+0xD0C700, the query the line-of-sight check exe+0x68B3C0 builds) from where it was
+//!    drawn last frame to where the controller puts it now, sliding along what it hits. Every surface met becomes a
+//!    contact plane tied to that point in the hand's frame. Loose physics props met that way are pushed with the game's
+//!    own impulse message (0x100 in DOTO, 0xFA in D2, what Windblast and the damage knockback post);
+//!  - the render thread (Apply, from GpuTrace where each view poses the hands): the hand's translation is pushed out of
+//!    those planes using THIS view's controller pose, so the stop is exact and does not lag a frame behind.
+//! Characters' bodies stop the blade too: SwordContact turns the raw blade's penetration of the bone capsules it strikes
+//! with into contact planes (SetBodyContacts), so a strike still lands from the real swing while the drawn blade halts.
+namespace Collision
+{
+    //! A plane the point `local` (in the hand's frame: x along the controller's forward, y left, z up) must stay
+    //! `clear` metres in front of: dot(world(local) - p, n) >= clear.
+    struct Contact { float local[3]; float p[3]; float n[3]; float clear; };
+
+    void SetHands(bool on);                    //!< [Gameplay] HandCollision
+    void SetWeapons(bool on);                  //!< [Gameplay] WeaponCollision (the sword, the left hand's guns, characters' bodies)
+    void SetPush(bool on, float handMass);     //!< [Gameplay] PushObjects / PushStrength (the hand's effective mass, kg)
+    void SetDoors(bool on);                    //!< [Gameplay] PushDoors: a hand pushing a door opens it (the game's own push)
+    //! [Gameplay] PhysicalPickup: items (loot, mission items) are taken by grabbing them and putting them behind the back
+    //! (or to the mouth); the interact from afar does not take them.
+    void SetItems(bool on);
+    //! [Gameplay] SwipeDials: a hand sliding up / down on a safe's dial turns it a digit up / down (the game's own steps).
+    void SetDials(bool on);
+    //! [Gameplay] SlideWindows: a hand sliding up on a window (a door / openable whose level name holds "window") raises
+    //! it, sliding down lowers it -- the game's interact.
+    void SetWindows(bool on);
+    //! [Gameplay.Interaction] TouchToUse: buttons, switches and levers by hand -- an empty hand poking into one, or its
+    //! grip closed on one and pulled -- the game's interact on it (only if the sensor, aimed there, picks it).
+    void SetUsables(bool on);
+    //! [Gameplay.Interaction] ClimbByHand: both hands on a top edge at chest height or above (resting on it), then pulled
+    //! down 10 cm (as when pulling yourself up): the game's jump -- its climb onto the ledge, if it has one there.
+    void SetClimb(bool on);
+    //! KbmInject: a climb was asked for (once).
+    bool TakeClimbRequest();
+    //! The game's interact on an entity, aimed at a world point (KbmInject sends it only once the sensor, aimed there,
+    //! picks that entity): what a hand's push on a door does. Game thread (NpcGestures: pickpocket, a wave to talk).
+    void RequestUse(int hand, uint32_t id, const float point[3]);
+    //! A character (a person, a creature; alive or not).
+    bool IsCharacterEnt(void* ent);
+    //! A shopkeeper (his name says so): talking to him is the shop counter's interact.
+    bool IsShopkeeper(uint32_t id);
+    bool ItemsOn();
+    //! The pointer's pick when it is an item (its id), else 0.
+    uint32_t PointerItem();
+    //! The pointer's pick when it is a drawer / cabinet (an openable, not a door): 1 open, 0 closed, -1 none; `id` its id.
+    int PointerOpenable(uint32_t* id = nullptr);
+    //! The pointer's pick when the interact would pick it up and hold it, else 0; `kind` 1 = an object held in the hand
+    //! (a bottle, a glass: arkCpntPickable_Simple), 2 = something carried (the sensor's carry pick: a body).
+    uint32_t PointerHoldable(int* kind = nullptr);
+    //! Watch an item's entity (0 = stop): ItemPresent() = 1 while it is still in the world, 0 once it is gone (taken),
+    //! -1 not checked yet. The game thread checks once a frame.
+    void WatchItem(uint32_t id);
+    int ItemPresent();
+    //! Tell whether an item (by id) is food -- eaten where it is, never stored -- on the next Tick: ItemFood() = 2 food,
+    //! 1 kept, 0 cannot tell, -1 not yet.
+    void ClassifyItem(uint32_t id);
+    int ItemFood();
+    void SetOpenables(bool on);                //!< [Gameplay] PullToOpen: grab and pull drawers / cabinets open, push to close
+    //! What a hand touched this frame (its first contact with an entity), fresh within ~0.1 s.
+    struct Touch { bool valid = false; void* ent = nullptr; uint32_t id = 0; bool openable = false, open = false, item = false; float n[3] = {}, p[3] = {}; };
+    bool Touched(int hand, Touch& out);
+    //! A hand asks for the game's interact on an entity (an open door pushed, a window slid): its id and the world
+    //! point the hand met it at (KbmInject aims the interaction sensor there and presses interact), once.
+    bool TakeCloseRequest(int hand, uint32_t* id, float point[3] = nullptr);
+    //! That entity is a sliding window (or its handle): "window" in its level name, not a door.
+    bool IsWindow(uint32_t id);
+    //! What the pointer has picked, in words (its level name, door / openable / item / ...), for the log.
+    std::string PointerDescribe();
+    //! Any entity in words (level name, C++ class and class id, door / window / openable / item / character...), for logs.
+    std::string Describe(void* ent);
+    std::string Name(void* ent);                  //!< the entity's name ('bloodfly_9543'), "" if none
+    //! The game's interact was sent on this entity (KbmInject: the trigger, a pull, a hand's push): a cabinet front's
+    //! open / closed count flips.
+    void NoteInteract(uint32_t id);
+    //! The game's impulse message to an entity (only physics-driven ones take it), at a world point.
+    void Push(void* ent, const float impulse[3], const float at[3]);
+    //! Research for a keyhole peek (logging on only): the head close to a door and facing it -- once per door per
+    //! approach, the door, where the eye is in its frame and what the interaction sensor has then. Game thread, once a frame.
+    void KeyholeProbe();
+    bool HandsOn();
+    //! The nearest wall, floor, ceiling or moving part of the level (doors, lifts) from a to b -- what the sword's sweep
+    //! takes for the world (layers 0x27, flag 0x100000: no props, characters or invisible clips). true + its distance
+    //! from a. Game thread only (Roomscale's wall fade).
+    bool WorldRay(const float a[3], const float b[3], float& dist);
+    bool WeaponsOn();
+
+    //! Game thread, once a frame.
+    void Tick();
+    //! Render thread: push a hand's world pose out of its contacts. `r` is the pose's rotation (row-major 3x3 whose
+    //! COLUMNS are fwd/left/up, GpuTrace's Rigid), `t` its translation, moved in place. `applied` gets the translation
+    //! added (zero when none). Returns true when the hand was moved.
+    bool Apply(int hand, const float r[9], float t[3], float applied[3]);
+    //! SwordContact: this frame's contacts of the raw blade with characters' bones (replaces the previous set).
+    void SetBodyContacts(int hand, const Contact* c, int n);
+    //! True while that hand's drawn pose is held back by something (for the reticle / logs).
+    bool Touching(int hand);
+    std::string Stats();
+}

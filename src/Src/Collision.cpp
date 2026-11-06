@@ -1,0 +1,1712 @@
+#include "pch.h"
+#include "Collision.h"
+#include "Probes.h"
+#include "DoorHold.h"
+#include "SoftBody.h"
+#include "BodyDrag.h"
+#include "NpcGestures.h"
+#include "AiResearch.h"
+#include "Undetected.h"
+#include "GameInfo.h"
+#include "GpuTrace.h"
+#include "HandAimHook.h"
+#include "BodyHide.h"
+#include "GrabHand.h"
+#include "VRRuntime.h"
+#include "Game.h"
+#include "PlayerState.h"
+#include "ViewMatrixHook.h"
+#include "KbmInject.h"
+#include <cmath>
+#include <algorithm>
+#include <sstream>
+#include <unordered_map>
+
+namespace
+{
+    // ---- the game's Havok ray cast (2026-10-29: exe+0x68B3C0 and exe+0x68D5D0 build the same query) ----
+    // castRay(hknpWorld*, const hknpRayCastQuery*, hknpCollisionQueryCollector*), the world at *(game+0x60410).
+    // The query (0x70): +0x00 the world's shape tag codec (world+0x9D8), +0x08 the game's filter, +0x10 u16 material
+    // 0xFFFF, +0x14 u32 filter info 0, +0x18 u64 user data 0, +0x20 u32 2 (level of detail), +0x30 the ray's origin
+    // (w 0), +0x40 its direction = to - from (w 1: the fraction), +0x50 1/direction (FLT_MAX where 0; w = 0x3F000000 |
+    // the signs: bit k = direction.k >= 0), +0x60 u32 0.
+    // The filter (0x28): vtable exe+0x1BDAF08, +0x10 u32 0x1FFFF, +0x18 u8 4, +0x20 the LAYERS a body may be on (its
+    // collision filter info & 0x1F indexes this mask), +0x24 the flags it must ALL have ((info >> 5) & f == f). The
+    // sword's world sweep ("MeleeWeaponWorld") asks layers & 0x27 with flags 0x100000, its sweep for characters
+    // ("MeleeWeaponEnemies") layers & 0x4480; the gun's trace layers 0x2F.
+    // The all-hits collector (vtable exe+0x1BD88B0): +0x0C hits found, +0x20 the early-out fraction (a vector of
+    // 1.8e19), +0x30 an hkArray of 0x70-byte results (+0x38 count, +0x3C capacity | 0x80000000 = inline storage, which
+    // follows at +0x50). A result: +0x00 the point, +0x10 the normal, +0x20 the fraction along the ray, +0x48 the hit
+    // body's id, +0x54 its shape's filter info, +0x60 its user data (-> +0x08 -> +0x10 = the entity).
+    constexpr uint32_t kGamePtr = 0x3A72280, kPhysWorld = 0x60410, kCodec = 0x9D8;
+    constexpr uint32_t kCastRay = 0xD0C700;
+    constexpr uint32_t kFilterVt = 0x1BDAF08, kFilterBaseVt = 0x1BDA488, kFilterDtor = 0xB211E0;
+    constexpr uint32_t kAllHitsVt = 0x1BD88B0, kCollectorDtor = 0xB211C0, kHeapAllocator = 0xB20FA0;
+    // The entity messages (exe+0x878CA0(queue = exe+0x877BF0() + 0xCFF0 (D2 +0xC8E8), type, payload size, entity id) -> payload):
+    // DOTO renumbered the messages (D2 in brackets): 0x100 (0xFA) = an impulse {impulse xyz, world point xyz} (Windblast exe+0x527A20, the damage knockback exe+0x81911A), sent
+    // only to entities with entity+0xD9 (D2 +0xD1) bit 3 (physics-driven) -- the test the game makes too.
+    constexpr uint32_t kMsgSystem = 0x877BF0, kMsgPost = 0x878CA0, kMsgQueue = 0xCFF0 /*0xC8E8*/, kMsgImpulse = 0x100 /*0xFA*/;
+    // Doors: an entity whose class id (vtable slot 0 -> type info +0x60) lies between the globals exe+0x3AA0930 / +4 is
+    // an arkDoor. Windblast opens one with ARK_MSG_DOOR_PUSH (0x13E; D2 0x138, payload = the pusher's entity id; exe+0x528150,
+    // chosen by that class test at exe+0x528CA5) -- the push NPCs walking through use too: the door swings away from
+    // the pusher.
+    constexpr uint32_t kDoorClassRange = 0x3AA0930, kMsgDoorPush = 0x13E /*0x138*/;
+    // Drawers, cabinets (and some doors) carry an arkCpntOpenable (type exe+0x3AA61F0, registered exe+0x145DDF0; vtable
+    // exe+0x1CDB248): +0x1E8 = open now. It is opened and closed by the player's interact on it, which applies the
+    // game's own rules (a lock component refuses it, a key opens it) -- so a hand's grab-and-pull, or its push on an open
+    // one, presses the interact (KbmInject) rather than forcing the state (exe+0x7B0F20(openable, open, animate), the
+    // script's Open / Close, checks no lock).
+    constexpr uint32_t kOpenableType = 0x3AA61F0, kOpenableIsOpen = 0x1E8, kGetComponent = 0x8E5050;
+    // Pickups: arkCpntLoot (type exe+0x3A9FF40, registered exe+0x1456910: coins, ammo, elixirs, runes, charms, keys...)
+    // and arkCpntMissionItem (type exe+0x3A9FFD0, exe+0x14569C0). Taking one is the player's interact on it.
+    constexpr uint32_t kLootType = 0x3A9FF40, kMissionItemType = 0x3A9FFD0;
+    // Safe dials: arkCpntUsableWithStateList (type exe+0x3AACB90, registered exe+0x1465BC0) with exactly 10 stages (its
+    // decl, usable+0x08: stages at +0x70, count +0x78, start +0x80; the current stage at usable+0x28, +0x30 bit 1 = turning).
+    // The script node ActionUsable steps it with exe+0x7DEA00 (next, what a click does) and exe+0x7DF2E0 (previous),
+    // both through the same transition (exe+0x7DE3B0: the dial's animation and the stage event the safe's script checks).
+    constexpr uint32_t kUsableStatesType = 0x3AACB90, kUsableNext = 0x7DEA00, kUsablePrev = 0x7DF2E0;
+    // DOTO entity layout (D2 in brackets): id/flags/model 8 bytes later, the transform block 0x10 later
+    constexpr uint32_t kEntId = 0xB0 /*0xA8*/, kEntFlags = 0xD9 /*0xD1*/, kEntVelocity = 0x34C /*0x33C*/, kEntModel = 0xF8 /*0xF0*/, kEntScale = 0x340 /*0x330*/, kModelBoundsSlot = 0x80;
+    // The layers (the game's own names, arkCollisionSettings' m_collisionLayers): 0 WORLD_LOW, 1 WORLD_LOW_HIGH,
+    // 2 WORLD_HIGH, 3 RIGID_BODY, 4 DEBRIS, 5 MOVER, 6 PLAYER, 7 PLAYER_HITBOX, 8 PLAYER_DEAD, 9 NPC,
+    // 10 NPC_BODY_ANIMATED, 11 PROJECTILE, 12 CLOTH, 13 CLOTH_COLLIDER, 14 NPC_BODY_RAGDOLL, 15 INTERACTABLE, 16 TRIGGER,
+    // 17 VISION, 18 PLAYER_PHYSICS, 19 DECAL_QUERY, 20 WEAPON_MELEE, 21 CHAIN, 22 TRIGGER_WATER, 23 PICKUP, 25 GHOST,
+    // 26 HIDDEN. The hands meet the world, loose props, movers (doors, drawers), interactables and pickups; the flag is
+    // the melee sweeps' (bodies a weapon meets).
+    constexpr uint32_t kWorldLayers = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 15) | (1u << 23);
+    constexpr uint32_t kWorldFlags = 0x100000;
+    // Loose props (fruit, cups, bottles, plates), drawers and items do not all carry that flag: reported from the
+    // headset, the hands stopped at walls and tables but went through every object. So a second cast takes the props'
+    // layers (RIGID_BODY, MOVER, INTERACTABLE, PICKUP) with no flag required, and the nearer hit of the two counts.
+    constexpr uint32_t kPropLayers = (1u << 3) | (1u << 4) | (1u << 5) | (1u << 15) | (1u << 23);
+    constexpr uint32_t kPropFlags = 0;
+
+    struct alignas(16) RayQuery
+    {
+        void* codec; const void* filter;
+        uint16_t material; uint16_t pad0; uint32_t cfi;
+        uint64_t user;
+        uint32_t lod; uint32_t pad1[3];
+        float org[4]; float dir[4]; float inv[4];
+        uint32_t id; uint32_t pad2[3];
+    };
+    static_assert(sizeof(RayQuery) == 0x70, "hknpRayCastQuery");
+    struct alignas(16) QueryFilter
+    {
+        const void* vt; uint64_t z08;
+        uint32_t a10; uint32_t pad14;
+        uint8_t b18; uint8_t pad19[7];
+        uint32_t layers; uint32_t flags;
+        uint64_t pad28;
+    };
+    static_assert(offsetof(QueryFilter, layers) == 0x20, "filter layers");
+    constexpr int kInline = 16;
+    struct alignas(16) AllHits
+    {
+        const void* vt; uint64_t q08;
+        uint8_t b10; uint8_t pad11[15];
+        float earlyOut[4];
+        uint8_t* buf; int32_t count; uint32_t cap;
+        uint8_t pad40[0x10];
+        alignas(16) uint8_t inl[kInline * 0x70];
+    };
+    static_assert(offsetof(AllHits, buf) == 0x30 && offsetof(AllHits, inl) == 0x50, "collector layout");
+
+    struct Cfg
+    {
+        float palmR = 0.045f;        // m: the palm's clearance
+        // the fingers of an empty hand (the hand's frame: x ahead, y to the left, z up), open; they draw in as it closes
+        float fingerMid = 0.06f, fingerTip = 0.095f, fingerSpread = 0.022f;
+        float fingerR = 0.025f, fingerTipR = 0.018f;
+        float itemRMin = 0.012f, itemRMax = 0.035f;
+        // m: the drawn hand further than this from the real one lets go (it passes through). Was 0.35: a fast slash or
+        // punch pushed the hand back further than that at once, and the blade or fist went through what it met (reported:
+        // "they should always collide"). Now only a safety net -- a hand left behind a wall by a teleport or a fall.
+        float maxSep = 1.5f;
+        float jumpYaw = 6.f;         // deg of the camera's yaw in one tick (a snap turn): start again from the eye
+        float jumpPos = 0.5f;        // m of the camera in one tick (a blink, a load)
+        float stale = 0.08f;         // s: contacts older than this are dropped
+        float pushMin = 0.05f;       // m/s into a prop before it is pushed
+        float pushMaxV = 6.f;        // m/s: the push's cap
+        float buzzMin = 0.12f, buzzMax = 0.7f, buzzGap = 0.15f;
+        float bodyDepth = 0.22f;     // m: the raw blade this deep in a body lets go (SwordContact applies it)
+        float doorSpeed = 0.35f;     // m/s into a door, or...
+        float doorPress = 0.04f;     // ...the real hand this far past the door's surface: a push opens it
+        float doorGap = 1.5f;        // s before the same door is pushed again
+    } C;
+
+    std::atomic<bool> g_Hands{ false }, g_Weapons{ false }, g_Push{ false }, g_Doors{ false };
+    std::atomic<float> g_HandMass{ 1.f };
+
+    double Now() { LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f); return (double)c.QuadPart / (double)f.QuadPart; }
+    float Dot(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+    float Len(const float* a) { return sqrtf(Dot(a, a)); }
+    void ToWorld(const float r[9], const float t[3], const float l[3], float w[3])
+    {   // r: columns fwd/left/up
+        for (int i = 0; i < 3; i++) w[i] = r[i * 3] * l[0] + r[i * 3 + 1] * l[1] + r[i * 3 + 2] * l[2] + t[i];
+    }
+    void ToLocal(const float r[9], const float t[3], const float w[3], float l[3])
+    {
+        const float d[3] = { w[0] - t[0], w[1] - t[1], w[2] - t[2] };
+        for (int c = 0; c < 3; c++) l[c] = r[c] * d[0] + r[3 + c] * d[1] + r[6 + c] * d[2];
+    }
+    bool Finite(const float* v, int n) { for (int i = 0; i < n; i++) if (!std::isfinite(v[i]) || fabsf(v[i]) > 1e6f) return false; return true; }
+
+    bool SafeRead(void* dst, const void* src, size_t n)
+    {
+        __try { memcpy(dst, src, n); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    void* HitEntity(const uint8_t* rec)
+    {
+        __try
+        {
+            const uint8_t* u = *(const uint8_t* const*)(rec + 0x60);
+            if (!u) return nullptr;
+            const uint8_t* o = *(const uint8_t* const*)(u + 0x08);
+            return o ? *(void* const*)(o + 0x10) : nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+
+    struct RayHit { bool hit = false; float pos[3] = {}, n[3] = {}, dist = 0.f; void* ent = nullptr; uint32_t body = 0, cfi = 0; };
+    std::atomic<uint64_t> g_Casts{ 0 }, g_CastHits{ 0 }, g_CastFaults{ 0 }, g_Skipped{ 0 };
+
+    using FnCastRay = void (*)(void*, const RayQuery*, void*);
+    using FnVoid = void (*)(void*);
+    using FnAllocator = void* (*)();
+    bool CallCast(void* world, const RayQuery* q, AllHits* c)
+    {
+        __try { ((FnCastRay)(GameInfo::Base() + kCastRay))(world, q, c); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    void FreeCollector(AllHits* c, QueryFilter* f)
+    {
+        __try
+        {
+            const uintptr_t base = GameInfo::Base();
+            if (!(c->cap & 0x80000000u) && c->buf && c->buf != c->inl)
+            {   // the results outgrew the inline storage: the array went to the heap (freed as the game frees it)
+                void* a = ((FnAllocator)(base + kHeapAllocator))();
+                using FnFree = void (*)(void*, void*, int);
+                ((FnFree)(*(void***)a)[4])(a, c->buf, (int)((c->cap & 0x3FFFFFFF) * 0x70));
+            }
+            c->buf = nullptr; c->count = 0;
+            ((FnVoid)(base + kCollectorDtor))(c);
+            f->vt = (const void*)(base + kFilterBaseVt);
+            ((FnVoid)(base + kFilterDtor))(f);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    //! The nearest hit from a to b that is not one of `skip`. Game thread only.
+    bool CastRay(const float a[3], const float b[3], uint32_t layers, uint32_t flags, void* const* skip, int nskip, RayHit& out)
+    {
+        out = RayHit{};
+        const uintptr_t base = GameInfo::Base();
+        uint8_t* game = nullptr; void* world = nullptr; void* codec = nullptr;
+        if (!SafeRead(&game, (void*)(base + kGamePtr), 8) || !game) return false;
+        if (!SafeRead(&world, game + kPhysWorld, 8) || !world) return false;
+        if (!SafeRead(&codec, (uint8_t*)world + kCodec, 8)) return false;
+
+        QueryFilter f{}; f.vt = (const void*)(base + kFilterVt); f.a10 = 0x1FFFF; f.b18 = 4; f.layers = layers; f.flags = flags;
+        RayQuery q{}; q.codec = codec; q.filter = &f; q.material = 0xFFFF; q.lod = 2;
+        float dir[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+        const float len = Len(dir);
+        if (len < 1e-5f || !Finite(a, 3) || !Finite(b, 3)) return false;
+        uint32_t signs = 0;
+        for (int k = 0; k < 3; k++)
+        {
+            q.org[k] = a[k]; q.dir[k] = dir[k];
+            if (dir[k] == 0.f) { const uint32_t big = 0x7F7FFFEE; memcpy(&q.inv[k], &big, 4); }
+            else q.inv[k] = 1.f / dir[k];
+            if (dir[k] >= 0.f) signs |= 1u << k;
+        }
+        q.org[3] = 0.f; q.dir[3] = 1.f;
+        { const uint32_t w = 0x3F000000u | signs; memcpy(&q.inv[3], &w, 4); }
+
+        AllHits c{}; c.vt = (const void*)(base + kAllHitsVt);
+        for (float& e : c.earlyOut) { const uint32_t v = 0x5F7FFFF0; memcpy(&e, &v, 4); }
+        c.buf = c.inl; c.count = 0; c.cap = 0x80000000u | kInline;
+        g_Casts++;
+        if (!CallCast(world, &q, &c)) { g_CastFaults++; return false; }
+        float bestF = 2.f; const uint8_t* best = nullptr; void* bestEnt = nullptr;
+        const int n = c.count < 0 ? 0 : (c.count > 4096 ? 4096 : c.count);
+        for (int i = 0; i < n; i++)
+        {
+            const uint8_t* rec = c.buf + (size_t)i * 0x70;
+            float fr = 2.f; if (!SafeRead(&fr, rec + 0x20, 4) || !(fr >= 0.f && fr <= 1.f) || fr >= bestF) continue;
+            void* e = HitEntity(rec);
+            bool sk = false; for (int k = 0; k < nskip; k++) if (e && e == skip[k]) sk = true;
+            if (sk) { g_Skipped++; continue; }
+            bestF = fr; best = rec; bestEnt = e;
+        }
+        if (best)
+        {
+            float p[4], nn[4]; uint32_t body = 0, cfi = 0;
+            if (SafeRead(p, best, 16) && SafeRead(nn, best + 0x10, 16) && Finite(p, 3) && Finite(nn, 3))
+            {
+                SafeRead(&body, best + 0x48, 4); SafeRead(&cfi, best + 0x54, 4);
+                out.hit = true; memcpy(out.pos, p, 12); memcpy(out.n, nn, 12);
+                const float nl = Len(out.n); if (nl > 1e-4f) for (float& v : out.n) v /= nl; else { for (int k = 0; k < 3; k++) out.n[k] = -dir[k] / len; }
+                if (Dot(out.n, dir) > 0.f) for (float& v : out.n) v = -v;   // the side the ray came from
+                out.dist = bestF * len; out.ent = bestEnt; out.body = body & 0xFFFFFF; out.cfi = cfi;
+                g_CastHits++;
+            }
+        }
+        FreeCollector(&c, &f);
+        return out.hit;
+    }
+
+    // ---- the points of a hand and its item ----
+    constexpr int kMaxPts = 13, kMaxContacts = 16;
+    struct Pt { float local[3]; float r; };
+    struct Pub { Collision::Contact c[kMaxContacts]; int n = 0; double at = 0; };
+    std::mutex g_PubM;
+    Pub g_Pub[2], g_Body[2];                  // world contacts (game thread) / characters' bodies (SwordContact)
+    std::atomic<bool> g_Touch[2]{ false, false };
+
+    struct HandState
+    {
+        bool valid = false, ghost = false; int npts = 0; void* item = nullptr;
+        float prevRaw[kMaxPts][3] = {}, prevRes[kMaxPts][3] = {};
+        double lastBuzz = 0; bool contact = false;
+    };
+    HandState g_H[2];                          // game thread
+    double g_LastTick = 0; float g_LastYaw = 0, g_LastCam[3] = {}; bool g_CamValid = false;
+    std::atomic<uint64_t> g_Ticks{ 0 }, g_Stops[2]{ 0, 0 }, g_Ghosts[2]{ 0, 0 }, g_Pushes{ 0 }, g_Resets{ 0 }, g_BodyStops{ 0 };
+    std::atomic<float> g_LastOff[2]{ 0.f, 0.f };
+    std::string g_LastHitDesc;                // game thread
+    std::mutex g_DescM;
+
+    struct BoxCache { void* model = nullptr; bool ok = false; float mn[3] = {}, mx[3] = {}; };
+    std::unordered_map<void*, BoxCache> g_Boxes;   // game thread
+    using BoundsFn = const float* (*)(void*);
+    bool CallBounds(void* model, uintptr_t fn, float out[6])
+    {
+        __try { const float* b = ((BoundsFn)fn)(model); if (!b) return false; memcpy(out, b, 24); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    //! The weapon entity's model box (entity frame, scaled), as SwordContact reads boxes.
+    bool ItemBox(void* ent, float mn[3], float mx[3])
+    {
+        void* model = nullptr; float sc[3] = { 1, 1, 1 };
+        if (!SafeRead(&model, (uint8_t*)ent + kEntModel, 8) || !model) return false;
+        SafeRead(sc, (uint8_t*)ent + kEntScale, 12);
+        BoxCache& c = g_Boxes[ent];
+        if (c.model != model)
+        {
+            c = BoxCache{}; c.model = model;
+            const uintptr_t base = GameInfo::Base(); uintptr_t vt = 0, fn = 0; float b[6];
+            if (SafeRead(&vt, model, 8) && vt > base && vt - base < 0x4000000 && SafeRead(&fn, (void*)(vt + kModelBoundsSlot), 8)
+                && fn > base && fn - base < 0x4000000 && CallBounds(model, fn, b) && Finite(b, 6))
+            {
+                c.ok = true;
+                for (int i = 0; i < 3; i++) { c.mn[i] = fminf(b[i], b[3 + i]); c.mx[i] = fmaxf(b[i], b[3 + i]); }
+            }
+            if (g_Boxes.size() > 64) { BoxCache keep = c; g_Boxes.clear(); g_Boxes[ent] = keep; }
+        }
+        if (!c.ok) return false;
+        for (int i = 0; i < 3; i++)
+        {
+            const float s = std::isfinite(sc[i]) && fabsf(sc[i]) > 1e-3f && fabsf(sc[i]) < 100.f ? fabsf(sc[i]) : 1.f;
+            mn[i] = c.mn[i] * s; mx[i] = c.mx[i] * s;
+        }
+        return true;
+    }
+
+    //! The points that collide for this hand, in its frame. The palm always (hands on), and while the hand holds no
+    //! item its fingers: one point over the middle of the fingers and two at the tips (index and little finger sides),
+    //! reaching ~10 cm ahead of the palm when the hand is open and drawn in to the knuckles as it closes (the grip's
+    //! curl, `curl` 0..1, what closes the drawn fingers too). A hand holding something has its fingers round it: the
+    //! item's own points stand for them. With weapons on, samples along the item's model box: its long axis (5 points
+    //! through the middle of the box) and, for a wide item (a crossbow's limbs), the two ends of the second axis. A
+    //! sword whose box cannot be read uses the measured blade (0.14 - 0.69 m). The palm stays point 0.
+    int BuildPoints(int h, const float hr[9], const float ht[3], bool item, const float* wo, const float* wa, void* ent, float curl, Pt* out)
+    {
+        int n = 0;
+        if (g_Hands.load())
+        {
+            out[n].local[0] = out[n].local[1] = out[n].local[2] = 0.f; out[n].r = C.palmR; n++;
+            if (!item)
+            {
+                const float c = std::clamp(curl, 0.f, 1.f);
+                auto lerp = [&](float open, float closed) { return open + (closed - open) * c; };
+                const float mid[3] = { lerp(C.fingerMid, 0.045f), 0.f, lerp(-0.005f, -0.02f) };
+                const float tipX = lerp(C.fingerTip, 0.05f), tipZ = lerp(-0.01f, -0.035f);
+                const float tips[2][3] = { { tipX, C.fingerSpread, tipZ }, { tipX - 0.012f, -C.fingerSpread, tipZ } };
+                memcpy(out[n].local, mid, 12); out[n].r = C.fingerR; n++;
+                for (const auto& t : tips) { memcpy(out[n].local, t, 12); out[n].r = C.fingerTipR; n++; }
+            }
+        }
+        if (!item || !g_Weapons.load()) return n;
+        // the item's frame: wo + l.x * fwd + l.y * left + l.z * up (wa rows)
+        auto add = [&](const float l[3], float r) {
+            if (n >= kMaxPts) return;
+            float w[3]; for (int i = 0; i < 3; i++) w[i] = wo[i] + l[0] * wa[i] + l[1] * wa[3 + i] + l[2] * wa[6 + i];
+            ToLocal(hr, ht, w, out[n].local); out[n].r = r; n++;
+        };
+        if (h == 1)
+        {   // The right hand holds the sword (Dishonored's right hand holds nothing else): the measured blade, as
+            // SwordContact sweeps it (0.14 - 0.69 m along the item's forward axis) -- reported, the sword went straight
+            // through solid objects; the model box alone is not trusted to lie along the blade.
+            for (int i = 0; i < 6; i++) { const float l[3] = { 0.14f + 0.55f * (float)i / 5.f, 0.f, 0.f }; add(l, 0.025f); }
+            return n;
+        }
+        float mn[3], mx[3];
+        if (ent && ItemBox(ent, mn, mx))
+        {
+            float ext[3]; for (int k = 0; k < 3; k++) ext[k] = mx[k] - mn[k];
+            int a = 0; for (int k = 1; k < 3; k++) if (ext[k] > ext[a]) a = k;
+            int b = (a + 1) % 3, c = (a + 2) % 3; if (ext[c] > ext[b]) std::swap(b, c);
+            if (ext[a] < 0.05f || ext[a] > 2.5f) return n;            // not a hand-held item's size
+            const float r = fminf(C.itemRMax, fmaxf(C.itemRMin, 0.5f * ext[c]));
+            float mid[3]; for (int k = 0; k < 3; k++) mid[k] = 0.5f * (mn[k] + mx[k]);
+            for (int i = 0; i < 5; i++)
+            {
+                float l[3] = { mid[0], mid[1], mid[2] };
+                l[a] = mn[a] + r + (ext[a] - 2.f * r) * (float)i / 4.f;
+                add(l, r);
+            }
+            if (ext[b] > 0.15f)
+            {
+                float l[3] = { mid[0], mid[1], mid[2] };
+                l[b] = mn[b] + r; add(l, r);
+                l[b] = mx[b] - r; add(l, r);
+            }
+        }
+        else if (h == 1)
+        {
+            for (int i = 0; i < 5; i++) { const float l[3] = { 0.14f + 0.55f * (float)i / 4.f, 0.f, 0.f }; add(l, 0.02f); }
+        }
+        return n;
+    }
+
+    //! Push a set of points (hand frame) out of the contact planes: the hand's translation. `cap` = drop all if larger.
+    void Solve(const float r[9], const float t[3], const Collision::Contact* c, int n, float off[3])
+    {
+        off[0] = off[1] = off[2] = 0.f;
+        for (int it = 0; it < 4; it++)
+        {
+            bool moved = false;
+            for (int i = 0; i < n; i++)
+            {
+                float w[3]; ToWorld(r, t, c[i].local, w);
+                const float d[3] = { w[0] + off[0] - c[i].p[0], w[1] + off[1] - c[i].p[1], w[2] + off[2] - c[i].p[2] };
+                const float pen = Dot(d, c[i].n) - c[i].clear;
+                if (pen < -1e-4f) { for (int k = 0; k < 3; k++) off[k] -= c[i].n[k] * pen; moved = true; }
+            }
+            if (!moved) break;
+        }
+    }
+
+    void PostImpulse(void* ent, const float imp[3], const float pt[3])
+    {
+        __try
+        {
+            const uint32_t id = *(const uint32_t*)((const uint8_t*)ent + kEntId);
+            const uintptr_t base = GameInfo::Base();
+            uint8_t* sys = ((uint8_t* (*)())(base + kMsgSystem))();
+            if (!sys) return;
+            using FnPost = float* (*)(void*, uint32_t, uint32_t, uint32_t);
+            float* pl = ((FnPost)(base + kMsgPost))(sys + kMsgQueue, kMsgImpulse, 0x18, id);
+            if (!pl) return;
+            pl[0] = imp[0]; pl[1] = imp[1]; pl[2] = imp[2]; pl[3] = pt[0]; pl[4] = pt[1]; pl[5] = pt[2];
+            g_Pushes++;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    bool IsDoor(void* ent)
+    {
+        if (!ent) return false;
+        __try
+        {
+            using FnType = const uint8_t* (*)(void*);
+            const uint8_t* ti = ((FnType)(*(void***)ent)[0])(ent);
+            if (!ti) return false;
+            const int id = *(const int*)(ti + 0x60);
+            const int* range = (const int*)(GameInfo::Base() + kDoorClassRange);
+            return id >= range[0] && id <= range[1];
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    std::atomic<uint64_t> g_DoorPushes{ 0 };
+    //! The game's own door push, from the player (as Windblast sends it).
+    bool PushDoor(void* door, void* player)
+    {
+        __try
+        {
+            const uint32_t id = *(const uint32_t*)((const uint8_t*)door + kEntId);
+            const uint32_t from = player ? *(const uint32_t*)((const uint8_t*)player + kEntId) : 0x3FFF0010u;
+            const uintptr_t base = GameInfo::Base();
+            uint8_t* sys = ((uint8_t* (*)())(base + kMsgSystem))();
+            if (!sys) return false;
+            using FnPost = uint32_t* (*)(void*, uint32_t, uint32_t, uint32_t);
+            uint32_t* pl = ((FnPost)(base + kMsgPost))(sys + kMsgQueue, kMsgDoorPush, 4, id);
+            if (!pl) return false;
+            *pl = from;
+            g_DoorPushes++;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    std::unordered_map<void*, double> g_DoorAt;   // game thread: when each door was last pushed
+    //! Close an open openable (a drawer, a cabinet, a door) the way the scripts' Close does (exe+0x7F8F00): if it is
+    //! open, exe+0x7B0F20(openable, false, animate). Closing needs no key, so no lock check is missing here (opening
+    //! still goes through the game's interact). True when it was open and is now closing.
+    constexpr uint32_t kOpenableSet = 0x7B0F20;
+    bool CloseOpenable(void* ent)
+    {
+        if (!ent) return false;
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            uint8_t* c = ((FnGet)(GameInfo::Base() + kGetComponent))(ent, (const void*)(GameInfo::Base() + kOpenableType), 2);
+            if (!c || !c[kOpenableIsOpen]) return false;
+            ((void (*)(void*, bool, bool))(GameInfo::Base() + kOpenableSet))(c, false, true);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    //! The openable component of an entity: 1 = one that is open, 0 = closed, -1 = none.
+    int OpenableState(void* ent)
+    {
+        if (!ent) return -1;
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            const uint8_t* c = ((FnGet)(GameInfo::Base() + kGetComponent))(ent, (const void*)(GameInfo::Base() + kOpenableType), 2);
+            if (!c) return -1;
+            return c[kOpenableIsOpen] ? 1 : 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    }
+    // Characters: class ids between the globals exe+0x3A96BC0 / +4 (MeleeAim's test). A guard knocked out carries
+    // loot (his pockets) and was taken for an item -- the grip and the trigger then refused to carry him.
+    constexpr uint32_t kNpcClassRange = 0x3A96BC0;
+    bool IsCharacter(void* ent)
+    {
+        if (!ent) return false;
+        __try
+        {
+            using FnType = const uint8_t* (*)(void*);
+            const uint8_t* ti = ((FnType)(*(void***)ent)[0])(ent);
+            if (!ti) return false;
+            const int id = *(const int*)(ti + 0x60);
+            const int* range = (const int*)(GameInfo::Base() + kNpcClassRange);
+            return id >= range[0] && id <= range[1];
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    bool IsItem(void* ent)
+    {
+        if (!ent || IsCharacter(ent)) return false;
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            const uintptr_t base = GameInfo::Base();
+            return ((FnGet)(base + kGetComponent))(ent, (const void*)(base + kLootType), 2) != nullptr
+                || ((FnGet)(base + kGetComponent))(ent, (const void*)(base + kMissionItemType), 2) != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    std::atomic<bool> g_Items{ false };
+    // Food: eaten where it lies (the game's interact on it eats it), never stored. An item's loot component
+    // (arkCpntLoot) lists what it gives in m_items (an idList at loot+0x28: entries of 0x18 bytes, the item's
+    // arkDeclInventoryItem first); an item decl's type is at +0x60 (TYPE_MISC 0, COIN 1, PLAYER_WEAPONRY 2, NPC_WEAPONRY 3,
+    // AMMO 4, BONE_CHARM 5, CONSUMABLE 6, RUNE 7, SHRINE 8, POWER 9, ARMOR 10, MISSIONITEM 11, NOTE_DOCUMENT 12,
+    // AUDIOGRAPH 13). Food is told as a CONSUMABLE the player cannot carry: no room for it in the inventory's item table
+    // (inventory+0x38, count +0x40, entries of 0x38: decl first, base capacity at +0x24) -- elixirs are consumables too,
+    // with room for 10.
+    // TODO(DOTO): unverified -- the loot / item decl / inventory offsets and the item type numbers below are Dishonored 2's.
+    constexpr uint32_t kLootDefs = 0x68, kLootDefStride = 0x10;
+    constexpr uint32_t kLootItems = 0x28, kLootInfoStride = 0x18, kItemDeclType = 0x60, kTypeCoin = 1, kTypeConsumable = 6;
+    constexpr uint32_t kInvTable = 0x38, kInvTableCount = 0x40, kInvTableStride = 0x38, kInvTableCapacity = 0x24;
+    std::atomic<uint32_t> g_ClassifyId{ 0 };
+    std::atomic<int> g_FoodState{ -1 };
+    //! An object's class name (MSVC RTTI) equals `want` (".?AV...@@").
+    bool ClassIs(const void* obj, const char* want)
+    {
+        __try
+        {
+            const uintptr_t base = GameInfo::Base();
+            const uintptr_t vt = *(const uintptr_t*)obj;
+            if (vt < base || vt - base > 0x4000000) return false;
+            const uint8_t* col = *(const uint8_t* const*)(vt - 8);
+            if (*(const uint32_t*)col != 1) return false;
+            const char* name = (const char*)(base + *(const uint32_t*)(col + 12) + 0x10);
+            return strcmp(name, want) == 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    //! The item decls an item entity gives (its loot's m_items), at most `max`. 0 when it has no loot component.
+    int LootDecls(void* ent, const void** out, int max)
+    {
+        int n = 0;
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            const uintptr_t base = GameInfo::Base();
+            const uint8_t* loot = ((FnGet)(base + kGetComponent))(ent, (const void*)(base + kLootType), 2);
+            if (!loot) return 0;
+            const uint8_t* list = *(const uint8_t* const*)(loot + kLootItems);
+            const int count = *(const int*)(loot + kLootItems + 8) & 0xFFFFFF;
+            for (int i = 0; list && i < count && i < 8 && n + 1 < max; i++)
+            {   // (the item decl's place in an entry is not certain: both of its first two fields are handed on, RTTI decides)
+                out[n++] = *(const void* const*)(list + (size_t)i * kLootInfoStride);
+                out[n++] = *(const void* const*)(list + (size_t)i * kLootInfoStride + 8);
+            }
+            // measured: the component's own list is empty on items lying in the world -- what they give is the loot
+            // decl's m_itemDefs (decl = loot+0x08; an idList at decl+0x68 of 0x10-byte arkDeclLootinfo)
+            const uint8_t* decl = *(const uint8_t* const*)(loot + 0x08);
+            const uint8_t* defs = decl ? *(const uint8_t* const*)(decl + kLootDefs) : nullptr;
+            const int nd = decl ? *(const int*)(decl + kLootDefs + 8) & 0xFFFFFF : 0;
+            for (int i = 0; defs && i < nd && i < 8 && n + 1 < max; i++)
+            {
+                out[n++] = *(const void* const*)(defs + (size_t)i * kLootDefStride);
+                out[n++] = *(const void* const*)(defs + (size_t)i * kLootDefStride + 8);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return n;
+    }
+    //! The base capacity the player's inventory has for an item decl: -1 when the table does not know it.
+    int Capacity(uint8_t* inv, const void* decl)
+    {
+        __try
+        {
+            const uint8_t* t = *(const uint8_t* const*)(inv + kInvTable);
+            const int n = *(const int*)(inv + kInvTableCount) & 0xFFFFFF;
+            for (int i = 0; t && i < n && i < 20000; i++)
+                if (*(const void* const*)(t + (size_t)i * kInvTableStride) == decl) return *(const int*)(t + (size_t)i * kInvTableStride + kInvTableCapacity);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return -1;
+    }
+    std::string DeclName(const void* decl)
+    {
+        char buf[160] = {};
+        const char* p = nullptr;
+        if (SafeRead(&p, (const uint8_t*)decl + 8, 8) && p)
+            for (int i = 0; i < 159; i++) { char c = 0; if (!SafeRead(&c, p + i, 1) || c < 32 || c > 126) break; buf[i] = c; }
+        return std::string(buf);
+    }
+    //! The player's inventory component (arkCpntInventory), or null. (No C++ objects here: __try, C2712.)
+    uint8_t* PlayerInventory()
+    {
+        void* player = Game::LocalPlayer();
+        if (!player) return nullptr;
+        using FnGet = uint8_t* (*)(void*, const void*, int);
+        __try { return ((FnGet)(GameInfo::Base() + kGetComponent))(player, (const void*)(GameInfo::Base() + BodyHide::kEquipCpntTypeInfo), 2); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+    //! 2 = food (eaten where it is: never stored), 1 = kept (stored), 0 = cannot tell. Logs what it read.
+    std::string EntityName(void* ent);
+    bool IsFoodName(void* ent);
+    int ClassifyFood(void* ent)
+    {
+        if (IsFoodName(ent)) { LOGI("Collision: item '{}': FOOD by its name (eaten at the mouth, never stored)", EntityName(ent)); return 2; }
+        const void* decls[32]; const int n = LootDecls(ent, decls, 32);
+        if (!n) { LOGI("Collision: item '{}': not food by its name, no readable loot list: kept (stored behind the back, or eaten at the mouth)", EntityName(ent)); return 1; }
+        uint8_t* inv = PlayerInventory();
+        int food = 0, kept = 0, known = 0; std::string what;
+        for (int i = 0; i < n; i++)
+        {
+            if (!decls[i] || !ClassIs(decls[i], ".?AVarkDeclInventoryItem@@")) continue;
+            known++;
+            int type = -1; SafeRead(&type, (const uint8_t*)decls[i] + kItemDeclType, 4);
+            const int cap = inv ? Capacity(inv, decls[i]) : -1;
+            what += fmt::format(" [{} type {} room {}]", DeclName(decls[i]), type, cap);
+            if (type == (int)kTypeConsumable && cap <= 0) food++; else kept++;
+        }
+        const int r = !known ? 0 : food && !kept ? 2 : 1;
+        LOGI("Collision: item gives{}: {}", what.empty() ? " (nothing readable)" : what, r == 2 ? "FOOD (eaten, never stored: only at the mouth)" : r == 1 ? "kept (stored behind the back, or at the mouth)" : "cannot tell (either place takes it)");
+        return r;
+    }
+    std::atomic<bool> g_Dials{ false };
+    std::atomic<uint64_t> g_DialSteps{ 0 };
+    //! The 10-stage usable (a safe's dial) of an entity, or null.
+    uint8_t* DialOf(void* ent)
+    {
+        if (!ent) return nullptr;
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            uint8_t* u = ((FnGet)(GameInfo::Base() + kGetComponent))(ent, (const void*)(GameInfo::Base() + kUsableStatesType), 2);
+            if (!u) return nullptr;
+            const uint8_t* decl = *(const uint8_t* const*)(u + 0x08);
+            return decl && (*(const uint32_t*)(decl + 0x78) & 0xFFFFFF) == 10 ? u : nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+    //! One step of a dial: +1 = next (up), -1 = previous (down). False while it is still turning.
+    bool StepDial(uint8_t* u, int dir, int* stage)
+    {
+        __try
+        {
+            if (u[0x30] & 0x2) return false;
+            ((void (*)(void*))(GameInfo::Base() + (dir > 0 ? kUsableNext : kUsablePrev)))(u);
+            *stage = *(const int*)(u + 0x28);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    struct DialSwipe
+    {
+        void* ent = nullptr; uint8_t* u = nullptr; float acc = 0.f; int pending = 0; double lastAt = 0; float prev[3] = {}; bool prevOk = false;
+        float org[3] = {}; bool byReach = false; double since = 0;    // by reach (not contact): the dial's origin, from when
+    };
+    // Sliding windows have no component of their own: they are doors / openables placed by the level. An entity's name
+    // (the level's, a char* at entity+0x20, what the game's own errors print through exe+0x1439A0) tells them: one that
+    // opens and whose name holds "window" is raised by a hand sliding up on it and lowered by one sliding down -- the
+    // game's interact (KbmInject taps it when the pointer has the window: its locks and animation apply).
+    std::atomic<bool> g_Windows{ false };
+    std::atomic<uint64_t> g_WindowMoves{ 0 };
+    // [Gameplay.Interaction] TouchToUse: buttons, switches and levers worked by hand (a poke into them, or a grip on one
+    // and a pull), as the game's interact aimed where the hand met them (KbmInject: only once the sensor picks that very
+    // entity, so a wall or a crate touched never presses anything)
+    std::atomic<bool> g_Usables{ true };
+    std::atomic<uint64_t> g_Uses{ 0 }, g_UsePulls{ 0 };
+    constexpr float kPokeSpeed = 0.35f, kPokePast = 0.01f, kPokePress = 0.035f;   // m/s into it and 1 cm through, or 3.5 cm through
+    constexpr float kPull = 0.07f;                                                 // m the gripping hand moves: a lever pulled
+    constexpr double kUseGap = 1.2;                                                // s before the same thing is used again by hand
+    struct UseHand { void* blocked = nullptr; void* touch = nullptr; double touchAt = -1; float tp[3] = {}, tn[3] = {};
+                     bool grip = false, gripDone = false; void* gripEnt = nullptr; float gripStart[3] = {}, gp[3] = {}, gn[3] = {}; };
+    UseHand g_UseH[2];                                                             // game thread
+    std::unordered_map<void*, double> g_UseAt;                                     // game thread
+    // [Gameplay.Interaction] ClimbByHand: both hands resting on a top edge at chest height or above, then pulled down
+    std::atomic<bool> g_Climb{ true }, g_ClimbReq{ false };
+    std::atomic<uint64_t> g_Climbs{ 0 };
+    struct LedgeHand { double at = -1; float p[3] = {}; };
+    LedgeHand g_Ledge[2];                                                          // game thread
+    struct ClimbArm { bool on = false; double at = 0; float z0[2] = {}; float p[2][3] = {}; double lastTold = -10, lastArmLog = -10; } g_ClimbArm;   // game thread
+    // a knock (research for KnockToLure): a hand rapping on something
+    std::atomic<uint64_t> g_Knocks{ 0 };
+    double g_KnockAt[2] = { -10, -10 };
+    struct WinSwipe { void* ent = nullptr; float acc = 0.f; double lastAt = 0, movedAt = 0; float prev[3] = {}; bool prevOk = false; int lastDir = 0; };
+    WinSwipe g_Win[2];                          // game thread
+    constexpr float kWindowSwipe = 0.06f;       // m of the hand along the window, up or down
+    constexpr float kWindowReach = 1.2f, kWindowNear = 0.35f;   // m from the picked window's origin (see below)
+    //! The entity's level name into `buf` (printable characters only; empty when unreadable). Kept free of C++ objects:
+    //! MSVC refuses __try in a function that has to unwind one (C2712).
+    void ReadEntityName(void* ent, char (&buf)[128])
+    {
+        buf[0] = 0;
+        __try
+        {
+            const char* s = *(const char* const*)((const uint8_t*)ent + 0x20);
+            if (!s) return;
+            for (int i = 0; i < 127; i++) { const char c = s[i]; buf[i] = 0; if (!c) break; if (c < 32 || c > 126) { buf[0] = 0; break; } buf[i] = c; buf[i + 1] = 0; }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { buf[0] = 0; }
+    }
+    //! The entity's level name, or "".
+    std::string EntityName(void* ent)
+    {
+        char buf[128] = {};
+        ReadEntityName(ent, buf);
+        buf[127] = 0;
+        return std::string(buf);
+    }
+    bool NameHas(const std::string& s, const char* what)
+    {
+        std::string l = s; for (char& c : l) c = (char)tolower((unsigned char)c);
+        return l.find(what) != std::string::npos;
+    }
+    //! Lowercase.
+    std::string Lower(std::string s) { for (char& c : s) c = (char)tolower((unsigned char)c); return s; }
+    bool HasAny(const std::string& l, std::initializer_list<const char*> words) { for (const char* w : words) if (l.find(w) != std::string::npos) return true; return false; }
+    //! Something to READ (a note, a book, a letter): the trigger's interact reads it; it is not taken by hand.
+    bool IsReadable(void* ent) { return HasAny(Lower(EntityName(ent)), { "note", "book", "letter", "journal", "diary" }); }
+    //! Food by its level name ('pickups_fruit_apple_02_5', ...). Measured: the item lists (the loot component's, its
+    //! decl's) give entity defs, not inventory item decls, and none of the pickups had one readable -- the name is what tells.
+    bool IsFoodName(void* ent)
+    {
+        return HasAny(Lower(EntityName(ent)), { "fruit", "food", "apple", "pear", "grape", "orange", "lemon", "bread", "cheese", "eels", "biscuit",
+                                               "_pie", "pastr", "cake", "meat", "sausage", "_ham_", "fish", "jerky", "canned", "_can_", "_tin_", "candy",
+                                               "chocolate", "_nut", "_egg", "carrot", "potato", "onion", "turnip", "berry", "melon", "_fig" });
+    }
+    //! A cabinet / cupboard / drawer front the level made a plain usable (arkUsable, no openable component) -- measured:
+    //! 'esc_env_door_middle_5' / 'esc_env_door_left_5', the cabinet doors the grip could not pull. Grabbing and pulling one
+    //! presses its interact, as for a drawer.
+    bool IsUsableFront(void* ent)
+    {
+        if (!ent || !ClassIs(ent, ".?AVarkUsable@@")) return false;
+        const std::string l = Lower(EntityName(ent));
+        return !HasAny(l, { "window" }) && HasAny(l, { "door", "drawer", "cabinet", "cupboard", "locker", "wardrobe", "hatch", "lid", "chest", "closet", "shutter" });
+    }
+    //! A sliding window (or its handle): "window" in the level name, and not a door -- measured, a glazed door is named
+    //! 'ld_door_big_rich_int_window_350_0_4' and was taken for a window; a window's handle 'ld_rich_small_gp_window_handle_1'.
+    bool IsWindowEnt(void* ent)
+    {
+        if (!ent) return false;
+        const std::string n = EntityName(ent);
+        return NameHas(n, "window") && !NameHas(n, "door");
+    }
+    //! An item the hand takes (PhysicalPickup): an item that is not something to read.
+    bool IsHandItem(void* ent) { return IsItem(ent) && !IsReadable(ent); }
+    // A door's open state. The openable's +0x1E8 stays 0 on a door the push swung open (measured: every door pushed
+    // was "closed"), so its state machine (arkCpntOpenable+0x40) is read: its current state is one of the component's
+    // own state objects, told by their vtables -- arkStateOpenable_Closed (exe+0x1CDB188), _Animated (exe+0x1CDB1C8:
+    // +0x28 = the phase, 0 opened, 1 opening, 2 closing, 3 closed) or _Opened (exe+0x1CDB208). Doors with none of that
+    // fall back on what the hands did to them (g_DoorMem: pushed open by a hand, closed by a hand).
+    constexpr uint32_t kVtClosed = 0x1CDB188, kVtAnimated = 0x1CDB1C8, kVtOpened = 0x1CDB208;
+    int OpenableMachineState(void* ent, int* where)
+    {
+        *where = -1;
+        if (!ent) return -1;
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            const uintptr_t base = GameInfo::Base();
+            const uint8_t* c = ((FnGet)(base + kGetComponent))(ent, (const void*)(base + kOpenableType), 2);
+            if (!c) return -1;
+            for (int off = 0x40; off < 0x60; off += 8)
+            {
+                const uint8_t* st = *(const uint8_t* const*)(c + off);
+                if (!st || (uintptr_t)st < 0x10000) continue;
+                const uintptr_t vt = *(const uintptr_t*)st;
+                if (vt == base + kVtOpened) { *where = off; return 1; }
+                if (vt == base + kVtClosed) { *where = off; return 0; }
+                if (vt == base + kVtAnimated) { *where = off; const int ph = *(const int*)(st + 0x28); return ph <= 1 ? 1 : 0; }
+            }
+            return -1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    }
+    std::unordered_map<void*, int> g_DoorMem;      // game thread: 1 = a hand pushed it open, 0 = a hand closed it
+    // Cabinet fronts (IsUsableFront) have no state to read: each interact on one toggles it, and the mod sees them all
+    // (the grip's pull, the trigger, a hand's push): the state is counted here, from closed. Under g_FrontM.
+    std::mutex g_FrontM;
+    std::unordered_map<uint32_t, int> g_FrontOpen;
+    // When the player's interact last went to an entity (NoteInteract: the grip's pull, the trigger, a push), under
+    // g_FrontM. A front or drawer the game has just opened swings or slides INTO the hand that opened it, and that read
+    // as the hand pushing it closed again (measured 2026-10-29: the trigger opened 'esc_env_door_left', and 0.18 s later
+    // the right hand, 2 cm "past its surface" at 0.59 m/s, closed it; another one 4 ms after opening). So a push-close
+    // waits kOpenSettle after the last interact, and on a cabinet front it takes the hand moving into it.
+    std::unordered_map<uint32_t, double> g_InteractAt;
+    constexpr double kOpenSettle = 1.0;
+    double SinceInteract(uint32_t id, double now)
+    {
+        std::lock_guard lk(g_FrontM);
+        auto it = g_InteractAt.find(id);
+        return it == g_InteractAt.end() ? 1e9 : now - it->second;
+    }
+    int FrontState(uint32_t id) { std::lock_guard lk(g_FrontM); auto it = g_FrontOpen.find(id); return it == g_FrontOpen.end() ? 0 : it->second; }
+    int DoorOpen(void* door, const char** how);
+    //! What the grip can pull: a drawer / cabinet (its openable) or a door (not a window): 1 open, 0 closed, -1 neither.
+    int OpenOrNot(void* e)
+    {
+        if (!e) return -1;
+        if (IsDoor(e)) { if (IsWindowEnt(e)) return -1; const char* how = ""; return DoorOpen(e, &how); }
+        const int os = OpenableState(e);
+        if (os >= 0) return os;
+        if (!IsUsableFront(e)) return -1;
+        uint32_t id = 0; SafeRead(&id, (uint8_t*)e + kEntId, 4);
+        return FrontState(id);                // counted from the interacts on it (closed at first)
+    }
+    //! 1 open, 0 closed; `how` says where that came from (for the log).
+    int DoorOpen(void* door, const char** how)
+    {
+        int where = -1;
+        const int m = OpenableMachineState(door, &where);
+        if (m >= 0) { *how = m ? "its openable's state: open" : "its openable's state: closed"; return m; }
+        if (OpenableState(door) == 1) { *how = "its openable: open"; return 1; }
+        auto it = g_DoorMem.find(door);
+        if (it != g_DoorMem.end()) { *how = it->second ? "pushed open by a hand" : "closed by a hand"; return it->second; }
+        *how = "taken as closed"; return 0;
+    }
+    DialSwipe g_Dial[2];                        // game thread
+    constexpr float kDialStep = 0.035f;         // m of the hand along the dial (up / down) per digit
+    // The wheels sit recessed in the safe's door: the hand meets the door, not the wheel. So the wheel the grabbing hand's
+    // pointer has picked counts as under the hand while the hand (its palm or a finger) is within kDialReach of the
+    // wheel's origin -- held while the hand stays within kDialKeep of it, so the pointer flicking to the next wheel
+    // mid-swipe does not drop it -- after kDialSettle there (reaching in is not a swipe).
+    constexpr float kDialReach = 0.14f, kDialKeep = 0.18f;
+    constexpr double kDialSettle = 0.15;
+    // after the interact that stores an item: is its entity still in the world (the game refused it: inventory full)?
+    std::atomic<uint32_t> g_WatchId{ 0 }; std::atomic<int> g_WatchState{ -1 };
+    std::atomic<uint32_t> g_PointerItem{ 0 };      // the pointer's pick when it is an item (game thread -> KbmInject)
+    std::atomic<int> g_PointerOpenable{ -1 };      // ...when it is a drawer / cabinet: id << 1 | open, else -1
+    std::atomic<uint32_t> g_PointerHoldable{ 0 };  // ...when it is something the interact picks up and holds
+    std::atomic<int> g_PointerHoldKind{ 0 };       // 1 an object held in the hand, 2 something carried (a body)
+    std::string g_PointerDesc;                     // under g_TouchM
+    constexpr uint32_t kPickableSimpleType = 0x3AA6280;   // arkCpntPickable_Simple (HoldObject's bottles, glasses)
+    bool HasComponent(void* ent, uint32_t type)
+    {
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            return ((FnGet)(GameInfo::Base() + kGetComponent))(ent, (const void*)(GameInfo::Base() + type), 2) != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    std::mutex g_TouchM;
+    Collision::Touch g_TouchPub[2];
+    double g_TouchAt[2] = {};
+    struct CloseReq { uint32_t id = 0; double at = 0; float p[3] = {}; } g_CloseReq[2];   // under g_TouchM
+    void RequestInteract(int h, uint32_t id, const float p[3], double now)
+    {
+        std::lock_guard lk(g_TouchM);
+        g_CloseReq[h & 1] = CloseReq{ id, now, { p[0], p[1], p[2] } };
+    }
+    std::atomic<bool> g_Openables{ false };
+    bool Dynamic(void* ent)
+    {
+        uint8_t f = 0;
+        return ent && SafeRead(&f, (uint8_t*)ent + kEntFlags, 1) && (f & 0x8);
+    }
+    // A loose prop at REST does not have entity+0xD9 (D2 +0xD1) bit 3: the game sets it while the body is being simulated
+    // (in exe+0x8E6660) and clears it once it has settled (exe+0x8E7460) -- so every bottle and crate standing still
+    // failed Dynamic() and was never pushed (reported: hitting grabbable objects moved nothing). Windblast, which does
+    // move resting props, asks the physics component instead: arkCpntPhysicsBase (type exe+0x3A88450, exe+0x143A615)
+    // and its vtable +0x188 (D2 +0x178) (arkCpntPhysicsSystem: exe+0x7CD9C0, "one of my bodies has motion type 2 = dynamic"),
+    // exe+0x528681 / exe+0x52869D. The impulse message (0x100; D2 0xFA) is handled by that component (exe+0x870DB0): a point
+    // impulse on its body, which wakes it.
+    constexpr uint32_t kPhysicsBaseType = 0x3A88450;
+    constexpr int kPhysicsHasDynamicSlot = 0x188 / 8;   // (D2 0x178: DOTO's arkCpntPhysicsSystem has 2 more slots before it)
+    bool PhysicsDynamic(void* ent)
+    {
+        if (!ent) return false;
+        __try
+        {
+            using FnGet = uint8_t* (*)(void*, const void*, int);
+            uint8_t* c = ((FnGet)(GameInfo::Base() + kGetComponent))(ent, (const void*)(GameInfo::Base() + kPhysicsBaseType), 2);
+            if (!c) return false;
+            using FnHas = bool (*)(void*);
+            return ((FnHas)(*(void***)c)[kPhysicsHasDynamicSlot])(c);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    //! A loose object a hand can push: one being simulated (as before: a prop in motion, a ragdoll), or a resting body
+    //! the physics would move. A standing character is not (its own impulse handler would shove the guard; the hands
+    //! stop at them instead).
+    bool Pushable(void* ent) { return ent && (Dynamic(ent) || (!IsCharacter(ent) && PhysicsDynamic(ent))); }
+    //! The entity's C++ class (MSVC RTTI: vtable[-1] = the complete object locator, +0x0C its type descriptor's RVA,
+    //! +0x14 its own; the name at descriptor+0x10, ".?AVarkDoor@@") and its class id (type info +0x60). POD only (C2712).
+    void ReadClass(void* ent, char (&buf)[96], int* classId)
+    {
+        buf[0] = 0; *classId = -1;
+        __try
+        {
+            const uintptr_t vt = *(const uintptr_t*)ent;
+            using FnType = const uint8_t* (*)(void*);
+            const uint8_t* ti = ((FnType)(*(void***)ent)[0])(ent);
+            if (ti) *classId = *(const int*)(ti + 0x60);
+            const uint8_t* col = *(const uint8_t* const*)(vt - 8);
+            const uintptr_t base = (uintptr_t)col - *(const uint32_t*)(col + 0x14);
+            const char* n = (const char*)(base + *(const uint32_t*)(col + 0x0C) + 0x10);
+            if (n[0] == '.' && n[1] == '?' && n[2] == 'A') n += 4;      // ".?AV" / ".?AU"
+            int i = 0;
+            for (; i < 95 && n[i] && !(n[i] == '@' && n[i + 1] == '@'); i++) { if (n[i] < 32 || n[i] > 126) break; buf[i] = n[i]; }
+            buf[i] = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+    //! An entity in words, for the logs: its level name, its class, and what the mod makes of it.
+    std::string DescribeEnt(void* e)
+    {
+        if (!e) return "none";
+        char cls[96] = {}; int cid = -1; ReadClass(e, cls, &cid);
+        uint32_t id = 0; SafeRead(&id, (uint8_t*)e + kEntId, 4);
+        std::string d = fmt::format("'{}' ({} #{}, id {:#x})", EntityName(e), cls[0] ? cls : "?", cid, id);
+        if (IsCharacter(e)) d += " character";
+        if (IsDoor(e)) d += " door";
+        if (IsWindowEnt(e)) d += " window";
+        const int os = OpenableState(e);
+        if (os >= 0) d += os ? " openable(open)" : " openable(closed)";
+        int where = -1; const int ms = OpenableMachineState(e, &where);
+        if (ms >= 0) d += fmt::format(" state:{}@+{:#x}", ms ? "open" : "closed", where);
+        if (IsItem(e)) d += IsReadable(e) ? " item(read)" : IsFoodName(e) ? " item(food)" : " item";
+        if (IsUsableFront(e)) d += " cabinet-front";
+        if (HasComponent(e, kPickableSimpleType)) d += " holdable";
+        if (Dynamic(e)) d += " physics";
+        else if (PhysicsDynamic(e)) d += " physics(resting)";
+        uint8_t f = 0; if (SafeRead(&f, (uint8_t*)e + kEntFlags, 1) && (f & 0x28) && IsCharacter(e)) d += " (down)";
+        return d;
+    }
+
+    struct HitLog { void* ent; uint32_t body, cfi; float p[3]; };
+
+    //! A hand's or a held item's ray: the world (with the melee flag) and the props (without it); the nearer hit.
+    std::atomic<uint64_t> g_PropHits{ 0 };
+    bool CastHand(const float a[3], const float b[3], void* const* skip, int nskip, RayHit& out)
+    {
+        RayHit w, p;
+        const bool hw = CastRay(a, b, kWorldLayers, kWorldFlags, skip, nskip, w);
+        const bool hp = CastRay(a, b, kPropLayers, kPropFlags, skip, nskip, p);
+        if (hp && (!hw || p.dist < w.dist - 1e-4f)) { out = p; if (!hw || p.ent != w.ent) g_PropHits++; return true; }
+        if (hw) { out = w; return true; }
+        out = RayHit{}; return false;
+    }
+    //! Sweep a point from `from` to `goal`, sliding along what it meets; appends the planes met.
+    void Sweep(const float from[3], const float goal[3], float r, void* const* skip, int nskip, const float local[3],
+               Collision::Contact* out, int& nout, void** ents, HitLog* log, float res[3])
+    {
+        float cur[3] = { from[0], from[1], from[2] }, target[3] = { goal[0], goal[1], goal[2] };
+        for (int it = 0; it < 3; it++)
+        {
+            float d[3] = { target[0] - cur[0], target[1] - cur[1], target[2] - cur[2] };
+            const float L = Len(d);
+            if (L < 1e-4f) break;
+            const float u[3] = { d[0] / L, d[1] / L, d[2] / L };
+            const float end[3] = { target[0] + u[0] * r, target[1] + u[1] * r, target[2] + u[2] * r };
+            RayHit h;
+            if (!CastHand(cur, end, skip, nskip, h)) { memcpy(cur, target, 12); break; }
+            const float stop = fmaxf(0.f, fminf(L, h.dist - r));
+            for (int k = 0; k < 3; k++) cur[k] += u[k] * stop;
+            if (nout < kMaxContacts)
+            {
+                Collision::Contact& c = out[nout];
+                memcpy(c.local, local, 12); memcpy(c.p, h.pos, 12); memcpy(c.n, h.n, 12); c.clear = r;
+                ents[nout] = h.ent; log[nout] = HitLog{ h.ent, h.body, h.cfi, { h.pos[0], h.pos[1], h.pos[2] } };
+                nout++;
+            }
+            const float dt[3] = { target[0] - h.pos[0], target[1] - h.pos[1], target[2] - h.pos[2] };
+            const float pen = Dot(dt, h.n) - r;
+            if (pen < 0.f) for (int k = 0; k < 3; k++) target[k] -= h.n[k] * pen;   // slide: the goal onto the plane
+        }
+        memcpy(res, cur, 12);
+    }
+}
+
+void Collision::SetHands(bool on) { g_Hands = on; LOGI("Collision: hands {}", on ? "SOLID (they stop at walls, tables and props)" : "pass through everything"); }
+void Collision::SetWeapons(bool on) { g_Weapons = on; LOGI("Collision: held weapons {}", on ? "SOLID (the sword and guns stop at the world and at characters' bodies)" : "pass through everything"); }
+void Collision::SetPush(bool on, float m)
+{
+    g_Push = on; g_HandMass = fminf(10.f, fmaxf(0.1f, m));
+    LOGI("Collision: pushing loose objects {} (the hand weighs {:.1f} kg)", on ? "on" : "off", g_HandMass.load());
+}
+void Collision::SetWindows(bool on) { g_Windows = on; LOGI("Collision: sliding windows {}", on ? "rise when a hand slides up on them and lower when it slides down" : "use the interact button"); }
+void Collision::SetClimb(bool on) { g_Climb = on; LOGI("Collision: climbing by hand {}", on ? "on: both hands on a ledge at chest height or above, pull down: the game's climb (ClimbByHand)" : "off"); }
+bool Collision::TakeClimbRequest() { return g_ClimbReq.exchange(false); }
+void Collision::RequestUse(int hand, uint32_t id, const float point[3]) { RequestInteract(hand, id, point, Now()); }
+bool Collision::IsCharacterEnt(void* ent) { return ent && IsCharacter(ent); }
+bool Collision::IsShopkeeper(uint32_t id)
+{
+    void* e = BodyHide::EntityById((int)id);
+    return e && IsCharacter(e) && EntityName(e).find("shopkeeper") != std::string::npos;
+}
+void Collision::SetUsables(bool on) { g_Usables = on; LOGI("Collision: buttons, switches and levers {}", on ? "work by hand: press one, or grip it and pull (TouchToUse)" : "use the interact button only"); }
+void Collision::SetDials(bool on) { g_Dials = on; LOGI("Collision: safe dials {}", on ? "turn when a hand slides up / down on them" : "turn with the interact button"); }
+void Collision::SetItems(bool on) { g_Items = on; LOGI("Collision: items {}", on ? "are taken by hand: grab one, put it behind your back (or food to your mouth)" : "are taken with the interact button"); }
+bool Collision::ItemsOn() { return g_Items.load() && g_Hands.load(); }   // a hand must be able to touch them
+uint32_t Collision::PointerItem() { return g_PointerItem.load(); }
+uint32_t Collision::PointerHoldable(int* kind) { if (kind) *kind = g_PointerHoldKind.load(); return g_PointerHoldable.load(); }
+int Collision::PointerOpenable(uint32_t* id)
+{
+    const int v = g_PointerOpenable.load();
+    if (v < 0) return -1;
+    if (id) *id = (uint32_t)v >> 1;
+    return v & 1;
+}
+void Collision::WatchItem(uint32_t id) { g_WatchState = -1; g_WatchId = id; }
+void Collision::ClassifyItem(uint32_t id) { g_FoodState = -1; g_ClassifyId = id; }
+int Collision::ItemFood() { return g_FoodState.load(); }
+int Collision::ItemPresent() { return g_WatchState.load(); }
+void Collision::SetOpenables(bool on) { g_Openables = on; LOGI("Collision: drawers and cabinets {}", on ? "open by grabbing and pulling, close by pushing (with HandCollision)" : "use the interact button only"); }
+bool Collision::Touched(int hand, Touch& out)
+{
+    const int h = hand & 1;
+    std::lock_guard lk(g_TouchM);
+    out = g_TouchPub[h];
+    return out.valid && Now() - g_TouchAt[h] < 0.12;
+}
+bool Collision::TakeCloseRequest(int hand, uint32_t* id, float point[3])
+{
+    const int h = hand & 1;
+    std::lock_guard lk(g_TouchM);
+    if (!g_CloseReq[h].id || Now() - g_CloseReq[h].at > 0.3) { g_CloseReq[h] = CloseReq{}; return false; }
+    *id = g_CloseReq[h].id;
+    if (point) memcpy(point, g_CloseReq[h].p, 12);
+    g_CloseReq[h] = CloseReq{};
+    return true;
+}
+std::string Collision::PointerDescribe() { std::lock_guard lk(g_TouchM); return g_PointerDesc; }
+void Collision::Push(void* ent, const float impulse[3], const float at[3]) { if (ent) PostImpulse(ent, impulse, at); }
+void Collision::KeyholeProbe()
+{
+    if (!Log::Enabled()) return;
+    static int logs = 0; static uint32_t lastDoor = 0; static double lastAt = -1e9;
+    if (logs >= 80) return;
+    float eye[3], ax[9];
+    if (!HandAimHook::RealCamera(eye, ax)) return;
+    {   // the real head, where the view puts it
+        float vo[3], go[3], hm[3];
+        if (ViewMatrixHook::ViewAnchor(vo, go, hm)) for (int i = 0; i < 3; i++) { const float d = vo[i] - go[i]; if (fabsf(d) < 1.5f) eye[i] += d; }
+    }
+    const float to[3] = { eye[0] + ax[0] * 0.30f, eye[1] + ax[1] * 0.30f, eye[2] + ax[2] * 0.30f };
+    RayHit h;
+    if (!CastHand(eye, to, nullptr, 0, h) || !h.ent || !IsDoor(h.ent) || h.dist > 0.22f) return;
+    uint32_t id = 0; SafeRead(&id, (uint8_t*)h.ent + kEntId, 4);
+    const double now = Now();
+    if (id == lastDoor && now - lastAt < 8.0) { lastAt = now; return; }   // the same approach
+    lastDoor = id; lastAt = now; logs++;
+    float org[3] = {}, da[9] = {};
+    const bool fr = SafeRead(org, (uint8_t*)h.ent + 0x310, 12) && SafeRead(da, (uint8_t*)h.ent + 0x31C, 36);   // (D2 +0x300 / +0x30C)
+    auto local = [&](const float* w, float o[3]) { const float d[3] = { w[0] - org[0], w[1] - org[1], w[2] - org[2] }; for (int r = 0; r < 3; r++) o[r] = d[0] * da[r * 3] + d[1] * da[r * 3 + 1] + d[2] * da[r * 3 + 2]; };
+    float le[3] = {}, lh[3] = {}; if (fr) { local(eye, le); local(h.pos, lh); }
+    BodyHide::Anchor an[BodyHide::aCount]; BodyHide::GetAnchors(an);
+    const float feet = an[BodyHide::aPlayer].valid ? an[BodyHide::aPlayer].org[2] : eye[2];
+    LOGI("Collision: keyhole research: the eyes {:.0f} cm from door {:#x} ({}), {:.2f} m over the feet; in the door's frame (fwd, left, up from its origin) the eyes ({:.2f}, {:.2f}, {:.2f}), the point looked at ({:.2f}, {:.2f}, {:.2f}); the interaction sensor has {:#x} ({}){}",
+         h.dist * 100.f, id, DescribeEnt(h.ent), eye[2] - feet, le[0], le[1], le[2], lh[0], lh[1], lh[2], (uint32_t)GrabHand::TargetId(), PointerDescribe(),
+         PlayerState::Running("Peeking") ? ", peeking now" : "");
+}
+void Collision::NoteInteract(uint32_t id)
+{
+    if (!id || id == 0x3FFF0010u) return;
+    { std::lock_guard lk(g_FrontM); if (g_InteractAt.size() > 256) g_InteractAt.clear(); g_InteractAt[id] = Now(); }
+    void* e = BodyHide::EntityById((int)id);
+    if (e) DoorHold::OnInteract(e);
+    if (!e || !IsUsableFront(e)) return;
+    int now = 0;
+    { std::lock_guard lk(g_FrontM); if (g_FrontOpen.size() > 256) g_FrontOpen.clear(); now = g_FrontOpen[id] ^= 1; }
+    LOGI("Collision: cabinet front '{}' (id {:#x}) interacted with: counted {} now", EntityName(e), id, now ? "OPEN" : "closed");
+}
+std::string Collision::Describe(void* ent) { return DescribeEnt(ent); }
+std::string Collision::Name(void* ent) { return ent ? EntityName(ent) : std::string(); }
+bool Collision::IsWindow(uint32_t id)
+{
+    if (!id || id == 0x3FFF0010u) return false;
+    return IsWindowEnt(BodyHide::EntityById((int)id));
+}
+void Collision::SetDoors(bool on) { g_Doors = on; LOGI("Collision: doors {}", on ? "open when a hand pushes them (with HandCollision)" : "only open with the interact button"); }
+bool Collision::HandsOn() { return g_Hands.load(); }
+bool Collision::WeaponsOn() { return g_Weapons.load(); }
+bool Collision::Touching(int hand) { return g_Touch[hand & 1].load(); }
+
+bool Collision::WorldRay(const float a[3], const float b[3], float& dist)
+{
+    RayHit h;
+    if (!CastRay(a, b, 0x27, 0x100000, nullptr, 0, h)) return false;
+    dist = h.dist;
+    return true;
+}
+
+void Collision::Tick()
+{
+    if (!g_Hands.load() && !g_Weapons.load()) { DoorHold::Tick(Now()); return; }
+    if (HandAimHook::Mode() < 2) { { std::lock_guard lk(g_PubM); g_Pub[0].n = g_Pub[1].n = 0; } DoorHold::Tick(Now()); return; }
+    const double now = Now();
+    const double dt = g_LastTick > 0 ? now - g_LastTick : 0.0;
+    g_LastTick = now;
+    g_Ticks++;
+
+    float eye[3], view[9];
+    if (!HandAimHook::RealCamera(eye, view)) { DoorHold::Tick(now); return; }
+    // a snap turn or a teleport moves every point at once: start each again from the eye
+    const float yaw = atan2f(view[1], view[0]) * 57.29578f;
+    bool jump = !g_CamValid || dt <= 0.0 || dt > 0.25;
+    if (g_CamValid)
+    {
+        float dy = yaw - g_LastYaw; while (dy > 180.f) dy -= 360.f; while (dy < -180.f) dy += 360.f;
+        const float dp[3] = { eye[0] - g_LastCam[0], eye[1] - g_LastCam[1], eye[2] - g_LastCam[2] };
+        if (fabsf(dy) > C.jumpYaw || Len(dp) > C.jumpPos) jump = true;
+    }
+    g_LastYaw = yaw; memcpy(g_LastCam, eye, 12); g_CamValid = true;
+    if (jump) g_Resets++;
+
+    BodyHide::Anchor an[BodyHide::aCount]; BodyHide::GetAnchors(an);
+    if (const uint32_t cid = g_ClassifyId.exchange(0))
+    {   // an item just taken by hand: food (to the mouth only) or something to keep?
+        void* ce = BodyHide::EntityById((int)cid);
+        g_FoodState = ce ? ClassifyFood(ce) : 0;
+    }
+    if (const uint32_t wid = g_WatchId.load())
+    {   // the item being stored: gone from the world (taken, eaten) or still there (refused)
+        void* we = BodyHide::EntityById((int)wid);
+        uint8_t hidden = 0; if (we) SafeRead(&hidden, (uint8_t*)we + 0xD8, 1);   // (D2 +0xD0)
+        g_WatchState = (we && !(hidden & 1) && IsItem(we)) ? 1 : 0;
+    }
+    {   // what the pointer has picked: an item (taken only by hand, PhysicalPickup)? an openable, open or closed?
+        const int pid = GrabHand::TargetId();
+        void* pe = pid > 0 && pid != 0x3FFF0010 ? BodyHide::EntityById(pid) : nullptr;
+        g_PointerItem = g_Items.load() && pe && IsHandItem(pe) ? (uint32_t)pid : 0u;
+        // (a door counts: cabinets are often doors -- measured, the grip on a cabinet 25-40 cm from the hand found
+        // nothing to pull; its open state is the door's, see DoorOpen)
+        const int os = g_Openables.load() ? OpenOrNot(pe) : -1;
+        // something the interact picks up and holds (a bottle, a glass: arkCpntPickable_Simple; a body: the sensor's
+        // carry pick) -- what the grip takes as a physical grab
+        const bool simple = pe && HasComponent(pe, kPickableSimpleType);
+        g_PointerHoldable = pe && (simple || pid == GrabHand::CarryTargetId()) ? (uint32_t)pid : 0u;
+        g_PointerHoldKind = simple ? 1 : 2;
+        g_PointerOpenable = os < 0 ? -1 : (int)(((uint32_t)pid << 1) | (uint32_t)os);
+        static int descId = -1; static double descAt = 0;
+        if (pid != descId || now - descAt > 0.5)
+        {   // what it is, for KbmInject's logs (the grip, the trigger, a hand's interact)
+            descId = pid; descAt = now;
+            std::string d = DescribeEnt(pe);
+            if (pe && pid == GrabHand::CarryTargetId()) d += " carriable";
+            std::lock_guard lk(g_TouchM); g_PointerDesc = d;
+        }
+    }
+    void* skip[8]; int nskip = 0;
+    for (int k = 0; k < BodyHide::aCount; k++) if (an[k].valid && an[k].ent) skip[nskip++] = an[k].ent;
+    if (void* held = GrabHand::HeldEntity()) skip[nskip++] = held;
+
+    float curl[2] = {};                         // how far each hand is closed (the grip's curl: the drawn fingers' too)
+    { XRInputState xin; if (VRRuntime::GetInput(xin)) { curl[0] = xin.gripL; curl[1] = xin.gripR; } }
+    for (int h = 0; h < 2; h++)
+    {
+        HandState& S = g_H[h];
+        float hr[9], ht[3];
+        if (!GpuTrace::RawHandPose(h, ht, hr)) { S.valid = false; std::lock_guard lk(g_PubM); g_Pub[h].n = 0; g_Touch[h] = false; continue; }
+        float wo[3], wa[9]; void* ent = nullptr;
+        const bool item = GpuTrace::HandItemDraws(h) > 0 && GpuTrace::RawItemPose(h, wo, wa, &ent);
+        Pt pts[kMaxPts];
+        const int np = BuildPoints(h, hr, ht, item, wo, wa, ent, curl[h], pts);
+        if (np != S.npts || ent != S.item)
+        {
+            S.valid = false;
+            LOGI("Collision: {} hand now collides with {} points{}", h ? "right" : "left", np,
+                 item && np > (g_Hands.load() ? 1 : 0) ? fmt::format(" (holding {}: its points from {:.2f} to {:.2f} m ahead of the palm)", DescribeEnt(ent),
+                                                                    pts[g_Hands.load() ? 1 : 0].local[0], pts[np - 1].local[0])
+                      : item ? fmt::format(" (holding {}: no points of its own)", DescribeEnt(ent))
+                      : std::string(" (empty hand)"));
+            S.npts = np; S.item = ent;
+        }
+        if (jump) S.valid = false;
+
+        float goal[kMaxPts][3];
+        for (int i = 0; i < np; i++) ToWorld(hr, ht, pts[i].local, goal[i]);
+
+        Contact cs[kMaxContacts]; void* cents[kMaxContacts] = {}; HitLog logs[kMaxContacts] = {}; int nc = 0;
+        if (S.ghost)
+        {   // passing through: back to solid once the eye sees the palm again (it is out in the open)
+            RayHit eh;
+            if (np > 0 && !CastRay(eye, goal[0], kWorldLayers, kWorldFlags, skip, nskip, eh)) { S.ghost = false; S.valid = false; }
+        }
+        if (!S.ghost)
+        {
+            for (int i = 0; i < np; i++)
+            {
+                float res[3];
+                if (!S.valid)
+                {   // from the eye: nothing between the head and the hand, or the hand stops at what is
+                    Sweep(eye, goal[i], pts[i].r, skip, nskip, pts[i].local, cs, nc, cents, logs, res);
+                }
+                else Sweep(S.prevRes[i], goal[i], pts[i].r, skip, nskip, pts[i].local, cs, nc, cents, logs, res);
+            }
+        }
+        float off[3];
+        Solve(hr, ht, cs, nc, off);
+        const float sep = Len(off);
+        if (sep > C.maxSep)
+        {   // the real hand went far through: let the drawn one follow it rather than lag behind
+            if (!S.ghost)
+            {   // reported: the sword passes through walls -- a blade stopped far from the hand lets go here
+                g_Ghosts[h]++;
+                static int logged = 0;
+                if (logged++ < 30) LOGI("Collision: {} hand {} pushed {:.0f} cm back by what it met: lets go, passes through (until the eye sees the palm)",
+                                        h ? "right" : "left", item ? "with its weapon" : "(empty)", sep * 100.f);
+            }
+            nc = 0; off[0] = off[1] = off[2] = 0.f; S.ghost = true;
+        }
+        g_LastOff[h] = sep > C.maxSep ? 0.f : sep;
+
+        // doors: pushed by the real hand (moving into it, or pressed past its surface) -- the game's own door push
+        if (g_Doors.load() && S.valid && dt > 1e-4 && dt < 0.1 && nc > 0)
+        {
+            for (int i = 0; i < nc; i++)
+            {
+                void* e = cents[i];
+                if (!e || !IsDoor(e)) continue;
+                if (g_Windows.load() && IsWindowEnt(e)) continue;   // a window moves by sliding, not pushing
+                int pi = -1; for (int k = 0; k < np; k++) if (!memcmp(pts[k].local, cs[i].local, 12)) { pi = k; break; }
+                if (pi < 0) continue;
+                float v[3]; for (int k = 0; k < 3; k++) v[k] = (goal[pi][k] - S.prevRaw[pi][k]) / (float)dt;
+                const float into = -Dot(v, cs[i].n);
+                const float d[3] = { goal[pi][0] - cs[i].p[0], goal[pi][1] - cs[i].p[1], goal[pi][2] - cs[i].p[2] };
+                const float past = cs[i].clear - Dot(d, cs[i].n);    // how far the real point is behind the surface
+                // a door whose swing the hand drives (DoorsFollowHand): the press sets how far it goes; pushed against
+                // its swing (from the other side), the interact below turns it round
+                const int held = DoorHold::Press(e, h, cs[i].p, cs[i].n, past, into, now);
+                if (held == 1) continue;
+                auto it = g_DoorAt.find(e);
+                if (it != g_DoorAt.end() && now - it->second < C.doorGap) continue;
+                if (into < C.doorSpeed && past < C.doorPress) continue;
+                if (g_DoorAt.size() > 64) g_DoorAt.clear();
+                g_DoorAt[e] = now;
+                uint32_t id = 0; SafeRead(&id, (uint8_t*)e + kEntId, 4);
+                // An OPEN door pushed closes: the game's push only ever swings a closed door open (away from the
+                // pusher), and the scripts' close did nothing on a door the push had opened (its openable still said
+                // closed). So it is the player's own interact on that door, the one a keyboard player closes it with:
+                // KbmInject aims the interaction sensor at the point the hand pushed and presses it. Either hand.
+                if (g_DoorMem.size() > 128) g_DoorMem.clear();
+                const char* how = "";
+                const int dstate = DoorOpen(e, &how);
+                if (dstate == 1 || held == -1)
+                {   // (a held door pushed against its swing: the interact turns it round, whichever way it was going)
+                    const float at[3] = { cs[i].p[0] - cs[i].n[0] * 0.02f, cs[i].p[1] - cs[i].n[1] * 0.02f, cs[i].p[2] - cs[i].n[2] * 0.02f };
+                    DoorHold::Begin(e, now);   // (before the interact: it is the hand's, the swing stays held)
+                    RequestInteract(h, id, at, now);
+                    g_DoorMem[e] = 0;
+                    LOGI("Collision: {} hand pushed OPEN door '{}' (id {:#x}; {}) at {:.2f} m/s, {:.0f} cm past its surface: interact to close it",
+                         h ? "right" : "left", EntityName(e), id, how, into, past * 100.f);
+                    VRRuntime::Vibrate(h, 0.35f, 0.04f);
+                    continue;
+                }
+                if (Probes::DoorImpulseTest(e, cs[i].p, cs[i].n, h)) { VRRuntime::Vibrate(h, 0.35f, 0.04f); continue; }   // (research, profiling only)
+                const bool ok = PushDoor(e, an[BodyHide::aPlayer].valid ? an[BodyHide::aPlayer].ent : nullptr);
+                if (ok) { g_DoorMem[e] = 1; DoorHold::Begin(e, now); }
+                LOGI("Collision: {} hand pushed door '{}' (id {:#x}; {}) at {:.2f} m/s, {:.0f} cm past its surface: {}",
+                     h ? "right" : "left", EntityName(e), id, how, into, past * 100.f, ok ? "the game's door push sent" : "COULD NOT SEND");
+                VRRuntime::Vibrate(h, 0.35f, 0.04f);
+            }
+        }
+        // a safe's dial under the hand: sliding the hand up turns it on a digit (the game's click), down back one
+        if (g_Dials.load() && S.valid)
+        {
+            DialSwipe& D = g_Dial[h];
+            int di = -1; uint8_t* du = nullptr;
+            for (int i = 0; i < nc && di < 0; i++) if (cents[i] && (du = DialOf(cents[i])) != nullptr) di = i;
+            // ...or, recessed as they are, by reach: the wheel the pointer has (or the one being swiped) near the hand
+            void* nearEnt = nullptr; uint8_t* nearU = nullptr; float nearOrg[3] = {};
+            auto handTo = [&](const float o[3]) {
+                float best = 1e9f;
+                for (int k = 0; k < np && k < 4; k++)      // the palm and the fingers (the item's points come after)
+                {
+                    const float d[3] = { goal[k][0] - o[0], goal[k][1] - o[1], goal[k][2] - o[2] };
+                    best = fminf(best, sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]));
+                }
+                return best;
+            };
+            if (di < 0 && h == GrabHand::Hand() && np > 0)
+            {
+                if (D.byReach && D.ent && now - D.lastAt < 0.3 && handTo(D.org) < kDialKeep)
+                { nearEnt = D.ent; nearU = D.u; memcpy(nearOrg, D.org, 12); }
+                else
+                {
+                    const int tid = GrabHand::TargetId();
+                    void* te = tid > 0 && tid != 0x3FFF0010 ? BodyHide::EntityById(tid) : nullptr;
+                    uint8_t* tu = te ? DialOf(te) : nullptr;
+                    float o[3];
+                    if (tu && GrabHand::TargetPoint(o) && handTo(o) < kDialReach) { nearEnt = te; nearU = tu; memcpy(nearOrg, o, 12); }
+                }
+            }
+            if (di < 0 && nearEnt)
+            {
+                if (D.ent != nearEnt || !D.byReach || now - D.lastAt > 0.3)
+                {
+                    D = DialSwipe{}; D.ent = nearEnt; D.u = nearU; D.byReach = true; D.since = now; memcpy(D.org, nearOrg, 12);
+                    LOGI("Collision: {} hand at a safe dial (by reach: {:.0f} cm from its centre)", h ? "right" : "left", handTo(nearOrg) * 100.f);
+                }
+                if (now - D.since >= kDialSettle)
+                {
+                    if (D.prevOk) D.acc += goal[0][2] - D.prev[2];        // the palm, world up (z)
+                    memcpy(D.prev, goal[0], 12); D.prevOk = true;
+                    while (D.acc >= kDialStep && D.pending < 3) { D.pending++; D.acc -= kDialStep; }
+                    while (D.acc <= -kDialStep && D.pending > -3) { D.pending--; D.acc += kDialStep; }
+                    if (D.acc > kDialStep || D.acc < -kDialStep) D.acc = 0.f;
+                }
+                D.lastAt = now;
+            }
+            if (di >= 0)
+            {
+                int pi = -1; for (int k = 0; k < np; k++) if (!memcmp(pts[k].local, cs[di].local, 12)) { pi = k; break; }
+                if (D.ent != cents[di] || D.byReach || now - D.lastAt > 0.3) { D = DialSwipe{}; D.ent = cents[di]; D.u = du; }
+                if (pi >= 0)
+                {
+                    if (D.prevOk) D.acc += goal[pi][2] - D.prev[2];       // world up (z)
+                    memcpy(D.prev, goal[pi], 12); D.prevOk = true;
+                    while (D.acc >= kDialStep && D.pending < 3) { D.pending++; D.acc -= kDialStep; }
+                    while (D.acc <= -kDialStep && D.pending > -3) { D.pending--; D.acc += kDialStep; }
+                    if (D.acc > kDialStep || D.acc < -kDialStep) D.acc = 0.f;   // more queued than it can take: drop the rest
+                }
+                D.lastAt = now;
+            }
+            if (D.u && D.pending != 0 && now - D.lastAt < 1.0)
+            {   // one step a frame, as soon as the dial has finished turning
+                int stage = -1;
+                if (StepDial(D.u, D.pending > 0 ? 1 : -1, &stage))
+                {
+                    LOGI("Collision: {} hand turned a safe dial {} -> {}", h ? "right" : "left", D.pending > 0 ? "up" : "down", stage);
+                    D.pending += D.pending > 0 ? -1 : 1; g_DialSteps++;
+                    VRRuntime::Vibrate(h, 0.2f, 0.015f);
+                }
+            }
+            else if (now - D.lastAt >= 1.0) D = DialSwipe{};
+        }
+        // a sliding window under the (grabbing) hand: slide up raises it, slide down lowers it
+        if (g_Windows.load() && S.valid)
+        {
+            WinSwipe& W = g_Win[h];
+            int wi = -1; int wstate = -1;
+            for (int i = 0; i < nc && wi < 0; i++)
+            {
+                void* e = cents[i];
+                if (!e) continue;
+                if (IsWindowEnt(e)) { wi = i; wstate = OpenableState(e); }
+            }
+            void* we = wi >= 0 ? cents[wi] : nullptr;
+            int pi = -1;
+            if (we) { for (int k = 0; k < np; k++) if (!memcmp(pts[k].local, cs[wi].local, 12)) { pi = k; break; } }
+            else if (np > 0)
+            {   // The sliding part is often out of reach: an open sash sits recessed behind the fixed one, so the hand
+                // swiping down to close it meets the fixed sash or the frame (another entity, or the level itself). So
+                // the window the pointer has picked counts too, while the hand rests on something (any contact) within
+                // kWindowReach of the window's origin, or is within kWindowNear of it in the air; the palm's travel.
+                const int tid = GrabHand::TargetId();
+                void* te = tid > 0 && tid != 0x3FFF0010 ? BodyHide::EntityById(tid) : nullptr;
+                float o[3];
+                if (te && GrabHand::TargetPoint(o))
+                {
+                    const int os = OpenableState(te);
+                    if (IsWindowEnt(te))
+                    {
+                        const float d[3] = { goal[0][0] - o[0], goal[0][1] - o[1], goal[0][2] - o[2] };
+                        const float dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                        if ((nc > 0 && dist < kWindowReach) || dist < kWindowNear)
+                        {
+                            we = te; wstate = os; pi = 0;
+                            if (W.ent != we || now - W.lastAt > 0.3)
+                                LOGI("Collision: {} hand at window '{}' by the pointer ({}, {:.0f} cm from its origin)", h ? "right" : "left",
+                                     EntityName(te), nc > 0 ? "resting on something" : "in the air", dist * 100.f);
+                        }
+                    }
+                }
+            }
+            if (we)
+            {
+                if (W.ent != we || now - W.lastAt > 0.3) { W = WinSwipe{}; W.ent = we; }
+                if (pi >= 0)
+                {
+                    if (W.prevOk) W.acc += goal[pi][2] - W.prev[2];
+                    memcpy(W.prev, goal[pi], 12); W.prevOk = true;
+                }
+                W.lastAt = now;
+                const int dir = W.acc >= kWindowSwipe ? 1 : (W.acc <= -kWindowSwipe ? -1 : 0);
+                uint32_t id = 0; SafeRead(&id, (uint8_t*)we + kEntId, 4);
+                if (dir && now - W.movedAt > 1.0)
+                {   // up opens a closed one, down closes an open one; with no open state to read, every swipe toggles,
+                    // but not twice the same way in a row (remembered per window, across touches)
+                    if (wstate < 0) { int where = -1; wstate = OpenableMachineState(we, &where); }
+                    static std::unordered_map<uint32_t, int> lastDir;   // game thread
+                    if (lastDir.size() > 64) lastDir.clear();
+                    const bool want = wstate >= 0 ? (dir > 0 ? wstate == 0 : wstate == 1) : dir != lastDir[id];
+                    if (want)
+                    {
+                        float at[3];
+                        if (wi >= 0) for (int k = 0; k < 3; k++) at[k] = cs[wi].p[k] - cs[wi].n[k] * 0.02f;
+                        else if (!GrabHand::TargetPoint(at)) memcpy(at, goal[0], 12);
+                        RequestInteract(h, id, at, now);
+                        W.movedAt = now; W.lastDir = dir; lastDir[id] = dir; g_WindowMoves++;
+                        LOGI("Collision: {} hand slid {} on window '{}' (id {:#x}, {}): interact", h ? "right" : "left", dir > 0 ? "UP" : "DOWN",
+                             EntityName(we), id, wstate < 0 ? "a door" : wstate ? "open" : "closed");
+                    }
+                    W.acc = 0.f;
+                }
+            }
+        }
+        // TouchToUse: buttons, switches and levers by an empty hand -- a poke into one, or the grip closed on one and a pull
+        if (g_Usables.load() && S.valid && !item && dt > 1e-4 && dt < 0.1)
+        {
+            UseHand& U = g_UseH[h];
+            bool blockedSeen = false;
+            for (int i = 0; i < nc; i++)
+            {
+                void* e = cents[i];
+                if (!e) continue;
+                if (e == U.blocked) { blockedSeen = true; continue; }
+                // what is already worked another way, or is not a thing to use: doors, windows, drawers and cabinets,
+                // items, notes, characters, loose objects (pushed), safe dials, what the game holds
+                if (IsDoor(e) || IsWindowEnt(e) || OpenOrNot(e) >= 0 || IsUsableFront(e) || IsItem(e) || IsReadable(e) || IsCharacter(e)
+                    || Pushable(e) || DialOf(e) || HasComponent(e, kPickableSimpleType)) continue;
+                int pi = -1; for (int k = 0; k < np; k++) if (!memcmp(pts[k].local, cs[i].local, 12)) { pi = k; break; }
+                if (pi < 0) continue;
+                U.touch = e; U.touchAt = now; memcpy(U.tp, cs[i].p, 12); memcpy(U.tn, cs[i].n, 12);
+                float v[3]; for (int k = 0; k < 3; k++) v[k] = (goal[pi][k] - S.prevRaw[pi][k]) / (float)dt;
+                const float into = -Dot(v, cs[i].n);
+                const float d[3] = { goal[pi][0] - cs[i].p[0], goal[pi][1] - cs[i].p[1], goal[pi][2] - cs[i].p[2] };
+                const float past = cs[i].clear - Dot(d, cs[i].n);
+                const bool poke = (into >= kPokeSpeed && past >= kPokePast) || past >= kPokePress;
+                if (!poke) continue;
+                auto it = g_UseAt.find(e);
+                if (it != g_UseAt.end() && now - it->second < kUseGap) continue;
+                if (g_UseAt.size() > 128) g_UseAt.clear();
+                g_UseAt[e] = now; U.blocked = e; blockedSeen = true;
+                uint32_t id = 0; SafeRead(&id, (uint8_t*)e + kEntId, 4);
+                const float at[3] = { cs[i].p[0] - cs[i].n[0] * 0.02f, cs[i].p[1] - cs[i].n[1] * 0.02f, cs[i].p[2] - cs[i].n[2] * 0.02f };
+                RequestInteract(h, id, at, now);
+                g_Uses++;
+                VRRuntime::Vibrate(h, 0.3f, 0.03f);
+                LOGI("Collision: {} hand pressed '{}' (id {:#x}; {}) at {:.2f} m/s, {:.0f} cm in: interact on it, if the game uses it",
+                     h ? "right" : "left", EntityName(e), id, DescribeEnt(e), into, past * 100.f);
+                break;
+            }
+            if (!blockedSeen) U.blocked = nullptr;     // (the hand has left it: it can be pressed again)
+            // the grip closed with the hand on one (within the last 0.3 s), then the hand moved: a lever pulled, a switch flipped
+            const bool grip = KbmInject::GripIdle(h);
+            if (grip && !U.grip && !U.gripDone && U.touch && now - U.touchAt < 0.3)
+            {
+                U.grip = true; U.gripEnt = U.touch; memcpy(U.gripStart, goal[0], 12); memcpy(U.gp, U.tp, 12); memcpy(U.gn, U.tn, 12);
+                LOGI("Collision: {} grip closed on '{}': move the hand to pull it", h ? "right" : "left", EntityName(U.gripEnt));
+            }
+            if (!grip) { if (U.grip) LOGI("Collision: {} grip let go of '{}' without pulling it", h ? "right" : "left", EntityName(U.gripEnt)); U.grip = false; U.gripDone = false; }
+            if (U.grip)
+            {
+                const float m[3] = { goal[0][0] - U.gripStart[0], goal[0][1] - U.gripStart[1], goal[0][2] - U.gripStart[2] };
+                const float moved = Len(m);
+                if (moved >= kPull)
+                {
+                    U.grip = false; U.gripDone = true;
+                    auto it = g_UseAt.find(U.gripEnt);
+                    if (it == g_UseAt.end() || now - it->second >= kUseGap)
+                    {
+                        g_UseAt[U.gripEnt] = now;
+                        uint32_t id = 0; SafeRead(&id, (uint8_t*)U.gripEnt + kEntId, 4);
+                        const float at[3] = { U.gp[0] - U.gn[0] * 0.02f, U.gp[1] - U.gn[1] * 0.02f, U.gp[2] - U.gn[2] * 0.02f };
+                        RequestInteract(h, id, at, now);
+                        g_UsePulls++;
+                        VRRuntime::Vibrate(h, 0.4f, 0.04f);
+                        LOGI("Collision: {} hand pulled '{}' (id {:#x}) {:.0f} cm with the grip: interact on it, if the game uses it",
+                             h ? "right" : "left", EntityName(U.gripEnt), id, moved * 100.f);
+                    }
+                }
+            }
+        }
+        // ClimbByHand: a top face under this hand (the hand resting on a ledge, a wall's top, a crate's lid)
+        for (int i = 0; i < nc; i++)
+            if (cs[i].n[2] > 0.7f) { g_Ledge[h].at = now; memcpy(g_Ledge[h].p, cs[i].p, 12); break; }
+        // research for a knock to lure guards (logging only): the empty hand rapping on something, hard but not a punch
+        if (!item && S.valid && dt > 1e-4 && dt < 0.1 && now - g_KnockAt[h] > 0.25)
+        {
+            for (int i = 0; i < nc; i++)
+            {
+                int pi = -1; for (int k = 0; k < np; k++) if (!memcmp(pts[k].local, cs[i].local, 12)) { pi = k; break; }
+                if (pi < 0) continue;
+                float v[3]; for (int k = 0; k < 3; k++) v[k] = (goal[pi][k] - S.prevRaw[pi][k]) / (float)dt;
+                const float into = -Dot(v, cs[i].n);
+                if (into < 1.0f || into > 5.0f) continue;
+                g_KnockAt[h] = now; g_Knocks++;
+                static int logs = 0;
+                if (logs++ < 200)
+                    LOGI("Collision: {} hand KNOCKED on {} at {:.1f} m/s (point {:.2f} {:.2f} {:.2f}, its face {:.2f} {:.2f} {:.2f}): a knock (research: nothing is heard by the guards yet)",
+                         h ? "right" : "left", cents[i] ? fmt::format("'{}' ({})", EntityName(cents[i]), DescribeEnt(cents[i])) : std::string("the level"), into,
+                         cs[i].p[0], cs[i].p[1], cs[i].p[2], cs[i].n[0], cs[i].n[1], cs[i].n[2]);
+                break;
+            }
+        }
+        // what this hand touches (the first contact with an entity), for KbmInject's grab-and-pull on drawers and cabinets;
+        // pushing an OPEN one (not a door: those have their own push) closes it
+        {
+            Touch tch;
+            for (int i = 0; i < nc && !tch.valid; i++)
+            {
+                void* e = cents[i];
+                if (!e) continue;
+                tch.valid = true; tch.ent = e; memcpy(tch.n, cs[i].n, 12); memcpy(tch.p, cs[i].p, 12);
+                tch.item = g_Items.load() && IsHandItem(e);
+                SafeRead(&tch.id, (uint8_t*)e + kEntId, 4);
+                const int os = g_Openables.load() ? OpenOrNot(e) : -1;
+                tch.openable = os >= 0; tch.open = os == 1;
+                if (tch.open && !IsDoor(e) && !(g_Windows.load() && IsWindowEnt(e)) && S.valid && dt > 1e-4 && dt < 0.1)
+                {
+                    int pi = -1; for (int k = 0; k < np; k++) if (!memcmp(pts[k].local, cs[i].local, 12)) { pi = k; break; }
+                    if (pi >= 0)
+                    {
+                        float v[3]; for (int k = 0; k < 3; k++) v[k] = (goal[pi][k] - S.prevRaw[pi][k]) / (float)dt;
+                        const float into = -Dot(v, cs[i].n);
+                        const float d[3] = { goal[pi][0] - cs[i].p[0], goal[pi][1] - cs[i].p[1], goal[pi][2] - cs[i].p[2] };
+                        const float past = cs[i].clear - Dot(d, cs[i].n);
+                        auto it = g_DoorAt.find(e);
+                        const bool front = IsUsableFront(e);
+                        const bool pushing = front ? into >= C.doorSpeed : (into >= C.doorSpeed || past >= C.doorPress);
+                        const double since = SinceInteract(tch.id, now);
+                        if (pushing && since < kOpenSettle)
+                        {
+                            static double toldAt = -10.0;
+                            if (now - toldAt > 1.0)
+                            {
+                                toldAt = now;
+                                LOGI("Collision: {} hand against '{}' (id {:#x}) {:.2f} s after it was opened ({:.2f} m/s, {:.0f} cm past its surface): not a push to close it yet",
+                                     h ? "right" : "left", EntityName(e), tch.id, since, into, past * 100.f);
+                            }
+                        }
+                        else if (pushing && (it == g_DoorAt.end() || now - it->second >= C.doorGap))
+                        {   // closed directly (either hand, no pointer needed): closing needs no key
+                            g_DoorAt[e] = now;
+                            if (front)
+                            {   // a cabinet front has no openable: the game's interact on it, aimed where the hand pushed
+                                const float at[3] = { cs[i].p[0] - cs[i].n[0] * 0.02f, cs[i].p[1] - cs[i].n[1] * 0.02f, cs[i].p[2] - cs[i].n[2] * 0.02f };
+                                RequestInteract(h, tch.id, at, now);
+                                VRRuntime::Vibrate(h, 0.3f, 0.04f);
+                                LOGI("Collision: {} hand pushed the open cabinet front '{}' (id {:#x}) at {:.2f} m/s, {:.0f} cm past its surface: interact to close it",
+                                     h ? "right" : "left", EntityName(e), tch.id, into, past * 100.f);
+                                continue;
+                            }
+                            const bool ok = CloseOpenable(e);
+                            if (ok) VRRuntime::Vibrate(h, 0.3f, 0.04f);
+                            LOGI("Collision: {} hand pushed an open drawer / cabinet {} (id {:#x}) at {:.2f} m/s: {}", h ? "right" : "left", e, tch.id, into,
+                                 ok ? "closing it (the scripts' close)" : "COULD NOT CLOSE");
+                        }
+                    }
+                }
+            }
+            std::lock_guard lk(g_TouchM); g_TouchPub[h] = tch; g_TouchAt[h] = now;
+        }
+        // pushes: what the real hand drives into a loose object (relative to the object's own velocity)
+        if (g_Push.load() && S.valid && dt > 1e-4 && dt < 0.1 && nc > 0)
+        {
+            void* pushed[kMaxContacts]; int npushed = 0;
+            for (int i = 0; i < nc; i++)
+            {
+                void* e = cents[i];
+                if (!Pushable(e) || IsDoor(e) || OpenableState(e) >= 0) continue;
+                bool dup = false; for (int k = 0; k < npushed; k++) if (pushed[k] == e) dup = true;
+                if (dup) continue;
+                int pi = -1; for (int k = 0; k < np; k++) if (!memcmp(pts[k].local, cs[i].local, 12)) { pi = k; break; }
+                if (pi < 0) continue;
+                float v[3]; for (int k = 0; k < 3; k++) v[k] = (goal[pi][k] - S.prevRaw[pi][k]) / (float)dt;
+                float vb[3] = {}; SafeRead(vb, (uint8_t*)e + kEntVelocity, 12); if (!Finite(vb, 3)) memset(vb, 0, 12);
+                const float rel[3] = { v[0] - vb[0], v[1] - vb[1], v[2] - vb[2] };
+                const float into = fminf(C.pushMaxV, -Dot(rel, cs[i].n));
+                if (into < C.pushMin) continue;
+                const float J = g_HandMass.load() * into;
+                const float imp[3] = { -cs[i].n[0] * J, -cs[i].n[1] * J, -cs[i].n[2] * J };
+                PostImpulse(e, imp, cs[i].p);
+                pushed[npushed++] = e;
+                static std::unordered_map<void*, double> told;   // game thread
+                if (told.size() > 64) told.clear();
+                double& at = told[e];
+                if (now - at > 1.0)
+                {
+                    at = now;
+                    LOGI("Collision: {} hand pushed '{}' at {:.2f} m/s: impulse {:.2f} (PushStrength {:.1f} kg){}", h ? "right" : "left",
+                         EntityName(e), into, J, g_HandMass.load(), Dynamic(e) ? "" : ", it was at rest");
+                }
+            }
+        }
+        // a buzz on touching, as hard as the hand came in
+        const bool touching = nc > 0;
+        if (touching && !S.contact && S.valid && dt > 1e-4 && now - S.lastBuzz > C.buzzGap)
+        {
+            float vn = 0.f;
+            for (int i = 0; i < nc; i++)
+                for (int k = 0; k < np; k++)
+                    if (!memcmp(pts[k].local, cs[i].local, 12))
+                    {
+                        float v[3]; for (int j = 0; j < 3; j++) v[j] = (goal[k][j] - S.prevRaw[k][j]) / (float)dt;
+                        vn = fmaxf(vn, -Dot(v, cs[i].n));
+                    }
+            VRRuntime::Vibrate(h, fminf(C.buzzMax, C.buzzMin + 0.25f * vn), 0.025f);
+            S.lastBuzz = now;
+            g_Stops[h]++;
+            std::lock_guard lk(g_DescM);
+            g_LastHitDesc = fmt::format("hand {} met entity {} {} body {:#x} layer {} flags {:#x} at ({:.2f},{:.2f},{:.2f}){} {:.2f} m/s",
+                                        h, logs[0].ent, logs[0].ent ? DescribeEnt(logs[0].ent) : std::string("(the level)"), logs[0].body, logs[0].cfi & 0x1F, logs[0].cfi >> 5, logs[0].p[0], logs[0].p[1], logs[0].p[2],
+                                        Pushable(logs[0].ent) ? " (loose: pushed)" : "", vn);
+            LOGI("Collision: {}", g_LastHitDesc);
+        }
+        S.contact = touching;
+        g_Touch[h] = touching;
+
+        for (int i = 0; i < np; i++)
+            for (int k = 0; k < 3; k++) { S.prevRaw[i][k] = goal[i][k]; S.prevRes[i][k] = goal[i][k] + off[k]; }
+        S.valid = np > 0;
+        std::lock_guard lk(g_PubM);
+        Pub& P = g_Pub[h]; P.n = nc; P.at = now;
+        for (int i = 0; i < nc; i++) P.c[i] = cs[i];
+    }
+    // ClimbByHand: both hands on a top edge at chest height or above, then both pulled down 10 cm relative to the eyes
+    if (g_Climb.load())
+    {
+        float hp[2][3]; bool ok = true;
+        for (int h = 0; h < 2 && ok; h++) { float r[9]; ok = GpuTrace::RawHandPose(h, hp[h], r); }
+        ClimbArm& A = g_ClimbArm;
+        const bool both = ok && now - g_Ledge[0].at < 0.25 && now - g_Ledge[1].at < 0.25;
+        if (!A.on && both)
+        {
+            const float lz = 0.5f * (g_Ledge[0].p[2] + g_Ledge[1].p[2]) - eye[2];
+            const float apart = sqrtf((g_Ledge[0].p[0] - g_Ledge[1].p[0]) * (g_Ledge[0].p[0] - g_Ledge[1].p[0]) + (g_Ledge[0].p[1] - g_Ledge[1].p[1]) * (g_Ledge[0].p[1] - g_Ledge[1].p[1]));
+            if (lz > -0.70f && lz < 0.60f && fabsf(g_Ledge[0].p[2] - g_Ledge[1].p[2]) < 0.25f && apart < 1.2f)
+            {
+                const double lastArmLog = A.lastArmLog;
+                A = ClimbArm{ true, now, { hp[0][2], hp[1][2] }, {}, A.lastTold, lastArmLog };
+                memcpy(A.p[0], g_Ledge[0].p, 12); memcpy(A.p[1], g_Ledge[1].p, 12);
+                if (now - A.lastArmLog > 2.0)
+                {
+                    A.lastArmLog = now;
+                    LOGI("Collision: both hands on a ledge {:.0f} cm {} the eyes ({:.0f} cm apart): push down on it to climb", fabsf(lz) * 100.f, lz < 0.f ? "below" : "above", apart * 100.f);
+                }
+            }
+            else if (now - A.lastTold > 2.0)
+            {
+                A.lastTold = now;
+                LOGI("Collision: both hands on top faces, but not a ledge to climb: {:.0f} cm {} the eyes (needs 70 below to 60 above), heights {:.0f} cm apart (needs under 25), {:.0f} cm apart across (needs under 120)",
+                     fabsf(lz) * 100.f, lz < 0.f ? "below" : "above", fabsf(g_Ledge[0].p[2] - g_Ledge[1].p[2]) * 100.f, apart * 100.f);
+            }
+        }
+        if (A.on && ok)
+        {   // (2026-11-05 play: measured against the eyes, and with the real hands' place across checked, it failed nearly
+            // always -- the head goes down with the push, and the real hands go on past the edge the drawn ones stop at)
+            // How far each real hand has pushed down: below the ledge's top, or below where it was when it took the ledge
+            float d[2];
+            for (int h = 0; h < 2; h++) d[h] = std::max(A.p[h][2] - hp[h][2], A.z0[h] - hp[h][2]);
+            const bool still = now - g_Ledge[0].at < 0.35 && now - g_Ledge[1].at < 0.35;   // both hands still on a top face
+            if (d[0] >= 0.04f && d[1] >= 0.04f && d[0] + d[1] >= 0.12f)
+            {
+                g_ClimbReq = true; g_Climbs++; A.on = false;
+                VRRuntime::Vibrate(0, 0.5f, 0.06f); VRRuntime::Vibrate(1, 0.5f, 0.06f);
+                LOGI("Collision: both hands pushed down on the ledge ({:.0f} / {:.0f} cm) {:.2f} s after taking it: climb (the game's jump)", d[0] * 100.f, d[1] * 100.f, now - A.at);
+            }
+            else if (now - A.at > 2.0 || !still)
+            {
+                if (now - A.lastTold > 1.0)
+                {
+                    A.lastTold = now;
+                    LOGI("Collision: the ledge was let go without a climb ({}; the hands pushed down {:.0f} / {:.0f} cm, it needs 4 each and 12 together)", !still ? "a hand left it" : "2 s passed", d[0] * 100.f, d[1] * 100.f);
+                }
+                A.on = false;
+            }
+        }
+    }
+    DoorHold::Tick(now);   // the held doors' swings: how far this frame's presses take them
+    Probes::GameTick();    // (research, profiling only: a test asked for from another thread)
+}
+
+bool Collision::Apply(int hand, const float r[9], float t[3], float applied[3])
+{
+    const int h = hand & 1;
+    applied[0] = applied[1] = applied[2] = 0.f;
+    if (!g_Hands.load() && !g_Weapons.load()) return false;
+    Contact cs[2 * kMaxContacts]; int n = 0;
+    {
+        const double now = Now();
+        std::lock_guard lk(g_PubM);
+        if (g_Pub[h].n && now - g_Pub[h].at < C.stale) for (int i = 0; i < g_Pub[h].n; i++) cs[n++] = g_Pub[h].c[i];
+        if (g_Body[h].n && now - g_Body[h].at < C.stale) for (int i = 0; i < g_Body[h].n; i++) cs[n++] = g_Body[h].c[i];
+    }
+    if (!n) return false;
+    float off[3];
+    Solve(r, t, cs, n, off);
+    const float sep = Len(off);
+    if (sep < 1e-5f || sep > C.maxSep || !Finite(off, 3)) return false;
+    for (int k = 0; k < 3; k++) { t[k] += off[k]; applied[k] = off[k]; }
+    return true;
+}
+
+void Collision::SetBodyContacts(int hand, const Contact* c, int n)
+{
+    const int h = hand & 1;
+    if (n > kMaxContacts) n = kMaxContacts;
+    std::lock_guard lk(g_PubM);
+    Pub& P = g_Body[h];
+    if (n > 0 && P.n == 0) g_BodyStops++;
+    P.n = n; P.at = Now();
+    for (int i = 0; i < n; i++) P.c[i] = c[i];
+}
+
+std::string Collision::Stats()
+{
+    std::ostringstream o;
+    o << DoorHold::Status() << "; " << SoftBody::Status() << "; " << BodyDrag::Status() << "; " << NpcGestures::Status() << "; " << AiResearch::Status() << "; " << Undetected::Status() << "; ";
+    o << "hands " << g_Hands.load() << " weapons " << g_Weapons.load() << " push " << g_Push.load() << " ticks " << g_Ticks.load()
+      << " casts " << g_Casts.load() << " hits " << g_CastHits.load() << " faults " << g_CastFaults.load() << " skipped " << g_Skipped.load()
+      << " stops L " << g_Stops[0].load() << " R " << g_Stops[1].load() << " ghosts L " << g_Ghosts[0].load() << " R " << g_Ghosts[1].load()
+      << " touching L " << g_Touch[0].load() << " R " << g_Touch[1].load() << " off L " << g_LastOff[0].load() << " R " << g_LastOff[1].load()
+      << " pushes " << g_Pushes.load() << " doors " << g_DoorPushes.load() << " prophits " << g_PropHits.load() << " dialsteps " << g_DialSteps.load() << " windows " << g_WindowMoves.load() << " uses " << g_Uses.load() << " / " << g_UsePulls.load() << " climbs " << g_Climbs.load() << " knocks " << g_Knocks.load() << " bodystops " << g_BodyStops.load() << " resets " << g_Resets.load();
+    std::lock_guard lk(g_DescM);
+    if (!g_LastHitDesc.empty()) o << " | last: " << g_LastHitDesc;
+    return o.str();
+}

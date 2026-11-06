@@ -1,0 +1,11 @@
+#pragma once
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <atomic>
+#include <fmt/format.h>
+#include "Log.h"

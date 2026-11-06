@@ -1,0 +1,564 @@
+#include "pch.h"
+#include "Reticle.h"
+#include "GpuTrace.h"
+#include "GunRay.h"
+#include "HandAimHook.h"
+#include "KbmInject.h"
+#include "PointerRay.h"
+#include "GrabHand.h"
+#include "SwordContact.h"
+#include "MeleeAim.h"
+#include "VRRuntime.h"
+#include "CVars.h"
+#include "Overlay.h"
+#include "Collision.h"
+#include "BodyHide.h"
+#include "ViewMatrixHook.h"
+#include "CameraHook.h"
+#include <imgui.h>
+#include <cmath>
+#include <algorithm>
+#include <array>
+#include <vector>
+
+namespace
+{
+    std::atomic<int> g_Mode{ 0 };
+    std::atomic<float> g_Range{ 8.f };
+    std::atomic<int> g_Axes{ 0 };
+    std::atomic<bool> g_Minimal{ false };
+    std::atomic<float> g_Opacity{ 0.5f };
+    //! `c` with its alpha scaled by ReticleOpacity
+    // The spyglass up (CameraHook::SpyZoom): the picture is magnified and the arms are not drawn, so the aiming reticle is
+    // all there is to aim with -- a larger border and more opaque (asked: easy to lose track of); the right hand's goes
+    thread_local bool t_Zoomed = false;
+    ImU32 Op(ImU32 c)
+    {
+        const float o = g_Opacity.load(std::memory_order_relaxed);
+        const float a = (float)((c >> IM_COL32_A_SHIFT) & 0xFF) * (t_Zoomed ? std::min(1.f, o + 0.3f) : o);
+        return (c & ~IM_COL32_A_MASK) | ((ImU32)(a + 0.5f) << IM_COL32_A_SHIFT);
+    }
+    std::mutex g_M; Reticle::Stats g_Stats;
+    // Research markers (`vr reticlemark x y z`): world points drawn as crosses, to check the projection against the image.
+    std::vector<std::array<float, 3>> g_Marks;
+
+    // Left hand cyan, right hand amber. DOTO puts powers and the ranged weapon on the left and the sword
+    // on the right, so the two rays mean different things and must not be the same colour.
+    const ImU32 kCol[2]    = { IM_COL32(90, 210, 255, 200), IM_COL32(255, 180, 80, 200) };
+    const ImU32 kColDim[2] = { IM_COL32(90, 210, 255,  70), IM_COL32(255, 180, 80,  70) };
+    // Filled instead of hollow when the ring is on the engine's own landing point rather than a fixed range.
+    const ImU32 kColHit[2] = { IM_COL32(120, 240, 255, 110), IM_COL32(255, 210, 120, 110) };
+
+    bool Finite3(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
+
+    // ---- the flicker log: a hand's ring flipping between two depths (reported: "depth fighting", nothing visible at
+    // the other depth). Each drawn ring is noted with where its distance came from (and for a gun what the static sweep
+    // and the aim sensor said). A JUMP is a change of the raw distance of > 0.15 m and > 15 % between two drawn frames
+    // 0.1 s apart at most; three within a second write the whole last second to the log, runs of like frames merged,
+    // with what the aim sensor hit (at most once a second per hand, 300 in all). Flips (A -> B -> A) are counted too.
+    int g_FrameEye = -1; unsigned long long g_FrameSerial = 0;   // the image being presented (Present thread)
+    enum Src { kSrcFixed, kSrcGun, kSrcPointer, kSrcPower };
+    const char* kSrcName[4] = { "fixed range", "gun", "grab pointer", "power's landing point" };
+    struct Sample { double t = 0; float len = 0, shown = 0; int src = 0; bool hit = false; int eye = -1;
+                    float sweepT = 0, sensorT = 0; bool sweepHit = false, sensorUsed = false, sensorHas = false; int sensorEnt = -1; };
+    constexpr int kHist = 512;
+    struct Track { Sample s[kHist]; int n = 0; double flipT[8] = {}; int fn = 0; double jumpT[16] = {}; int jn = 0; double lastLog = -10;
+                   double jumpAt = -1; float jumpFrom = 0; int jumpSign = 0; };
+    Track g_Track[2];                 // Present thread
+    int g_FlickerLogs = 0;
+    double NowS() { LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f); return (double)c.QuadPart / (double)f.QuadPart; }
+    void NoteRing(int h, float len, float shown, int src, bool hit)
+    {
+        Track& T = g_Track[h];
+        const double now = NowS();
+        const Sample* prev = T.n ? &T.s[(T.n - 1) % kHist] : nullptr;
+        Sample cur; cur.t = now; cur.len = len; cur.shown = shown; cur.src = src; cur.hit = hit; cur.eye = g_FrameEye;
+        if (src == kSrcGun)
+        {
+            const GunRay::TraceDbg g = GunRay::LastTrace();
+            cur.sweepT = g.sweepT; cur.sweepHit = g.sweepHit; cur.sensorUsed = g.sensorUsed; cur.sensorHas = g.sensorHas; cur.sensorT = g.sensorT;
+            cur.sensorEnt = g.sensorEnt;
+        }
+        if (prev && now - prev->t < 0.1)
+        {
+            const float d = len - prev->len, lo = std::min(len, prev->len);
+            if (fabsf(d) > 0.15f && fabsf(d) > 0.15f * lo)
+            {
+                const int sign = d > 0 ? 1 : -1;
+                T.jumpT[T.jn++ % 16] = now;
+                // back the way the last jump came, soon, to near where that one started: a flip
+                if (T.jumpAt >= 0 && now - T.jumpAt <= 0.25 && sign == -T.jumpSign && fabsf(len - T.jumpFrom) <= 0.2f * std::max(len, T.jumpFrom))
+                    T.flipT[T.fn++ % 8] = now;
+                T.jumpAt = now; T.jumpFrom = prev->len; T.jumpSign = sign;
+            }
+        }
+        T.s[T.n++ % kHist] = cur;
+        int recent = 0, flips = 0;
+        for (int i = 0; i < std::min(T.jn, 16); i++) if (now - T.jumpT[i] <= 1.0) recent++;
+        for (int i = 0; i < std::min(T.fn, 8); i++) if (now - T.flipT[i] <= 1.0) flips++;
+        if (recent < 3 || now - T.lastLog < 1.0 || g_FlickerLogs >= 300) return;
+        T.lastLog = now; g_FlickerLogs++;
+        // the last second, runs of like frames merged
+        int first = T.n - 1;
+        while (first > 0 && first > T.n - kHist && now - T.s[(first - 1) % kHist].t <= 1.0) first--;
+        std::string seq; int ents[3] = { -1, -1, -1 }; int ne = 0;
+        for (int k = first; k < T.n;)
+        {
+            const Sample& a = T.s[k % kHist];
+            int m = k + 1;
+            while (m < T.n)
+            {
+                const Sample& b = T.s[m % kHist];
+                if (b.src != a.src || b.hit != a.hit || b.sensorUsed != a.sensorUsed || fabsf(b.len - a.len) > 0.03f * std::max(a.len, 0.1f)) break;
+                m++;
+            }
+            const Sample& z = T.s[(m - 1) % kHist];
+            seq += fmt::format(" [{:.0f}ms x{} {:.2f}m (shown {:.2f}) {}{}", (a.t - now) * 1000.0, m - k, z.len, z.shown, kSrcName[a.src], a.hit ? " HIT" : "");
+            if (a.src == kSrcGun)
+                seq += fmt::format(" (sweep {} {:.2f}, sensor {} {:.2f}{}{})", a.sweepHit ? "hit" : "clear", a.sweepT, a.sensorHas ? "hit" : "none", a.sensorT,
+                                   a.sensorUsed ? " USED" : "", a.sensorEnt >= 0 ? fmt::format(" ent {}", a.sensorEnt) : std::string());
+            seq += "]";
+            if (a.sensorEnt >= 0 && ne < 3 && (ne == 0 || ents[0] != a.sensorEnt) && (ne < 2 || ents[1] != a.sensorEnt)) ents[ne++] = a.sensorEnt;
+            k = m;
+        }
+        std::string extra;
+        for (int e = 0; e < ne; e++)
+        {
+            void* ent = BodyHide::EntityById(ents[e]);
+            extra += fmt::format(" -- aim sensor's ent {}: {}", ents[e], ent ? Collision::Describe(ent) : std::string("(gone)"));
+        }
+        if (src == kSrcPointer || h == GrabHand::Hand())
+            extra += fmt::format(" -- grab pointer: target id 0x{:X}, {}", (unsigned)GrabHand::TargetId(), Collision::PointerDescribe());
+        LOGI("Reticle: the {} hand's ring jumps between depths ({} jumps, {} of them flips back, in 1 s), now {:.2f} m (shown {:.2f}) from {}; the last second:{}{}",
+             h ? "right" : "left", recent, flips, len, shown, kSrcName[src], seq, extra);
+    }
+
+    // ---- the ring's screen position jumping while the ray did not move (a projection of the wrong view?): per hand and
+    // per eye, the ring's NDC and its ray's direction at the last drawn frame of that eye. A jump of > 0.04 NDC (~2 deg)
+    // with the ray turned < 0.5 deg and the distance steady is logged with what the projection came from.
+    struct PosT { bool valid = false; double t = 0; float ndc[2] = {}, dir[3] = {}, org[3] = {}, len = 0; int src = 0; unsigned long long serial = 0; };
+    PosT g_Pos[2][2];
+    double g_PosLogAt[2] = { -10, -10 }; int g_PosLogs = 0; unsigned long long g_PosJumps = 0;
+    const char* kProjSrc[4] = { "?", "the presented view's own draws", "the presented view's matrix", "the LATEST view (maybe the other eye's)" };
+    void NotePos(int h, const float ndc[2], const float dir[3], const float org[3], float len)
+    {
+        const int e = g_FrameEye;
+        if (e < 0 || e > 1) return;
+        PosT& P = g_Pos[h][e];
+        const double now = NowS();
+        const int src = GpuTrace::LastProjSource();
+        if (P.valid && now - P.t < 0.1)
+        {
+            const float dn = hypotf(ndc[0] - P.ndc[0], ndc[1] - P.ndc[1]);
+            const float cosd = dir[0] * P.dir[0] + dir[1] * P.dir[1] + dir[2] * P.dir[2];
+            const float moved = sqrtf((org[0] - P.org[0]) * (org[0] - P.org[0]) + (org[1] - P.org[1]) * (org[1] - P.org[1]) + (org[2] - P.org[2]) * (org[2] - P.org[2]));
+            if (dn > 0.04f && cosd > 0.99996f && moved < 0.03f && fabsf(len - P.len) < 0.1f * std::max(len, P.len))
+            {
+                g_PosJumps++;
+                if (now - g_PosLogAt[h] >= 1.0 && g_PosLogs < 200)
+                {
+                    g_PosLogAt[h] = now; g_PosLogs++;
+                    unsigned long long a = 0, b = 0, c = 0; GpuTrace::ProjStats(a, b, c);
+                    LOGI("Reticle: the {} hand's ring JUMPED {:.3f} NDC on the eye-{} image with its ray still (turned {:.2f} deg, moved {:.1f} cm, {:.2f} m): "
+                         "projection from {} (serial {}; before: {}, serial {}); projections so far: own draws {}, matrix {}, latest {}; {}; {} such jumps",
+                         h ? "right" : "left", dn, e, acosf(std::min(1.f, cosd)) * 57.29578f, moved * 100.f, len, kProjSrc[src & 3], g_FrameSerial,
+                         kProjSrc[P.src & 3], P.serial, a, b, c, GpuTrace::ProjFilterStats(), g_PosJumps);
+                }
+            }
+        }
+        P.valid = true; P.t = now; memcpy(P.ndc, ndc, 8); memcpy(P.dir, dir, 12); memcpy(P.org, org, 12); P.len = len; P.src = src; P.serial = g_FrameSerial;
+    }
+
+    // ---- the ring's distance, steadied: a new distance (> 15 % off the one shown) is taken only once it has held for
+    // kHoldFrames drawn frames in a row (~3 game frames); closer changes follow at once. A distance that flips back and
+    // forth from frame to frame -- the gun's projectile-shaped sweep grazing an edge or the floor, the aim sensor's hit
+    // on something thin coming and going -- stays where it was instead of the ring jumping between depths (reported
+    // 2026-10-31: "as if there were 3 reticles per hand").
+    constexpr int kHoldFrames = 6;
+    struct Steady { float shown = -1, cand = -1; int count = 0; };
+    Steady g_Steady[2];          // Present thread
+    float SteadyLen(int h, float raw)
+    {
+        Steady& S = g_Steady[h];
+        if (S.shown < 0) { S.shown = raw; return raw; }
+        const auto close = [](float a, float b) { return fabsf(a - b) <= 0.15f * std::max(a, b); };
+        if (close(raw, S.shown)) { S.shown = raw; S.count = 0; S.cand = -1; return raw; }
+        if (S.cand >= 0 && close(raw, S.cand)) S.count++; else { S.cand = raw; S.count = 1; }
+        if (S.count >= kHoldFrames) { S.shown = raw; S.count = 0; S.cand = -1; }
+        return S.shown;
+    }
+
+    //! NDC -> pixels in the image the headset receives (ImGui's display size is the backbuffer, which is what
+    //! VRRuntime submits). No viewport correction: the projection came from the same image's own draws.
+    ImVec2 ToScreen(const float ndc[2], const ImVec2& size)
+    {
+        return ImVec2((ndc[0] * 0.5f + 0.5f) * size.x, (0.5f - ndc[1] * 0.5f) * size.y);
+    }
+
+    //! One hand's ray. Returns false when this frame has no pose for it (no weapon anchor yet, or hand not tracked).
+    //! The grabbing hand draws its POINTER (PointerRay: the ray the interaction sensor picks along), ending on what it
+    //! picked -- so what the ray touches on screen is what the grip will take.
+    void DrawHand(int h, ImDrawList* dl, const ImVec2& size, Reticle::Stats& st)
+    {
+        float org[3], fwd[3];
+        if (GrabHand::CarryHidesArm(h)) return;    // the hand carrying a corpse is hidden, and so is its ray
+        t_Zoomed = CameraHook::SpyZoom();
+        if (t_Zoomed && h == 1) return;            // the spyglass up: only the left hand's (the gun's, the power's) reticle
+        const bool pointer = h == GrabHand::Hand() && GrabHand::Enabled() && PointerRay::Mode() > 0 && PointerRay::Get(h, org, fwd);
+        // The hand with a gun or the crossbow: the ray the shot takes, from the muzzle as drawn along the barrel
+        // (GunRay), not the controller's -- they differ by the muzzle's offset from the hand and by the grip trim.
+        const bool gun = !pointer && h == HandAimHook::GunHand() && (GunRay::Mode() & 8) && GunRay::DrawnRay(h, org, fwd);
+        if (!pointer && !gun && !GpuTrace::HandRay(h, org, fwd)) return;
+        if (!Finite3(org) || !Finite3(fwd)) return;
+        st.handValid |= 1 << h;
+
+        // Where the ring goes. The engine computes a real landing point for the power hand while its sensor is
+        // running (Far Reach's marker, the throw preview); that is worth far more than a guess at a fixed range,
+        // because it accounts for geometry. Everything else gets the fixed range.
+        float end[3];
+        bool engineTarget = false;
+        float pick[3];
+        bool picked = false;            // the grab hand's ray is on something it can take
+        const HandAimHook::Stats hs = HandAimHook::GetStats();
+        // (+0x108, the tendril's END: +0x1C0, used before, is the curve's middle control point, which HandFx moves
+        // with the tendril's start.)
+        if (gun)
+        {   // up to where the engine's own aim sensor, tracing this very ray, says it hits: the bolt lands on the ring
+            float t = 0; bool hit = false;
+            if (!GunRay::SensorHit(t, hit)) { t = g_Range.load(); hit = false; }
+            for (int i = 0; i < 3; i++) end[i] = org[i] + fwd[i] * t;
+            if (hit) { engineTarget = true; st.engineTarget |= 1 << h; }
+        }
+        else if (pointer)
+        {   // up to the picked object (along the ray, then the ring on the object itself), else the sensor's reach
+            picked = !GrabHand::HeldEntity() && GrabHand::HandHasTarget() && GrabHand::TargetPoint(pick) && Finite3(pick);
+            const float reach = GrabHand::PickRange() > 0.f ? GrabHand::PickRange() : 3.f;
+            float len = reach;
+            if (picked)
+            {
+                const float d[3] = { pick[0] - org[0], pick[1] - org[1], pick[2] - org[2] };
+                len = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+                len = len < 0.05f ? 0.05f : len;
+                engineTarget = true;
+                st.engineTarget |= 1 << h;
+            }
+            for (int i = 0; i < 3; i++) end[i] = picked ? pick[i] : org[i] + fwd[i] * len;
+        }
+        else if (h == (HandAimHook::PowerHand() & 1) && hs.powerActive && Finite3(hs.powerEnd)
+            && (hs.powerEnd[0] || hs.powerEnd[1] || hs.powerEnd[2]))
+        {
+            memcpy(end, hs.powerEnd, 12);
+            engineTarget = true;
+            st.engineTarget |= 1 << h;
+        }
+        else
+        {
+            const float r = g_Range.load();
+            for (int i = 0; i < 3; i++) end[i] = org[i] + fwd[i] * r;
+        }
+
+        {   // the distance steadied (SteadyLen), and noted for the flicker log
+            const float dl3[3] = { end[0] - org[0], end[1] - org[1], end[2] - org[2] };
+            const float raw = sqrtf(dl3[0] * dl3[0] + dl3[1] * dl3[1] + dl3[2] * dl3[2]);
+            const float shown = raw > 1e-4f ? SteadyLen(h, raw) : raw;
+            if (raw > 1e-4f && shown != raw) for (int i = 0; i < 3; i++) end[i] = org[i] + dl3[i] * (shown / raw);
+            NoteRing(h, raw, shown, gun ? kSrcGun : pointer ? kSrcPointer : engineTarget ? kSrcPower : kSrcFixed, engineTarget);
+        }
+        // The ray, as a polyline. A straight world line does project to a straight screen line, but sampling it
+        // lets the part that falls behind the eye drop out cleanly instead of taking the whole segment with it.
+        constexpr int kSteps = 10;
+        // skip the first 12 cm: a line that begins inside the hand reads badly (a gun's starts at its muzzle, 1 cm on)
+        const float len = sqrtf((end[0] - org[0]) * (end[0] - org[0]) + (end[1] - org[1]) * (end[1] - org[1]) + (end[2] - org[2]) * (end[2] - org[2]));
+        const float kStart = gun ? (len > 0.02f ? 0.01f / len : 0.f) : 0.12f;
+        ImVec2 pts[kSteps + 1]; int n = 0;
+        for (int i = 0; i <= kSteps; i++)
+        {
+            const float t = kStart + (1.f - kStart) * (float)i / kSteps;
+            const float w[3] = { org[0] + (end[0] - org[0]) * t, org[1] + (end[1] - org[1]) * t, org[2] + (end[2] - org[2]) * t };
+            float ndc[2];
+            if (!GpuTrace::ProjectWorld(w, ndc)) { n = 0; continue; }     // restart the run past the eye plane
+            pts[n++] = ToScreen(ndc, size);
+        }
+        const bool minimal = g_Minimal.load(std::memory_order_relaxed);
+        if (n >= 2 && !minimal) dl->AddPolyline(pts, n, Op(kColDim[h]), 0, 2.0f);
+
+        // The ring at the end.
+        float ndc[2], depth = 0;
+        if (!GpuTrace::ProjectWorld(end, ndc, &depth)) return;
+        st.projValid |= 1 << h;
+        {
+            const float dd[3] = { end[0] - org[0], end[1] - org[1], end[2] - org[2] };
+            const float ln = sqrtf(dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]);
+            if (ln > 1e-3f) { const float u[3] = { dd[0] / ln, dd[1] / ln, dd[2] / ln }; NotePos(h, ndc, u, org, ln); }
+        }
+        const ImVec2 c = ToScreen(ndc, size);
+        if (!pointer && h == HandAimHook::GunHand()) GunRay::NoteRing(c.x / size.x, c.y / size.y);   // the gun hand's ring, either mode (test scripts aim with it)
+        // A takedown on offer (the game's assassination sensor, MeleeAim::KillOffered), or a knockout blow still possible
+        // (KnockoutReady: it outlasts the offer by 1.5 s): the right hand's reticle turns RED (lethal: the sword) inside a
+        // thick BLUE border (non-lethal: the choke) -- the game offers the two together. Drawn opaque whatever
+        // ReticleOpacity says: at 0.4 the red over the blue blended into pink (reported).
+        // (no more: the blue dot on the guard's head shows a knockout, and the red / blue reticle was reported redundant)
+        const bool takedown = false;
+        const ImU32 kTakedownRed = IM_COL32(255, 0, 0, 255), kTakedownBlue = IM_COL32(0, 90, 255, 255);
+        if (minimal)
+        {   // MinimalReticle: a white dot ringed in black, a fixed angular size (~0.3 deg across at the headset's density);
+            // three times that while the grab hand's ray is on something it can take
+            const float grow = picked ? 3.f : 1.f;
+            const float r = std::max(2.5f, size.y * 0.0016f) * grow * (t_Zoomed ? 1.3f : 1.f),
+                        edge = std::max(1.5f, size.y * 0.0008f) * (picked ? 1.5f : 1.f) * (t_Zoomed ? 2.5f : 1.f);
+            if (takedown)
+            {
+                const float thick = std::max(3.f, size.y * 0.0024f) * (picked ? 1.5f : 1.f);   // three times the usual edge
+                dl->AddCircleFilled(c, r + thick + 1.f, IM_COL32(0, 0, 0, 255), 20);       // a hairline of black keeps it readable on blue skies
+                dl->AddCircleFilled(c, r + thick, kTakedownBlue, 20);
+                dl->AddCircleFilled(c, r, kTakedownRed, 16);
+                st.drawn++;
+                return;
+            }
+            dl->AddCircleFilled(c, r + edge, Op(IM_COL32(0, 0, 0, 255)), 16);
+            dl->AddCircleFilled(c, r, Op(IM_COL32(255, 255, 255, 255)), 16);
+            st.drawn++;
+            return;
+        }
+        const float rad = size.y * 0.012f;                  // a fixed angular size reads as a reticle; range does not
+        if (takedown)
+        {   // the ring: red, inside a thick blue band
+            const float band = std::max(4.f, size.y * 0.004f);
+            dl->AddCircle(c, rad + band * 0.5f + 1.f, kTakedownBlue, 24, band);
+            dl->AddCircle(c, rad, kTakedownRed, 24, 2.5f);
+            dl->AddCircleFilled(c, rad * 0.35f, kTakedownRed, 12);
+            st.drawn++;
+            return;
+        }
+        if (t_Zoomed) dl->AddCircle(c, rad, Op(IM_COL32(0, 0, 0, 255)), 24, 6.0f);   // a dark border round the ring
+        dl->AddCircle(c, rad, Op(kCol[h]), 24, t_Zoomed ? 3.0f : 2.0f);
+        if (engineTarget) dl->AddCircleFilled(c, rad, Op(kColHit[h]), 24);
+        dl->AddCircleFilled(c, 1.8f, Op(kCol[h]), 8);
+        st.drawn++;
+    }
+
+    //! A world segment from `org` along `dir`, drawn if both ends project. Short lines are straight enough in
+    //! screen space that two points are all it takes.
+    void Seg(ImDrawList* dl, const ImVec2& size, const float org[3], const float dir[3], float len, ImU32 col, float w, bool dot)
+    {
+        const float end[3] = { org[0] + dir[0] * len, org[1] + dir[1] * len, org[2] + dir[2] * len };
+        float a[2], b[2];
+        if (!GpuTrace::ProjectWorld(org, a) || !GpuTrace::ProjectWorld(end, b)) return;
+        const ImVec2 pa = ToScreen(a, size), pb = ToScreen(b, size);
+        dl->AddLine(pa, pb, col, w);
+        if (dot) dl->AddCircleFilled(pb, 3.5f, col, 10);
+    }
+
+    //! The measuring instrument: where the mod has put the PALM and how it is turned, next to the controller that
+    //! is supposed to be driving it. Judging this from the rendered hand does not work -- with a power the hand is
+    //! a fanned black glove at the edge of the frame -- so both frames get drawn on top of the image and the
+    //! question "does the palm follow my real hand" becomes something you can read off a screenshot.
+    //! At the palm: fingers WHITE and the palm normal MAGENTA (both with a dot at the far end), plus the
+    //! palm bone's own axes in red/green/blue.
+    //! At the controller: forward in the hand's colour with a dot, up and left the same colour, dimmer.
+    void DrawAxes(int h, ImDrawList* dl, const ImVec2& size, Reticle::Stats& st)
+    {
+        float corg[3], crot[9];
+        if (GpuTrace::HandPoseWorld(h, corg, crot))
+        {
+            const float fwd[3] = { crot[0], crot[3], crot[6] };      // columns are fwd/left/up
+            const float left[3] = { crot[1], crot[4], crot[7] };
+            const float up[3] = { crot[2], crot[5], crot[8] };
+            Seg(dl, size, corg, fwd, 0.16f, kCol[h], 2.0f, true);
+            Seg(dl, size, corg, up, 0.09f, kColDim[h], 2.0f, false);
+            Seg(dl, size, corg, left, 0.09f, kColDim[h], 2.0f, false);
+        }
+        float porg[3], prot[9], fing[3], pn[3];
+        if (!GpuTrace::PalmFrame(h, porg, prot, fing, pn)) return;
+        const float px[3] = { prot[0], prot[3], prot[6] }, py[3] = { prot[1], prot[4], prot[7] }, pz[3] = { prot[2], prot[5], prot[8] };
+        Seg(dl, size, porg, px, 0.07f, IM_COL32(255, 70, 70, 220), 2.0f, false);
+        Seg(dl, size, porg, py, 0.07f, IM_COL32(70, 255, 70, 220), 2.0f, false);
+        Seg(dl, size, porg, pz, 0.07f, IM_COL32(90, 120, 255, 220), 2.0f, false);
+        Seg(dl, size, porg, fing, 0.13f, IM_COL32(255, 255, 255, 230), 2.5f, true);
+        Seg(dl, size, porg, pn, 0.10f, IM_COL32(255, 80, 255, 230), 2.5f, true);      // out of the PALM, magenta
+        float ndc[2];
+        if (GpuTrace::ProjectWorld(porg, ndc)) dl->AddCircleFilled(ToScreen(ndc, size), 4.0f, IM_COL32(255, 255, 255, 230), 12);
+        // The weapon in this hand (yellow): its origin and forward -- for the sword, where the fist's hole is.
+        float wo[3], wa[9];
+        if (GpuTrace::WeaponTargetPose(h, wo, wa))
+        {
+            Seg(dl, size, wo, wa, 0.12f, IM_COL32(255, 220, 0, 230), 2.0f, true);
+            if (GpuTrace::ProjectWorld(wo, ndc)) dl->AddCircleFilled(ToScreen(ndc, size), 4.0f, IM_COL32(255, 220, 0, 230), 12);
+        }
+        st.drawn++;
+    }
+    //! The sword's contact detector (SwordContact): the blade it sweeps (orange, guard to tip), the boxes it sweeps it
+    //! against nearest the tip (grey; red for 1.5 s after the blade struck one) and the last contact point (red).
+    void DrawSword(ImDrawList* dl, const ImVec2& size)
+    {
+        static SwordContact::Debug d;   // ~20 KB: not on the stack
+        if (!SwordContact::GetDebug(d)) return;
+        // the bodies: bone capsules (cyan; red for 1.5 s after the blade struck that body)
+        float a[2], b[2];
+        for (int k = 0; k < d.segs; k++)
+            if (GpuTrace::ProjectWorld(d.seg[k].a, a) && GpuTrace::ProjectWorld(d.seg[k].b, b))
+                dl->AddLine(ToScreen(a, size), ToScreen(b, size), d.seg[k].touched ? IM_COL32(255, 40, 40, 220) : IM_COL32(60, 220, 255, 150), d.seg[k].r > 0.12f ? 3.0f : 1.5f);
+        // sample by sample: the tip is often behind the eye's plane (blade up, looking down) and a line to it cannot be drawn.
+        // Orange = a contact now strikes; yellow = not a swing of the arm (a touch only); grey = this swing already struck.
+        const ImU32 bc = d.armed ? IM_COL32(255, 140, 0, 230) : d.ready ? IM_COL32(255, 230, 60, 200) : IM_COL32(150, 150, 150, 200);
+        for (int i = 0; i + 1 < d.n; i++)
+            if (GpuTrace::ProjectWorld(d.pts[i], a) && GpuTrace::ProjectWorld(d.pts[i + 1], b))
+            {
+                dl->AddLine(ToScreen(a, size), ToScreen(b, size), bc, 3.0f);
+                dl->AddCircleFilled(ToScreen(b, size), i + 2 == d.n ? 6.0f : 2.5f, bc, 10);
+            }
+        for (int k = 0; k < d.boxes; k++)
+        {
+            ImVec2 sc[8]; bool ok[8];
+            for (int c = 0; c < 8; c++) { float n[2]; ok[c] = GpuTrace::ProjectWorld(d.corners[k][c], n); if (ok[c]) sc[c] = ToScreen(n, size); }
+            const ImU32 col = d.touched[k] ? IM_COL32(255, 40, 40, 240) : IM_COL32(200, 200, 200, 140);
+            for (int x = 0; x < 8; x++) for (int bit = 1; bit < 8; bit <<= 1)
+                if (!(x & bit) && ok[x] && ok[x | bit]) dl->AddLine(sc[x], sc[x | bit], col, d.touched[k] ? 2.0f : 1.0f);
+        }
+        float n[2];
+        if (d.contact && GpuTrace::ProjectWorld(d.point, n)) dl->AddCircle(ToScreen(n, size), 9.0f, IM_COL32(255, 30, 30, 255), 16, 3.0f);
+    }
+    //! The held object's box as it is drawn (cyan), with its centre: what the grip has to put in the fist.
+    void DrawHeld(ImDrawList* dl, const ImVec2& size)
+    {
+        GrabHand::Debug d;
+        if (!GrabHand::GetDebug(d) || !d.box) return;
+        ImVec2 s[8]; bool ok[8];
+        for (int c = 0; c < 8; c++) { float n[2]; ok[c] = GpuTrace::ProjectWorld(d.corners[c], n); if (ok[c]) s[c] = ToScreen(n, size); }
+        const ImU32 col = IM_COL32(0, 230, 255, 220);
+        for (int a = 0; a < 8; a++) for (int bit = 1; bit < 8; bit <<= 1)
+            if (!(a & bit) && ok[a] && ok[a | bit]) dl->AddLine(s[a], s[a | bit], col, 1.5f);
+        float n[2];
+        if (GpuTrace::ProjectWorld(d.center, n)) dl->AddCircleFilled(ToScreen(n, size), 5.0f, col, 12);
+    }
+}
+
+void Reticle::Draw()
+{
+    const int mode = g_Mode.load();
+    if (!mode && !g_Axes.load()) return;
+    // Not over a menu. The reticle is aimed at the world, and while a menu is up there is nothing to aim at --
+    // it was drawn straight across the main menu before this check.
+    if (KbmInject::GetStats().menuSafe) return;
+    // Nor during a takedown: the hands are the animation's, and a ray from a controller they are not attached to
+    // points at nothing the player can act on.
+    if (GpuTrace::AnimSuspended()) return;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImVec2 size = ImGui::GetIO().DisplaySize;
+    if (!dl || size.x < 16.f || size.y < 16.f) return;
+    // projected with the frustum of the image this lands on (the one about to be presented), not the latest view's: in
+    // stereo the two eyes' projections differ (CameraHook::ApplyEyeProjection)
+    struct ProjScope { ProjScope() { GpuTrace::ProjectForSerial(VRRuntime::PresentingSerial()); } ~ProjScope() { GpuTrace::ProjectForSerial(0); } } projScope;
+    g_FrameSerial = VRRuntime::PresentingSerial();
+    g_FrameEye = g_FrameSerial ? ViewMatrixHook::RenderPoseXr(g_FrameSerial).eye : -1;
+    {   // every 30 s: what the rings' projections came from
+        static double at = 0; const double now = NowS();
+        if (now - at >= 30.0)
+        {
+            at = now;
+            unsigned long long a = 0, b = 0, c = 0; GpuTrace::ProjStats(a, b, c);
+            if (a + b + c) LOGI("Reticle: the rings' projections so far: the presented view's own draws {}, its matrix {}, the latest view {}; {}; screen jumps with the ray still {}",
+                                a, b, c, GpuTrace::ProjFilterStats(), g_PosJumps);
+        }
+    }
+    Stats st; st.frames = 1;
+    if (mode == 1 || mode == 2) DrawHand(HandAimHook::PowerHand() & 1, dl, size, st);
+    if (mode == 1 || mode == 3)
+    {
+        const int gun = HandAimHook::GunHand() & 1;
+        // With both hands on the same controller (the DOTO default) mode 1 must not draw it twice.
+        if (mode == 3 || gun != (HandAimHook::PowerHand() & 1)) DrawHand(gun, dl, size, st);
+        else DrawHand(gun ^ 1, dl, size, st);
+    }
+    {   // While a takedown is possible (he cannot see you), a dot on the back of the guard's head: blue for the knockout
+        // (a blow with either hand, open or closed, the sword's pommel or the pistol, near it), ringed red for the
+        // stealth kill (a swing of the blade). One state for both (MeleeAim::KnockoutAim).
+        float kp[3], ndc[2];
+        if (MeleeAim::KnockoutAim(kp) && GpuTrace::ProjectWorld(kp, ndc))
+        {
+            const ImVec2 c = ToScreen(ndc, size);
+            const float r = std::max(4.f, size.y * 0.004f);
+            // As SEEN (Overlay::Seen): drawn as plain IM_COL32 through the backbuffer's sRGB view they came out light blue
+            // and pink (reported 2026-10-31)
+            dl->AddCircleFilled(c, r + std::max(3.f, size.y * 0.0016f), Overlay::Seen(118, 40, 40), 24);   // a dark red edge, as dark and as grey as the blue
+            dl->AddCircleFilled(c, r, Overlay::Seen(40, 64, 118), 20);   // a dark, slightly greyed blue (the game's palette)
+            st.drawn++;
+        }
+    }
+    if (g_Axes.load()) { DrawAxes(0, dl, size, st); DrawAxes(1, dl, size, st); DrawHeld(dl, size); DrawSword(dl, size); }
+    {
+        std::lock_guard lk(g_M);
+        for (size_t i = 0; i < g_Marks.size(); i++)
+        {
+            float ndc[2];
+            if (!GpuTrace::ProjectWorld(g_Marks[i].data(), ndc)) continue;
+            const ImVec2 c = ToScreen(ndc, size);
+            const ImU32 col = IM_COL32(255, 60, 255, 255);
+            dl->AddLine(ImVec2(c.x - 8, c.y), ImVec2(c.x + 8, c.y), col, 2.f);
+            dl->AddLine(ImVec2(c.x, c.y - 8), ImVec2(c.x, c.y + 8), col, 2.f);
+            char t[8]; snprintf(t, sizeof t, "%zu", i);
+            dl->AddText(ImVec2(c.x + 6, c.y + 4), col, t);
+        }
+    }
+    std::lock_guard lk(g_M);
+    g_Stats.frames += st.frames; g_Stats.drawn += st.drawn;
+    g_Stats.handValid = st.handValid; g_Stats.projValid = st.projValid; g_Stats.engineTarget = st.engineTarget;
+}
+
+void Reticle::SetMode(int m) { g_Mode = m; }
+
+namespace
+{
+    // The game's own crosshair (ark_ui_crosshair_style 0 off / 1 dot / 2 normal, ark_ui_crosshair_opacity) is the
+    // centre of the game camera's view: with the hands aiming, it marks nothing. Off while the hand reticles are on and
+    // the headset shows the game, and the player's values put back otherwise. Only the live values are written (as
+    // WristHud does with the HUD option): the game's config keeps the player's choice. A value the player picks in the
+    // options meanwhile is taken as their new choice, to put back later.
+    int g_UserStyle = -1; float g_UserOpacity = -1.f; bool g_Forced = false;
+    ULONGLONG g_NextCrossCheck = 0;
+}
+
+void Reticle::Tick()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_NextCrossCheck || !CVars::Available()) return;
+    g_NextCrossCheck = now + 1000;
+    const bool want = g_Mode.load() != 0 && VRRuntime::GetStatus().running;
+    const int style = CVars::GetInt("ark_ui_crosshair_style", -1);
+    const float opacity = CVars::GetFloat("ark_ui_crosshair_opacity", -1.f);
+    if (style < 0) return;
+    if (want)
+    {
+        if (style != 0 || (opacity > 0.f))
+        {
+            // (only what differs from the forced value is the player's: the other one is still ours)
+            if (style != 0 || g_UserStyle < 0) g_UserStyle = style;
+            if (opacity > 0.f || (g_UserOpacity < 0.f && opacity >= 0.f)) g_UserOpacity = opacity;
+            CVars::SetInt("ark_ui_crosshair_style", 0);
+            if (opacity >= 0.f) CVars::SetFloat("ark_ui_crosshair_opacity", 0.f);
+            if (!g_Forced) LOGI("Reticle: the game's crosshair off while the hand reticles are on (was style {}, opacity {:.2f})", style, opacity);
+            g_Forced = true;
+        }
+    }
+    else if (g_Forced)
+    {
+        if (g_UserStyle >= 0) CVars::SetInt("ark_ui_crosshair_style", g_UserStyle);
+        if (g_UserOpacity >= 0.f) CVars::SetFloat("ark_ui_crosshair_opacity", g_UserOpacity);
+        LOGI("Reticle: the game's crosshair back to the player's setting (style {}, opacity {:.2f})", g_UserStyle, g_UserOpacity);
+        g_Forced = false; g_UserStyle = -1; g_UserOpacity = -1.f;
+    }
+}
+void Reticle::SetStyle(bool minimal, float opacity)
+{
+    g_Minimal = minimal;
+    g_Opacity = opacity < 0.05f ? 0.05f : (opacity > 1.f ? 1.f : opacity);
+    LOGI("Reticle: {} at opacity {:.2f}", minimal ? "a dot where each hand points (MinimalReticle = 1)" : "rays and rings", g_Opacity.load());
+}
+void Reticle::AddMark(const float* w) { std::lock_guard lk(g_M); if (g_Marks.size() < 32) g_Marks.push_back({ w[0], w[1], w[2] }); }
+void Reticle::ClearMarks() { std::lock_guard lk(g_M); g_Marks.clear(); }
+void Reticle::SetAxes(int on) { g_Axes = on; }
+int  Reticle::Axes() { return g_Axes.load(); }
+int  Reticle::Mode() { return g_Mode.load(); }
+void Reticle::SetRange(float m) { if (m > 0.1f && m < 500.f) g_Range = m; }
+float Reticle::Range() { return g_Range.load(); }
+Reticle::Stats Reticle::GetStats() { std::lock_guard lk(g_M); return g_Stats; }

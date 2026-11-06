@@ -1,0 +1,10 @@
+build/
+local/
+references/
+*.log
+*.user
+.vs/
+tools/__pycache__/
+dist/
+build-mockxr/
+tools/.disp_cache.pkl

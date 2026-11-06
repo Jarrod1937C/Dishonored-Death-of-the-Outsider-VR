@@ -1,0 +1,155 @@
+#pragma once
+#include <string>
+#include <vector>
+#include "StereoSync.h"
+#include "Fog.h"
+#include "Foveation.h"
+
+//! The player's settings: <game>\DOTOVR.ini, read once at startup. Every key has a default, so a missing file,
+//! a missing key or a value that cannot be read all leave the mod working (and the log says which). Settings are
+//! turned into the same `vr ...` commands the test channel uses, so a setting does exactly what its command does.
+namespace Settings
+{
+    void Load();                                  //!< InitThread, before anything asks for a setting
+    std::vector<std::string> StartupCommands();   //!< run at the first Present (input layout, turning)
+    std::vector<std::string> PackageCommands();   //!< run when the VR package switches on in a game
+    bool StatusFile();                            //!< write DVR_heartbeat.txt once a second (diagnostics)
+    bool WriteLog();                              //!< [Logging] WriteLog (or [System.Troubleshooting] DebugLogging): DOTOVR.log written at all
+    bool LogInput();                              //!< log every controller button change (diagnostics)
+    bool Haptics();                               //!< controller vibration
+    float RenderScale();                          //!< the game's render size relative to the headset's pixel density (0 = the window's)
+    bool SimStepAtRefresh();                      //!< [Performance.FrameRate] SimStepAtRefresh (hidden): the game's simulation step at the headset's refresh (SimStep)
+    bool TaaSkyMotion();                          //!< [Display.Picture] TaaSkyMotion (hidden): the sky's motion vectors for the game's TAA (SkyMotion)
+    bool HandDepth();                             //!< [Display.Picture] HandDepth (hidden): the hands sort by their real distance, not drawn over the world (GpuTrace)
+    float TaaSharpening();                        //!< [Display.Picture] TaaSharpening: the game's TAA result sharpened in the headset, 0..1 (0 = off)
+    float ControllerPitchOffset();                //!< degrees the controllers' pointing is tilted (+ = up)
+    bool FingerTracking();                        //!< [Controls] FingerTracking, with Layout = index (XRSession, GpuTrace)
+    bool SwordBladeDamage();                      //!< [Gameplay] SwordBladeDamage: the blade strikes what it touches itself (MeleeAim)
+    float SwordDamageScale();                     //!< [Gameplay] SwordDamageScale: x the blade's damage
+    bool HandCollision();                         //!< [Gameplay] HandCollision: the drawn hands stop at the world (Collision)
+    bool WeaponCollision();                       //!< [Gameplay] WeaponCollision: the held weapons too, and at bodies (Collision)
+    bool PushObjects();                           //!< [Gameplay] PushObjects: hands / weapons push loose props (Collision)
+    bool PushDoors();                             //!< [Gameplay] PushDoors: a hand pushing a door opens it (Collision)
+    bool DoorsFollowHand();                       //!< [Gameplay.Collision] DoorsFollowHand: a pushed door swings only as far as the hand pushes it (DoorHold)
+    bool SoftCharacters();                        //!< [Gameplay.Collision] SoftCharacters: characters' bodies give where a hand presses / pulls (SoftBody)
+    bool WatchObjectives();                       //!< [Display.Hud] WatchObjectives: the objectives' directions on the watch, the game's markers hidden (ObjectiveWatch)
+    bool KnockoutBlow();                          //!< [Gameplay] KnockoutBlow: a blow to the back of the head knocks out (MeleeAim)
+    bool FinisherAnimations();
+    float KnockoutSoundVolume();
+    float KnockoutSpeed();
+    float KnockoutAngle();                        //!< [Gameplay] KnockoutAngle: deg off straight behind the target (MeleeAim)
+    float SwordBloodflyReach();                   //!< [Gameplay] SwordBloodflyReach: m further from a bloodfly the blade touches it (SwordContact)
+    float KnockoutRadius();                       //!< [Gameplay] KnockoutRadius: m around the head's centre (MeleeAim)
+    float HudScale();
+    float HudResolution();                        //!< [Performance] HudResolution: the HUD panel's resolution, 0.25..1 of the picture's per side (ScreenMode)
+    bool HudSkipEmpty();                          //!< [Performance] HudSkipEmpty: the HUD panel only where it shows something (ScreenMode)
+    bool ScreenSpaceShadows();                    //!< [Display] ScreenSpaceShadows (ScreenShadows)
+    float ScreenSpaceShadowLength();
+    int ScreenSpaceShadowSteps();
+    float ScreenSpaceShadowStrength();
+    bool ScreenSpaceShadowCharacters();           //!< [Display] (ScreenShadows)
+    bool ShadowMapCharacters();                   //!< [Display] (ScreenShadows)
+    float ScreenSpaceShadowContact();             //!< [Display] (ScreenShadows)
+    float ScreenSpaceShadowSmallObjects();        //!< [Display] (ScreenShadows), m across
+    float ShadowCullDistance();                   //!< [Display] ShadowCullDistance: r_shadowCullDistance held (ScreenShadows)
+    bool ShadowUltraTrim();                       //!< [Display] ShadowUltraTrim (ScreenShadows)
+    float OutOfViewMaskCorners();                 //!< [Display] OutOfViewMaskCorners (FovMask)
+    bool ShadowLampFewerUpdates();                //!< [Display] ShadowLampFewerUpdates (ScreenShadows)
+    bool ShadowLampKeepCache();                   //!< [Performance.Shadows] ShadowLampKeepCache (ScreenShadows)
+    int ShadowLampCacheSlices();                  //!< [Display] ShadowLampCacheSlices (ScreenShadows)
+    float StaticLodZoom();                        //!< [Display] StaticLodZoom (VrTweaks, experimental)
+    int ViewDistance();                           //!< [Display] ViewDistance (VrTweaks): -1 = the game's
+    bool DepthPassDepthOnly();                    //!< [Display] DepthPassDepthOnly (experimental)
+    bool SkipFrameSyncFlush();                    //!< [Performance.SkippedWork] SkipFrameSyncFlush (hidden, experimental: PaceLog)
+    bool DepthPassSkipRedundantCopies();          //!< [Display] DepthPassSkipRedundantCopies
+    bool SkipEmptyOutlines();                     //!< [Performance] SkipEmptyOutlines (PostShare)
+    bool StereoExposureReuse();                   //!< [Performance] StereoExposureReuse (PostShare)
+    float ShadowMapMinObjectSize();               //!< [Display] (ScreenShadows), m across
+    int ShadowSunUpdateEvery();                   //!< [Display] (ScreenShadows), frame pairs 1 / 2 / 4
+    float HudMarkerSize();                        //!< [Display] HudMarkerSize: the HUD square around a marker put at its character's distance (ScreenMode)                             //!< [Display] HudScale: the stereo HUD panel's share of the view (ScreenMode)
+    bool HudMarkers();                            //!< [Display] HudMarkers: the game's markers over characters placed for the headset (ScreenMode)                        //!< [Gameplay] KnockoutSpeed: m/s a knockout blow needs (MeleeAim)
+    bool SkipIntroVideos();                       //!< [Advanced] SkipIntroVideos: the start-up videos end at once (BinkVideo)                  //!< [Gameplay] KnockoutSoundVolume: the knockout blow's hit sound, 0..1                    //!< [Gameplay] FinisherAnimations: 0 = the game's finishing moves and kill cam off (MeleeAim)
+    bool PhysicalCrouch();                        //!< [Controls] PhysicalCrouch: crouching for real crouches the character (KbmInject)
+    float PhysicalCrouchDepth();                  //!< [Controls] PhysicalCrouchDepth: m (the ini says cm) the head goes down to crouch
+    bool DragBodies();                            //!< [Gameplay.Interaction] DragBodies: a gripped body is dragged; up over the shoulder it is carried (BodyDrag)
+    bool ClimbByHand();                           //!< [Gameplay.Interaction] ClimbByHand (Collision)
+    bool SwimStrokes();                           //!< [Gameplay.Interaction] SwimStrokes (KbmInject)
+    bool Undetected();                            //!< [Cheats.Player] Undetected: guards and hostile people do not notice you (Undetected)
+    bool TouchToUse();                            //!< [Gameplay.Interaction] TouchToUse: buttons, switches and levers by hand (Collision)
+    float SitHoldTime();                          //!< [Gameplay.Sitting] SitHoldTime: s B is held while crouched to sit (0 = off)
+    float SitHeight();                            //!< [Gameplay.Sitting] SitHeight: m (the ini says cm) the eye is over the feet when sitting
+    float MovementVignette();                     //!< [Controls.Comfort] MovementVignette: 0..1, the view's edges darken while the character moves (Vignette)
+    bool Roomscale();                             //!< [Controls] Roomscale: walking in the room walks the character (Roomscale)
+    std::string ControllerBindings();             //!< [Controls] ControllerBindings: auto or a profile's file name (ControllerBindings)
+    float PadPressForce();                        //!< a controller profile's trackpad press force (KbmInject)
+    float PadReleaseForce();                      //!< ...and the force it lets go below
+    float PadCenterRadius();                      //!< ...and the left pad's centre (the menu button), 0..1
+    bool WallFade();                              //!< [Controls] WallFade: the headset darkens with the head in a wall (Roomscale)
+    void WallFadeColor(float srgb[3]);            //!< [Controls] WallFadeColor: what it fades to (R,G,B 0-255 in the file)
+    float RoomscaleDeadzone();                    //!< [Controls] RoomscaleDeadzone: m (the ini says cm) before it follows
+    float RoomscaleMaxSpeed();                    //!< [Controls] RoomscaleMaxSpeed: m/s
+    bool PullToOpen();                            //!< [Gameplay] PullToOpen: grab and pull drawers / cabinets open, push to close
+    bool PhysicalPickup();                        //!< [Gameplay] PhysicalPickup: items grabbed by hand, stored behind the back
+    bool MouthPotions();                          //!< [Gameplay] MouthPotions: a grip at the mouth drinks an elixir (KbmInject)
+    bool TempleZoom();                            //!< [Gameplay] TempleZoom: the right hand tapped against the side of the head taps the zoom (KbmInject)
+    bool FarReachVRComfortOption();               //!< [Gameplay.Powers] FarReachVRComfortOption: Far Reach jumps like Blink (HandAimHook)
+    //! [Cheats] UnlockEverything (= all) or its parts: the TestAids::Unlock mask given to every save loaded
+    unsigned Unlocks();
+    //! [Cheats.Powers] the powers switched on one by one, as TestAids::SetAutoPowers takes them ("blink,darkvision"; "" = none)
+    std::string PowerUnlocks();
+    bool SwipeDials();                            //!< [Gameplay] SwipeDials: slide a hand up / down a safe dial to turn it
+    bool SlideWindows();                          //!< [Gameplay] SlideWindows: slide a hand up / down a window to raise / lower it
+    bool HolsterWeapons();                        //!< [Gameplay] HolsterWeapons: left trigger at the left hip draws the pistol, behind the back the crossbow
+    float SwordBodyDepth();                       //!< [Gameplay] SwordBodyDepth: m (the ini says cm) the blade sinks into a body
+    float PushStrength();                         //!< [Gameplay] PushStrength: the hand's effective mass, kg
+    //! [Controls] GripThresholdLeft / GripThresholdRight (hand 0 / 1): how far that grip is pressed to count (KbmInject).
+    //! An ini without them that still has the old GripThreshold uses that for both.
+    float GripThreshold(int hand);
+    bool SnapTurnBlank();                         //!< [Controls] SnapTurnBlank: black during a snap turn (KbmInject)
+    bool StereoHud();                             //!< [Display] StereoHud: the game's HUD on one panel for both eyes (ScreenMode)
+    float HudDistance();                          //!< [Display] HudDistance: that panel's distance, m
+    bool CameraPitchFix();                        //!< [Display] CameraPitchFix: the game's neck out of the view (ViewMatrixHook)
+    float MaxRenderMegapixels();                  //!< [Display] MaxRenderMegapixels: the render size's budget, MP per eye (0 = none)
+    bool SkipSneakOverlay();                      //!< [Display] SkipSneakOverlay: the sneak mode's screen overlay not drawn in the eyes
+    float FogMapsResolution();                    //!< [Display] FogMapsResolution: the game's fog buffers in FogMaps maps (share of the eye)
+    float SnapTurnBlankOpacity();                 //!< [Controls] SnapTurnBlankOpacity: 0..1, 1 = black
+    bool MinimalReticle();                        //!< [Display] MinimalReticle: the reticle is only a dot (Reticle)
+    float ReticleOpacity();                       //!< [Display] ReticleOpacity: 0.05..1 (Reticle)
+    bool VrGraphicsTweaks();                      //!< [Display] VrGraphicsTweaks: no depth of field in VR (VrTweaks)
+    bool DisableMotionBlur();                     //!< [Display] DisableMotionBlur: the game's camera motion blur off
+    bool DisableHeadBob();                        //!< [Display.Effects] DisableHeadBob: the game's view bob (walking, breathing) off in VR
+    bool AmbientOcclusion();                      //!< [Display] AmbientOcclusion: 0 = none in VR (VrTweaks)
+    bool Fog();                                   //!< [Display] Fog: 0 = no fog in VR (VrTweaks)
+    int SkipDisabledEffects();                    //!< [Advanced] SkipDisabledEffects (experimental): 0 off, 1 SSAO, 2 SSAO + DOF
+    Foveation::Params Foveated();                 //!< [Display] FoveatedRendering / FoveatedInner / FoveatedOuter
+    int OutOfViewMask();                          //!< [Display] OutOfViewMask (FovMask): 0 off, 1 all, 2 outer sides only
+    float OutOfViewMaskMargin();                  //!< [Display] OutOfViewMaskMargin, degrees
+    bool OutOfViewMaskLens();                     //!< [Display] OutOfViewMaskLens
+    int FpsCounter();                             //!< [Performance] FpsCounter: 0 off, 1 top left, 2 top right, 3 bottom left, 4 bottom right
+    float FpsCounterSize();                       //!< [Performance] FpsCounterSize (1 = 20 cm wide at 1 m)
+    float FpsCounterAngle();                      //!< [Performance] FpsCounterAngle: degrees from the view's centre
+    bool ProfileRenderPasses();                   //!< [Logging] ProfileRenderPasses: GPU time per render pass (PassProfile)
+    bool VrOptionsMenu();                         //!< [System] VrOptionsMenu: VR tabs in the game's Options screen (VrMenu)
+    bool LogMenuData();                           //!< [Logging] LogMenuData: the options screen's Flash traffic (MenuProbe)
+    std::string FogMaps();
+    Fog::Params CheapFog();                       //!< [Display] CheapFog*: the mod's own fog while the game's is off                        //!< [Display] FogMaps: words of map names where Fog = 0 does not apply
+    StereoSync::ReuseFlags StereoReuse();         //!< [Advanced] Stereo*Reuse, StereoStreamOncePerPair (experimental, StereoSync)
+    std::string Summary();                        //!< one line for the log
+    //! The setting is @hidden (most players never need to change it) rather than @user; "key" or "group.key"
+    bool IsHidden(const std::string& name);
+    //! One setting as the VR options tabs show it (VrMenu): kind 0 bool, 1 number (lo..hi; both 0 = no range), 2 one of
+    //! `choices` ("a|b"), 3 free text; the value as read (or the default)
+    struct KeyInfo { std::string name; int kind = 0; std::string value, def; float lo = 0, hi = 0; std::string choices; bool hidden = false;
+                     std::string rec; /*!< recommended for most players (@user ones; "" = none) */
+                     bool restart = false; /*!< a change takes effect when the game is started again; value = the saved one */
+                     std::string source;   /*!< the controller profile that holds it ("index.json"; "" = the ini) */ };
+    bool Info(const std::string& name, KeyInfo& out);
+    //! The VR options tabs' Save (VrMenu): each (name, value) checked as the file's own would be, written into
+    //! DOTOVR.ini in place (only the value on that setting's line changes) and then used: at once, or after a
+    //! restart (KeyInfo::restart). `live`: the bare lower-case names that changed at once, for the modules to be told.
+    //! false (+ err) = the file could not be written, and nothing changed.
+    bool Save(const std::vector<std::pair<std::string, std::string>>& changes, std::vector<std::string>& live, std::string& err);
+    //! A controller profile's settings (ControllerBindings: bare name, value as written), checked as the ini's are and
+    //! used instead of the ini's; `changed` = the bare names whose value changed. Any thread.
+    void ApplyOverrides(const std::vector<std::pair<std::string, std::string>>& values, const std::string& source, std::vector<std::string>& changed);
+}
