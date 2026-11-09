@@ -14,6 +14,7 @@
 #include "PlayerState.h"
 #include "SwordGesture.h"
 #include "Collision.h"
+#include "HandFx.h"
 #include <cmath>
 #include <sstream>
 #include <unordered_map>
@@ -237,6 +238,14 @@ namespace
         void* held = GrabHand::HeldEntity();
         float player[3] = { eye[0], eye[1], eye[2] - 1.0f };
         if (an[BodyHide::aPlayer].valid) memcpy(player, an[BodyHide::aPlayer].org, 12);
+        // DOTO (2026-11-09): the wrist launcher and what hangs off it (`gauss_electric_attachment`, 7 cm from it) are
+        // entities of their own where the flat game holds the left arm -- 0.45 m from the eye -- and were struck as
+        // targets ("CONTACT box ... 'gauss_electric_attachment_5274' ... clicks a Slash"). The player's own: skipped,
+        // with everything within 30 cm of a launcher's entity.
+        void* launcher[2] = { HandFx::WristLauncherEntity(0), HandFx::WristLauncherEntity(1) };
+        float launcherOrg[2][3] = {}; bool launcherOk[2] = {};
+        for (int s = 0; s < 2; s++)
+            launcherOk[s] = launcher[s] && SafeCopy(launcherOrg[s], (uint8_t*)launcher[s] + BodyHide::kEntityOrigin, 12) && Finite(launcherOrg[s], 3);
         int seen = 0, nBoxed = 0, nSkelReads = 0;
         LARGE_INTEGER q0{}; if (Log::Enabled()) QueryPerformanceCounter(&q0);
         for (uint32_t i = 0; i < kEntSlots; i++)
@@ -253,6 +262,17 @@ namespace
             uint8_t hidden = 0; SafeCopy(&hidden, e + kEntHidden, 1);
             if (!RefreshPose(t)) continue;
             if (hidden & 1) { NoteSkipped(t, false, "hidden", eye, C.radius); continue; }
+            {
+                bool worn = false;
+                for (int s = 0; s < 2 && !worn; s++)
+                {
+                    if (!launcherOk[s]) continue;
+                    if (e == launcher[s]) { worn = true; break; }
+                    const float w[3] = { t.org[0] - launcherOrg[s][0], t.org[1] - launcherOrg[s][1], t.org[2] - launcherOrg[s][2] };
+                    worn = Dot(w, w) < 0.3f * 0.3f;
+                }
+                if (worn) { NoteSkipped(t, false, "the wrist launcher or a piece of it (the player's own)", eye, C.radius); continue; }
+            }
             if (const int wc = GpuTrace::WeaponClaim(t.org); wc >= 0)
             {   // drawn as part of a held weapon (its upgrades, the cartridge): the player's own
                 if (log) SafeCopy(&t.id, e + kEntId, 4);

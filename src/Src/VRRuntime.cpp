@@ -747,6 +747,7 @@ void VRRuntime::SetControllerOptions(float pitchOffsetDeg, bool fingerTracking)
     g_Session.SetFingerTracking(fingerTracking);
 }
 void VRRuntime::SetFpsCounter(int position, float size, float angleDeg) { XRSession::SetFpsCounter(position, size, angleDeg); }
+void VRRuntime::SetBackgroundSubmit(bool on) { XRSession::SetBackgroundSubmit(on); }
 static bool HudFrameOfPose(const ViewMatrixHook::XrPose& rp, float q[4], float pos[3], float tan[4])
 {   // the frame the game camera rendered a main view's picture as: the eye's turn to its frustum (warp) and the eye's
     // own offset from the head taken back out; at the head of the view's pair

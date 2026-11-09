@@ -1155,6 +1155,7 @@ namespace
     volatile int g_SunMask = 0;                  // N - 1 (N a power of 2), 0 = as the game
     bool g_SunPatched = false;
 }
+int ScreenShadows::SunUpdateMask() { return g_SunPatched ? g_SunMask : 0; }
 void ScreenShadows::SetSunUpdateEvery(int pairs)
 {
     const int n = pairs >= 4 ? 4 : pairs >= 2 ? 2 : 1;

@@ -36,7 +36,23 @@ namespace
             if (!logged) { logged = true; LOGI("D3D11Hook: the game's V-Sync (sync interval {}) is ignored while synchronised stereo runs: the headset paces the frames", sync); }
             sync = 0;
         }
-        return g_RealPresent(sc, sync, flags);
+        const HRESULT hr = g_RealPresent(sc, sync, flags);
+        // 2026-11-08 (the silent load crash): a Present that fails is the game's cue to quit -- a lost device (DXGI_ERROR_
+        // DEVICE_REMOVED / RESET: a driver reset, or an invalid call from a recording thread) ends in no exception. Logged
+        // with the device's own reason, once each.
+        if (FAILED(hr) && hr != DXGI_STATUS_OCCLUDED)
+        {
+            static int logged = 0;
+            if (logged++ < 8)
+            {
+                HRESULT why = S_OK; ID3D11Device* dev = nullptr;
+                if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&dev)) && dev) { why = dev->GetDeviceRemovedReason(); dev->Release(); }
+                Log::ForceFile();
+                LOGI("D3D11Hook: Present FAILED 0x{:08X} (the device's removed reason 0x{:08X}){}", (unsigned)hr, (unsigned)why,
+                     hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ? ": the GPU device is lost (a driver reset, or an invalid call) -- the game will quit" : "");
+            }
+        }
+        return hr;
     }
     HRESULT STDMETHODCALLTYPE HkResize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
     {

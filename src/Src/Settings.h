@@ -59,6 +59,10 @@ namespace Settings
     float OutOfViewMaskCorners();                 //!< [Display] OutOfViewMaskCorners (FovMask)
     bool ShadowLampFewerUpdates();                //!< [Display] ShadowLampFewerUpdates (ScreenShadows)
     bool ShadowLampKeepCache();                   //!< [Performance.Shadows] ShadowLampKeepCache (ScreenShadows)
+    bool BackgroundSubmit();                      //!< [Performance.CPU] BackgroundSubmit (XRSession)
+    bool LeanDrawHooks();                         //!< [Performance.CPU] LeanDrawHooks (GpuTrace)
+    bool BackgroundInput();                       //!< [Performance.CPU] BackgroundInput (KbmInject)
+    //   ([Performance.CPU] RightEyeSunShadows: in StereoReuse, as sunAll)
     int ShadowLampCacheSlices();                  //!< [Display] ShadowLampCacheSlices (ScreenShadows)
     float StaticLodZoom();                        //!< [Display] StaticLodZoom (VrTweaks, experimental)
     int ViewDistance();                           //!< [Display] ViewDistance (VrTweaks): -1 = the game's
@@ -123,7 +127,11 @@ namespace Settings
     bool DisableMotionBlur();                     //!< [Display] DisableMotionBlur: the game's camera motion blur off
     bool DisableHeadBob();                        //!< [Display.Effects] DisableHeadBob: the game's view bob (walking, breathing) off in VR
     bool AmbientOcclusion();                      //!< [Display] AmbientOcclusion: 0 = none in VR (VrTweaks)
-    bool AmbientOcclusionHigh();                  //!< [Display.Effects] AmbientOcclusionQuality: high = GTAO (AoGtao) instead of the game's DWAO
+    bool AmbientOcclusionHigh();                  //!< [Display.Effects] AmbientOcclusionQuality: high / ultra = GTAO (AoGtao) instead of the game's DWAO
+    bool AmbientOcclusionUltra();                 //!< ... ultra = the full GTAO (3 slices a pixel), high = the fast one
+    bool AmbientOcclusionLow();
+    bool RawBool(const char* bareKey);            //!< a bool setting as stored (e.g. "fog"), without the rules its own getter applies                   //!< ... low = the lite GTAO (about the game's own AO's cost)
+    bool FoveatedEffects();                       //!< [Performance.Shading] FoveatedEffects: the mod's own effects lighter away from the centre (any GPU)
     float AmbientOcclusionRadius();               //!< its radius (m), hidden
     float AmbientOcclusionStrength();             //!< the power on its visibility, hidden
     bool Fog();                                   //!< [Display] Fog: 0 = no fog in VR (VrTweaks)

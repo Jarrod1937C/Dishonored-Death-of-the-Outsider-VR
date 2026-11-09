@@ -149,11 +149,18 @@ namespace
     // every task once the executors are hooked, whatever else is on
     int g_RowClass[kRows] = {};
     thread_local int t_Class = PassProfile::kTaskNone;
+    // LeanDrawHooks (GpuTrace): the static world's forward pass, which never draws what the player holds
+    bool g_RowStaticWorld[kRows] = {};
+    thread_local bool t_StaticWorld = false;
     struct ClassScope
     {
-        int saved;
-        explicit ClassScope(int pass) : saved(t_Class) { t_Class = pass >= 0 && pass < kRows ? g_RowClass[pass] : PassProfile::kTaskNone; }
-        ~ClassScope() { t_Class = saved; }
+        int saved; bool savedWorld;
+        explicit ClassScope(int pass) : saved(t_Class), savedWorld(t_StaticWorld)
+        {
+            t_Class = pass >= 0 && pass < kRows ? g_RowClass[pass] : PassProfile::kTaskNone;
+            t_StaticWorld = pass >= 0 && pass < kRows && g_RowStaticWorld[pass];
+        }
+        ~ClassScope() { t_Class = saved; t_StaticWorld = savedWorld; }
     };
     // ---- the batching census (ProfileRenderPasses, the draw-by-draw frame): how many of a left-eye frame's draws
     // repeat a mesh and a material already drawn in the same pass, i.e. how many an instanced draw could take in ----
@@ -1534,6 +1541,7 @@ void PassProfile::Install()
         for (const char* n : motion) if (!strcmp(kPasses[i].name, n)) g_RowClass[i] = kTaskMotion;
         for (const char* n : { "SHADOWS_WORLD lamps", "SHADOWS_WORLD sun" }) if (!strcmp(kPasses[i].name, n)) g_RowClass[i] = kTaskStaticShadow;
         for (const char* n : scene) if (!strcmp(kPasses[i].name, n)) g_RowClass[i] = kTaskScene;
+        if (!strcmp(kPasses[i].name, "FORWARD_WORLD")) g_RowStaticWorld[i] = true;
     }
     g_FogHook = Fog::Wanted();
     g_FovHook = Foveation::Wanted();
@@ -1570,6 +1578,7 @@ void PassProfile::DrawByDrawSoon(int ms)
 }
 bool PassProfile::On() { return g_On.load(std::memory_order_relaxed); }
 int PassProfile::TaskClass() { return t_Class; }
+bool PassProfile::StaticWorldNow() { return t_StaticWorld; }
 
 int PassProfile::CharTask() { return t_CharTask; }
 bool PassProfile::DepthOnlyNow() { return t_DepthOnly; }

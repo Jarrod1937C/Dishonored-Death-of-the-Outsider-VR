@@ -278,6 +278,9 @@ public:
     //! [Performance] FpsCounter: 0 off, 1 top left, 2 top right, 3 bottom left, 4 bottom right of the view; size (1 =
     //! the default) and how far from the view's centre (degrees, sideways; 0.8 of it up / down). Any thread.
     static void SetFpsCounter(int position, float size, float angleDeg);
+    //! [Performance.CPU] BackgroundSubmit: a stereo pair's swapchain releases and xrEndFrame made on the submit thread
+    //! (the render thread goes on with the next frame while SteamVR waits for the driver there). Any thread.
+    static void SetBackgroundSubmit(bool on);
     //! The menu screen's frame (ScreenMode): instead of the game's picture across the eyes, the backdrop in the
     //! projection layer (each eye drawn for its pose right now) and panel slot 0 over it. Ends the frame.
     void SubmitScreen(const XRBackdrop& b);
@@ -389,6 +392,10 @@ private:
     void ReadVisibilityMasks();            //!< XR_KHR_visibility_mask: the lens's hidden triangles per eye (XRVisMask)
     void PumpLoop();
     static unsigned long __stdcall PumpThread(void* self);
+    void SubmitLoop();                     //!< BackgroundSubmit: the submit thread (XRSession.cpp, SubmitJob)
+    static unsigned long __stdcall SubmitThread(void* self);
+    bool StartSubmit();
+    void StopSubmit();
     bool StartPump();
     bool StopPump(unsigned waitMs);
     void KeepAliveFrame(const void* frameState);

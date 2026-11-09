@@ -35,6 +35,8 @@ namespace ScreenShadows
     //! (a patch of the cascade task's frame test, exe+0x334D8D); then InstallSunUpdateRate
     void SetSunUpdateEvery(int pairs);
     void InstallSunUpdateRate();
+    //! ShadowSunUpdateEvery's mask as patched into the cascade task (N - 1; 0 = the game's own parity), for StereoSync
+    int SunUpdateMask();
     void InstallSmallObjects();
     bool Wanted();
     bool CharactersWanted();

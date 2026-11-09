@@ -35,6 +35,11 @@ namespace
     std::atomic<bool> g_GameFogOff{ false };   // r_skipFog is 1 now (the game's fog pass does not run)
     std::atomic<int> g_FogMapsShift{ -1 };    // FogMapsResolution as r_downsampleQuality (0 full, 1 half, 2 quarter; -1 the game's)
     std::atomic<float> g_LodZoom{ 1.f };   // StaticLodZoom (1 = the game's own, never written)
+    // StaticLodZoom's undo: the game's own r_lodZoomMultiplicator (its view-distance level's: 0.7 at Very High), seen
+    // before the first hold and after every view-distance change, put back when StaticLodZoom returns to 1. (Before
+    // 2026-11-08 a change back to 1 only stopped the hold: the last held value stayed in the cvar for the session.)
+    std::atomic<float> g_GameLod{ -1.f };   // -1 = not seen yet
+    bool g_LodHeld = false;                 // render thread: the cvar holds StaticLodZoom's value
     std::atomic<bool> g_NoBob{ true };     // DisableHeadBob
     int g_UserNoBob = -1;                  // the game's pm_noBob, to put back (render thread)
     int g_UserObjMarkers = -1;             // the game's ark_ui_show_objective_markers, to put back (render thread)
@@ -91,6 +96,7 @@ namespace
         const int want = g_ViewDist.load();
         if (want >= 0 && want != level) LOGI("VrTweaks: view distance: the game asked for level {}, ViewDistance {} applied instead", level, want);
         g_ViewDistReal(settings, want >= 0 ? want : level);
+        { const float g = CVars::GetFloat("r_lodZoomMultiplicator", -1.f); if (g > 0.f) g_GameLod = g; }   // the level's own (StaticLodZoom's undo)
         LOGI("VrTweaks: view distance level {} applied: r_lodZoomMultiplicator {:g}{}, r_umbraGateVisibilityRatio {:g}", want >= 0 ? want : level,
              CVars::GetFloat("r_lodZoomMultiplicator", -1.f), fabsf(g_LodZoom.load() - 1.f) > 1e-3f ? fmt::format(" (StaticLodZoom {:g} holds it instead)", g_LodZoom.load()) : std::string(),
              CVars::GetFloat("r_umbraGateVisibilityRatio", -1.f));
@@ -148,6 +154,7 @@ void VrTweaks::SetLodZoom(float z)
 {
     g_LodZoom = z;
     if (fabsf(z - 1.f) > 1e-3f) LOGI("VrTweaks: StaticLodZoom {:g}: the game's r_lodZoomMultiplicator held at it (the static models' level of detail; experimental)", z);
+    else LOGI("VrTweaks: StaticLodZoom 1: the game's own r_lodZoomMultiplicator (its view-distance level's; {:g} when last seen)", g_GameLod.load());
 }
 void VrTweaks::SetHeadBobOff(bool off) { g_NoBob = off; }
 bool VrTweaks::GameFogOff() { return g_GameFogOff.load(std::memory_order_relaxed); }
@@ -280,7 +287,7 @@ void VrTweaks::SetFogMapsResolution(float share)
 {
     const int s = share <= 0.f ? -1 : share >= 0.75f ? 0 : share >= 0.375f ? 1 : 2;
     g_FogMapsShift = s;
-    LOGI("VrTweaks: FogMapsResolution {:g}: {}", share, s < 0 ? std::string("the game's own size for its fog in FogMaps maps") : fmt::format("in FogMaps maps the game's fog (and its other reduced-size buffers) at 1/{} of the eye's size", 1 << s));
+    LOGI("VrTweaks: FogMapsResolution {:g}: {}", share, s < 0 ? std::string("the game's own size for its fog") : fmt::format("wherever the game's fog is drawn (FogMaps maps, or everywhere with Fog = 1) its fog (and its other reduced-size buffers) at 1/{} of the eye's size", 1 << s));
 }
 void VrTweaks::SetFog(bool on)
 {
@@ -336,8 +343,21 @@ void VrTweaks::OnPresent()
             if (fabsf(z - 1.f) > 1e-3f)
             {
                 const float now = CVars::GetFloat("r_lodZoomMultiplicator", -1.f);
-                if (now > 0.f && fabsf(now - z) > 1e-3f && CVars::SetFloat("r_lodZoomMultiplicator", z) && told++ < 8)
-                    LOGI("VrTweaks: r_lodZoomMultiplicator {:g} -> {:g} (StaticLodZoom)", now, z);
+                if (!g_LodHeld && now > 0.f && g_GameLod.load() < 0.f) g_GameLod = now;   // the game's own, before the first hold
+                if (now > 0.f && fabsf(now - z) > 1e-3f && CVars::SetFloat("r_lodZoomMultiplicator", z))
+                {
+                    g_LodHeld = true;
+                    if (told++ < 8) LOGI("VrTweaks: r_lodZoomMultiplicator {:g} -> {:g} (StaticLodZoom)", now, z);
+                }
+            }
+            else if (g_LodHeld)
+            {   // StaticLodZoom back to 1: the game's own value back
+                g_LodHeld = false;
+                const float g = g_GameLod.load(), now = CVars::GetFloat("r_lodZoomMultiplicator", -1.f);
+                if (g > 0.f && CVars::SetFloat("r_lodZoomMultiplicator", g))
+                    LOGI("VrTweaks: r_lodZoomMultiplicator {:g} -> {:g}, the game's own (StaticLodZoom 1)", now, g);
+                else
+                    LOGI("VrTweaks: StaticLodZoom 1: the game's own r_lodZoomMultiplicator is not known: {:g} stays until the view distance is next applied", now);
             }
         }
         {   // DisableHeadBob: pm_noBob held at 1 while the headset shows the game (read by the player's body every frame),
@@ -383,7 +403,9 @@ void VrTweaks::OnPresent()
             static int saved = -1;
             const int shift = g_FogMapsShift.load();
             const int cur = CVars::GetInt("r_downsampleQuality", -1);
-            if (active && g_MapFog && shift >= 0 && cur >= 0)
+            // (2026-11-08: also with Fog = 1 -- the game's fog everywhere -- not only in FogMaps maps: "FogMapsResolution = 1
+            // and the fog still looks like a scaled-down buffer". Whenever the game's own fog is drawn.)
+            if (active && (g_MapFog || g_Fog.load()) && !g_GameFogOff.load() && shift >= 0 && cur >= 0)
             {
                 if (saved < 0) saved = cur;
                 if (cur != shift && CVars::SetIntModified("r_downsampleQuality", shift))

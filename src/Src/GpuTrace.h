@@ -321,7 +321,9 @@ namespace GpuTrace
     //! (cb_modeldepthhack 5) so they always win against the world; 1 = undone on the player's own draws (the hands
     //! sort by their real distance), 0 = the game's.
     void SetHandDepth(bool real);
-    void SetWeaponShadows(bool on);   //!< vr weaponshadows / [Display.Picture] WeaponShadows: the held weapon drawn into the shadow maps
+    void SetWeaponShadows(bool on);
+    //! [Performance.CPU] LeanDrawHooks: the static world's forward pass skips the per-draw player test (GpuTrace.cpp)
+    void SetLeanDrawHooks(bool on);   //!< vr weaponshadows / [Display.Picture] WeaponShadows: the held weapon drawn into the shadow maps
     std::string HandRestStats();
     std::string SixDofStats();
 

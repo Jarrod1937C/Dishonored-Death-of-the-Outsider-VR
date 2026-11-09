@@ -27,6 +27,8 @@
 #include "BodyDrag.h"
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 
 namespace
 {
@@ -426,6 +428,68 @@ namespace
     //! bare virtual key (wScan 0) is not seen at all -- measured on the choke prompt ("Ctrl" = choke): Ctrl sent that
     //! way counted two key events and choked nothing, the same key by scancode (0x1D) choked at once. The arrows and
     //! PGUP/PGDN share their scancodes with the keypad; only the extended bit makes them arrows (KeyBinds::Bind::ext).
+    // ---- [Performance.CPU] BackgroundInput ----
+    // SendInput is a system call that hands the event to the system's input thread and waits for it to be queued; on
+    // the render thread (the game's main thread: KbmInject::Tick) every key, button and mouse move of a frame paid it
+    // in turn. With this on the events go into a queue a thread of their own sends -- in one SendInput for all that
+    // were queued, in the order they were made -- while the render thread goes on. The game's keyboard / mouse reads
+    // (StereoSync's poll hooks) first wait, at most 1.5 ms, for that queue to be empty (DrainInjected), so a frame's
+    // input reaches the same game frame as before. Off: SendInput on the calling thread, as before.
+    std::atomic<bool> g_BgInput{ true };
+    struct InputQueue
+    {
+        std::mutex m; std::condition_variable cv, done;
+        std::vector<INPUT> q; bool busy = false;
+        HANDLE thread = nullptr;
+        std::atomic<unsigned long long> sent{ 0 }, batches{ 0 }, direct{ 0 }, drains{ 0 }, drainWaits{ 0 }, drainTimeouts{ 0 }, sendUs{ 0 }, waitUs{ 0 };
+    } g_In;
+    unsigned long long QpcUs()
+    {
+        static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        LARGE_INTEGER c; QueryPerformanceCounter(&c); return (unsigned long long)(c.QuadPart * 1000000.0 / (double)f.QuadPart);
+    }
+    DWORD WINAPI InputThread(void*)
+    {
+        std::vector<INPUT> batch;
+        for (;;)
+        {
+            {
+                std::unique_lock lk(g_In.m);
+                g_In.cv.wait(lk, [] { return !g_In.q.empty(); });
+                batch.swap(g_In.q); g_In.busy = true;
+            }
+            const unsigned long long t0 = QpcUs();
+            SendInput((UINT)batch.size(), batch.data(), sizeof(INPUT));
+            g_In.sendUs += QpcUs() - t0; g_In.sent += batch.size(); g_In.batches++;
+            batch.clear();
+            { std::lock_guard lk(g_In.m); g_In.busy = false; }
+            g_In.done.notify_all();
+        }
+    }
+    //! one event out: queued for the input thread (BackgroundInput), else sent here
+    void Inject(const INPUT& in)
+    {
+        if (g_BgInput.load(std::memory_order_relaxed) && g_In.thread)
+        {
+            { std::lock_guard lk(g_In.m); g_In.q.push_back(in); }
+            g_In.cv.notify_one();
+            return;
+        }
+        INPUT c = in; SendInput(1, &c, sizeof c); g_In.direct++;
+    }
+    //! waits (at most `us`) for the queued events to have been sent; false on the time running out
+    bool WaitInputQueue(long long us)
+    {
+        std::unique_lock lk(g_In.m);
+        if (g_In.q.empty() && !g_In.busy) return true;
+        g_In.drainWaits++;
+        const unsigned long long t0 = QpcUs();
+        const bool ok = g_In.done.wait_for(lk, std::chrono::microseconds(us), [] { return g_In.q.empty() && !g_In.busy; });
+        g_In.waitUs += QpcUs() - t0;
+        if (!ok) g_In.drainTimeouts++;
+        return ok;
+    }
+
     void SendBind(const KeyBinds::Bind& b, bool down)
     {
         INPUT in{};
@@ -452,7 +516,7 @@ namespace
             in.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP) | (b.ext ? KEYEVENTF_EXTENDEDKEY : 0);
         }
         else return;
-        SendInput(1, &in, sizeof in);
+        Inject(in);
         std::lock_guard lk(g_M); g_Stats.keyEvents++;
     }
     void SendKey(Slot s, bool down)
@@ -948,7 +1012,7 @@ namespace
     {
         if (!dx && !dy) return;
         INPUT in{}; in.type = INPUT_MOUSE; in.mi.dx = dx; in.mi.dy = dy; in.mi.dwFlags = MOUSEEVENTF_MOVE;
-        SendInput(1, &in, sizeof in);
+        Inject(in);
         std::lock_guard lk(g_M); g_Stats.mouseEvents++; g_Stats.lastDx = (float)dx;
     }
 
@@ -1332,9 +1396,42 @@ namespace
     }
 }
 
+void KbmInject::SetBackgroundInput(bool on)
+{
+    if (on && !g_In.thread)
+    {
+        g_In.thread = CreateThread(nullptr, 0, InputThread, nullptr, 0, nullptr);
+        if (!g_In.thread) { LOGI("KbmInject: BackgroundInput: the input thread could not be started ({}): input is sent from the render thread", GetLastError()); on = false; }
+    }
+    const bool was = g_BgInput.exchange(on);
+    if (was && !on && g_In.thread) WaitInputQueue(50000);   // what was queued goes out before the render thread sends again
+    LOGI("KbmInject: BackgroundInput {}", on ? "on: keys, buttons and mouse moves go out from a thread of their own (batched), the game's input reads wait for them"
+                                             : "off: keys, buttons and mouse moves are sent from the render thread, one SendInput each");
+}
+bool KbmInject::BackgroundInput() { return g_BgInput.load() && g_In.thread; }
+void KbmInject::DrainInjected()
+{
+    if (!g_In.thread) return;
+    g_In.drains++;
+    WaitInputQueue(1500);
+}
+std::string KbmInject::BackgroundInputInfo()
+{
+    const unsigned long long b = g_In.batches.load(), s = g_In.sent.load(), w = g_In.drainWaits.load();
+    return fmt::format("BackgroundInput {}: {} events in {} SendInput calls ({:.1f} us a call on the input thread), {} sent on the calling thread; "
+                       "the game's input reads {}, {} waited for the queue ({:.0f} us on average), {} gave up after 1.5 ms",
+                       BackgroundInput() ? "on" : "off", s, b, b ? (double)g_In.sendUs.load() / b : 0.0, g_In.direct.load(),
+                       g_In.drains.load(), w, w ? (double)g_In.waitUs.load() / w : 0.0, g_In.drainTimeouts.load());
+}
+
 void KbmInject::Tick()
 {
     g_Frame++;
+    {   // [Performance.CPU] BackgroundInput's report, every 60 s
+        static ULONGLONG next = 0; const ULONGLONG t = GetTickCount64();
+        if (!next) next = t + 60000;
+        else if (t >= next && g_In.thread) { next = t + 60000; LOGI("KbmInject: {}", BackgroundInputInfo()); }
+    }
     {
         static LARGE_INTEGER fq{}, last{}; LARGE_INTEGER now; QueryPerformanceCounter(&now);
         if (!fq.QuadPart) { QueryPerformanceFrequency(&fq); last = now; }

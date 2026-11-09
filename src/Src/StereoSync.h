@@ -42,6 +42,8 @@ namespace StereoSync
     //! only through the engine's own keep path (StereoSunShadowReuse): see StereoSync.cpp.
     //! StereoSunShadowReuse: the right eye's frame keeps the left eye's nearest sun cascade (its matrix, split distance
     //! and map); the farther ones are already shared (the engine's alternate-frame updates).
-    struct ReuseFlags { bool ocean = false, reflections = false, decals = false, streaming = false, lightShadows = false, sunShadows = false; };
+    //! sunAll ([Performance.CPU] RightEyeSunShadows): the right eye's frame also leaves out the farther cascades' tasks
+    //! whenever its frame only copies them from their caches (their matrix and map are then the left frame's).
+    struct ReuseFlags { bool ocean = false, reflections = false, decals = false, streaming = false, lightShadows = false, sunShadows = false, sunAll = false; };
     void SetReuse(const ReuseFlags& f);
 }

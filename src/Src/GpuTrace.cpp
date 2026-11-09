@@ -12,6 +12,7 @@
 #include "Settings.h"
 #include "PortCheck.h"
 #include <detours/detours.h>
+#include <intrin.h>
 #include <map>
 #include <mutex>
 #include <string>
@@ -26,6 +27,7 @@
 #include <d3d11shader.h>
 #include <cmath>
 #include "GameInfo.h"
+#include "GunRay.h"
 #include "ViewMatrixHook.h"
 #include "HandAimHook.h"
 #include "VRRuntime.h"
@@ -961,6 +963,13 @@ namespace
     // pistol part at 0.175, a mod at 0.128 (RESEARCH). At 0.75 a bottle on a table 0.68 m from the sword's entity was
     // claimed as the sword after a release and drawn wherever the sword's delta put it (its shadow stayed put).
     std::atomic<float> g_AnchorRadius{ 0.35f };
+    // DOTO (2026-11-09): an effect's card -- a draw of a few triangles (n <= kFxCardIndices) -- hung off a held item but
+    // farther from its entity than the anchor radius: the glow of the round loaded in the wrist launcher ("the dark /
+    // red box" at the flat game's left hand, `nearleft` 2026-11-08: ALPHA_LIT + DEPTHALPHA_LIT n=6, 0.23-0.48 m from the
+    // launcher's entity, never moved). Within g_FxCardRadius of a held item's entity it is taken as that item's piece.
+    constexpr UINT kFxCardIndices = 36;
+    std::atomic<float> g_FxCardRadius{ 0.6f };
+    std::atomic<unsigned long long> g_FxCards[2];
     std::atomic<unsigned long long> g_NoAnchor{ 0 };
     // Live count of the draws the entity test claimed, per hand, for the frame just submitted. This is what tells
     // the tester at a glance whether the weapon is whole: it should be steady, and it should not be zero.
@@ -2039,10 +2048,48 @@ namespace
                  s.n, s.angBad, s.maxAng, s.detNeg, s.noModel, s.n ? s.sumMoved / (float)s.n : 0.f);
         }
     }
+    // ---- research (2026-11-08): what by the flat game's held weapon / wrist launcher is left where the game has it ----
+    // "the electric effect" and "a dark card with a glow" stay where the flat game holds the launcher. Every draw whose
+    // model origin lies within 0.6 m of a held weapon's (or the launcher's) entity and that the mod then does NOT move
+    // is logged once per (pass, index count, constant size, shaders), with how often it came (`nearleft` lines, 30 s).
+    thread_local float t_NearOrg[3]; thread_local float t_NearD = 1e9f; thread_local bool t_NearValid = false;
+    struct NearLeft { unsigned long long n = 0; float d = 0, org[3] = {}; };
+    std::mutex g_NearLeftM;
+    std::map<std::string, NearLeft> g_NearLeft;   // under g_NearLeftM
+    std::atomic<int> g_NearLeftNew{ 0 };
+    void NearLeftNote(ID3D11DeviceContext* c, UINT draw)
+    {
+        const char* pass = PassProfile::PassNow();
+        ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullptr;
+        c->VSGetShader(&vs, nullptr, nullptr); c->PSGetShader(&ps, nullptr, nullptr);
+        const std::string key = fmt::format("pass {} n={} vs {} ps {} eye {}", pass ? pass : "?", draw, (void*)vs, (void*)ps, PassProfile::CharEye());
+        if (vs) vs->Release(); if (ps) ps->Release();
+        std::lock_guard lk(g_NearLeftM);
+        if (g_NearLeft.size() >= 96 && !g_NearLeft.count(key)) return;
+        NearLeft& r = g_NearLeft[key];
+        if (r.n++ == 0)
+        {
+            r.d = t_NearD; memcpy(r.org, t_NearOrg, 12);
+            if (g_NearLeftNew.fetch_add(1) < 60)
+                LOGI("nearleft: NEW {} | {:.2f} m from the held weapon / launcher entity, origin ({:.3f},{:.3f},{:.3f}): left where the game draws it",
+                     key, t_NearD, t_NearOrg[0], t_NearOrg[1], t_NearOrg[2]);
+        }
+    }
+    void NearLeftReport()
+    {
+        std::lock_guard lk(g_NearLeftM);
+        if (g_NearLeft.empty()) return;
+        std::string s;
+        for (const auto& [k, r] : g_NearLeft) if (r.n) s += fmt::format(" | {} x{} ({:.2f} m)", k, r.n, r.d);
+        LOGI("nearleft: draws by the held weapon / launcher left unmoved, last 30 s:{}", s);
+        for (auto& [k, r] : g_NearLeft) r.n = 0;
+    }
+
     bool TransformInstanceCb(ID3D11DeviceContext* ctx, const InstLayout* L, const float* in, UINT bytes, float* out, bool byIndex, UINT draw, ArmInfo* ai = nullptr)
     {
         t_DrawProjValid = false;
         t_WristDraw = 0;
+        t_NearValid = false;
         if (!L || !L->ok) { g_NoLayout++; return false; }
         const bool byAnchor = g_IdMode.load() == 1;
         if (!byIndex && !byAnchor && g_OnlyWeapon.load())
@@ -2131,6 +2178,16 @@ namespace
             LOGI("gunparts: REJECTED ({}) draw n={} cb{} | engine origin ({:.3f},{:.3f},{:.3f}), {:.3f} m from weapon {}", why, draw, bytes, worldOrg[0], worldOrg[1], worldOrg[2], sqrtf(best), wk);
         };
         if (g_CensusLeft.load() > 0) CensusAdd(f.p, sqrtf(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]), false);
+        {   // research (nearleft): how far from a held weapon's / the launcher's entity this draw's origin is
+            float best = 1e9f;
+            for (int k = 0; k < 2; k++)
+            {
+                const BodyHide::Anchor& w = anch[k == 0 ? BodyHide::aWeaponL : BodyHide::aWeaponR]; if (!w.valid) continue;
+                float q = 0; for (int i = 0; i < 3; i++) q += (worldOrg[i] - w.org[i]) * (worldOrg[i] - w.org[i]);
+                best = std::min(best, q);
+            }
+            t_NearD = sqrtf(best); memcpy(t_NearOrg, worldOrg, 12); t_NearValid = best < 0.6f * 0.6f;
+        }
         {   // a draw of the carried item: its model origin is the item entity's (wherever it was taken from)
             const BodyHide::Anchor& ca = anch[BodyHide::aCarry];
             if (ca.valid && byAnchor)
@@ -2155,8 +2212,25 @@ namespace
         {   // the entity test: this draw is the weapon only if the weapon entity is the nearest thing to it. The
             // radius is a sanity bound (a weapon plus its mods spans far less than that), not the discriminator.
             float d = 0.f, margin = 0.f;
-            const int a = NearestAnchor(anch, worldOrg, &d, &margin);
+            int a = NearestAnchor(anch, worldOrg, &d, &margin);
             if (a < 0) { partsReject("no anchor"); g_NoAnchor++; return false; }
+            bool fxCard = false;                 // (see g_FxCardRadius)
+            if (draw <= kFxCardIndices && !carryDraw && !((a == BodyHide::aArmL || a == BodyHide::aArmR || a == BodyHide::aPlayer) && d < 0.05f)
+                && !((a == BodyHide::aWeaponL || a == BodyHide::aWeaponR) && d <= g_AnchorRadius.load()))
+            {
+                int kw = -1; float dw = 1e9f;
+                for (int k : { (int)BodyHide::aWeaponL, (int)BodyHide::aWeaponR })
+                {
+                    if (!anch[k].valid) continue;
+                    float q = 0; for (int i = 0; i < 3; i++) q += (worldOrg[i] - anch[k].org[i]) * (worldOrg[i] - anch[k].org[i]);
+                    q = sqrtf(q); if (q < dw) { dw = q; kw = k; }
+                }
+                if (kw >= 0 && dw <= g_FxCardRadius.load())
+                {   // claimed as that item's: within the anchor radius from here on (the radius is a sanity bound)
+                    a = kw; d = std::min(dw, g_AnchorRadius.load()); fxCard = true;
+                    g_FxCards[kw == BodyHide::aWeaponL ? 0 : 1]++;
+                }
+            }
             // DOTO: something worn on forearm `s` (see WristDelta): this view's arm, or the one before carried to this
             // view; the HandFx snapshot (ForearmDeltaWorld) when neither is there. how = exactHow, or 7 when carried.
             auto WristDw = [&](int s, bool launcherHeld, Rigid& fw, int* sg, int& how, int exactHow) -> bool
@@ -2185,6 +2259,11 @@ namespace
                     const int o = a == BodyHide::aWeaponL ? 0 : 1;
                     if (BodyHide::HoldsWristDevice(o)) { wSide = o; wHeld = true; }
                 }
+                if (wSide < 0 && (BodyHide::HoldsWristDevice(0) || BodyHide::HoldsWristDevice(1)))
+                {   // a piece hung off the launcher by its own entity (the electric attachment's card): GunRay knows them
+                    const int ks = GunRay::WristKidSide(worldOrg, 0.06f);
+                    if (ks >= 0) { wSide = ks; wHeld = true; }
+                }
                 if (wSide < 0)
                 {
                     const int ks = WristKeySide(draw, wVb);
@@ -2206,7 +2285,7 @@ namespace
                     }
                     ownDv = Mul(vw, Mul(fw, Inv(vw))); useOwnDv = true; hand = wSide;
                     t_WristDraw = how; g_ForearmDraws[wSide]++; g_WristRigDraws[wSide]++;
-                    if (wHeld && d < 0.2f) WristKeyAdd(draw, wVb, wSide);   // (its parts sit within 8 cm of its entity: not a shadow proxy 33 cm off)
+                    if (wHeld && d < 0.2f && !fxCard) WristKeyAdd(draw, wVb, wSide);   // (a card's buffer is the effects' shared one: no key)   // (its parts sit within 8 cm of its entity: not a shadow proxy 33 cm off)
                     else g_WristUnclaimed[wSide]++;
                     goto wristPlaced;
                 }
@@ -4643,8 +4722,8 @@ namespace
             const unsigned long long v0 = g_WristViews[side][0].exchange(0), v1 = g_WristViews[side][1].exchange(0), v2 = g_WristViews[side][2].exchange(0), v3 = g_WristViews[side][3].exchange(0);
             const WristRefStat& r = g_WristRefStat[side]; const WristPartStat& p = g_WristPart[side];
             if (!(v0 + v1 + v2 + v3) && !r.n && !p.n) continue;
-            s += fmt::format(" | {}: views posed from their own arm {}, from the view before {}, kept {}, none {}; draws {} unposed {}; reference {:.2f} along the forearm",
-                             side ? "R" : "L", v0, v1, v2, v3, g_WristRigDraws[side].exchange(0), g_WristNoPose[side].exchange(0), g_WristRefK[side].load());
+            s += fmt::format(" | {}: views posed from their own arm {}, from the view before {}, kept {}, none {}; draws {} unposed {} (effect cards taken by the held item {}); reference {:.2f} along the forearm",
+                             side ? "R" : "L", v0, v1, v2, v3, g_WristRigDraws[side].exchange(0), g_WristNoPose[side].exchange(0), g_FxCards[side].exchange(0), g_WristRefK[side].load());
             if (r.n) s += fmt::format(" (launcher origin {:.2f} [{:.2f}..{:.2f}], {:.1f} cm off the bone line, max {:.1f}; past the wrist by at most {:.1f} cm)",
                                       r.sumK / r.n, r.minK, r.maxK, r.sumRad / r.n * 100.0, r.maxRad * 100.0, r.maxPast * 100.0);
             s += "; view to view in the controller's frame (by the arm frame's age):";
@@ -5070,6 +5149,10 @@ namespace
         return d2 > reach * reach;
     }
 
+    // LeanDrawHooks (see LeanSkip below): on/off, and its counters
+    std::atomic<bool> g_Lean{ true };
+    std::atomic<unsigned long long> g_LeanSkipped{ 0 }, g_LeanSampled{ 0 }, g_LeanCaught{ 0 };
+    thread_local bool t_LeanSample = false;
     void BeginSixDof(ID3D11DeviceContext* ctx, Swap& sw, bool byIndex, UINT draw, bool allowMove = true)
     {
         if (!g_PoolReady.load()) return;
@@ -5117,6 +5200,13 @@ namespace
         float out[kInstMaxFloats]; ArmInfo ai;
         const bool transformed = xf && TransformInstanceCb(ctx, L, in, bd.ByteWidth, out, byIndex, draw, &ai);
         if (!transformed) t_DrawProjValid = false;
+        if (transformed && PassProfile::StaticWorldNow())
+        {   // LeanDrawHooks' check: a draw of the static world's pass was the player's after all -- the trim goes off
+            g_LeanCaught++;
+            if (g_Lean.exchange(false))
+                LOGI("GpuTrace: LeanDrawHooks: a draw of the static world's pass (FORWARD_WORLD, index count {}{}) was one of the player's: the trim is switched OFF for this session",
+                     draw, t_LeanSample ? ", a sampled one" : "");
+        }
         bool moved = transformed;
         if (moved && g_AnimSuspend.load()) { g_AnimSuspended++; moved = false; }   // identified and counted, drawn as the game has it
         if (t_DrawProjValid)
@@ -5246,16 +5336,70 @@ namespace
         t.rtv->Release(); t.dsv->Release(); t.ps->Release();
         t.depthOnly = false;
     }
+    // ---- [Performance.CPU] LeanDrawHooks ----
+    // Measured 2026-11-08 (log 57310700, logging on): the mod's own code was ~14% of the render threads' active time --
+    // nearly all of it the per-draw test for the player's own draws (BeginSixDof: the draw's constants, its shader's
+    // layout, the distance from the player), run on every draw of every pass. The static world's forward pass
+    // (FORWARD_WORLD, 400-1450 draws an eye, one task on one thread) never draws anything the player holds -- the arms,
+    // weapons, held and carried things are dynamic models (FORWARD_DYNAMIC; measured: the sword's draws are DEPTHPASS and
+    // FORWARD_DYNAMIC only). With this on its draws skip the test, except one in 64 that still takes it as a check: should
+    // one of those turn out to be the player's, the trim switches itself off (logged). And every draw hook's own time (its
+    // work outside the real call) is measured, per draw, into the 30 s line `gpu6dof: the mod's per-draw work`.
+    // (g_Lean and its counters are declared above BeginSixDof)
+    thread_local unsigned t_LeanN = 0, t_LeanSkipN = 0;
+    //! this draw of the static world's pass skips the player test (LeanDrawHooks), else false
+    inline bool LeanSkip()
+    {
+        t_LeanSample = false;
+        if (!g_Lean.load(std::memory_order_relaxed) || !PassProfile::StaticWorldNow()) return false;
+        if ((++t_LeanN & 63) == 0) { t_LeanSample = true; g_LeanSampled.fetch_add(1, std::memory_order_relaxed); return false; }
+        if (++t_LeanSkipN == 256) { g_LeanSkipped.fetch_add(256, std::memory_order_relaxed); t_LeanSkipN = 0; }
+        return true;
+    }
+    // the hooks' own time: cycles outside the real call, per thread, published every 256 draws
+    std::atomic<unsigned long long> g_HookCycles{ 0 }, g_HookDraws{ 0 };
+    thread_local unsigned long long t_HookCycles = 0; thread_local unsigned t_HookDraws = 0;
+    struct HookClock
+    {
+        unsigned long long t0 = __rdtsc(), real = 0, r0 = 0;
+        void RealBegin() { r0 = __rdtsc(); }
+        void RealEnd() { real += __rdtsc() - r0; }
+        ~HookClock()
+        {
+            t_HookCycles += __rdtsc() - t0 - real;
+            if (++t_HookDraws == 256) { g_HookCycles.fetch_add(t_HookCycles, std::memory_order_relaxed); g_HookDraws.fetch_add(256, std::memory_order_relaxed); t_HookCycles = 0; t_HookDraws = 0; }
+        }
+    };
+    //! the TSC's ticks per ms (measured against the performance counter, once, over the first report's interval)
+    double TscPerMs()
+    {
+        static unsigned long long q0 = 0, c0 = 0; static double perMs = 0;
+        LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+        const unsigned long long c = __rdtsc();
+        if (!q0) { q0 = q.QuadPart; c0 = c; return 0; }
+        const double ms = (double)(q.QuadPart - q0) * 1000.0 / (double)f.QuadPart;
+        if (ms > 1000.0) perMs = (double)(c - c0) / ms;
+        return perMs;
+    }
+
     void BeginTarget(ID3D11DeviceContext* c, UINT n, TargetSwap& t)
     {
         if (PassProfile::DepthOnlyNow()) DepthOnlyBegin(c, t);
         if (Scanning()) ScanDraw(c, n);
         const bool byIndex = IsTarget(n);
-        // the static world's shadow casters (SHADOWS_WORLD): never what the player holds, and no motion vectors
-        const bool candidate = byIndex || (g_Near.load() > 0.f && PassProfile::TaskClass() != PassProfile::kTaskStaticShadow);
+        // the static world's shadow casters (SHADOWS_WORLD): never what the player holds, and no motion vectors; the static
+        // world's forward pass with LeanDrawHooks (but one draw in 64)
+        const bool candidate = byIndex || (g_Near.load() > 0.f && PassProfile::TaskClass() != PassProfile::kTaskStaticShadow && !LeanSkip());
         const bool fix = FixHere();
         if (!candidate && !fix) return;
-        if (SixDofOn() || fix) { BeginSixDof(c, t.six, byIndex, n, candidate); return; }
+        if (SixDofOn() || fix)
+        {
+            t_NearValid = false;
+            BeginSixDof(c, t.six, byIndex, n, candidate);
+            if (t_NearValid && !t.six.on && !t.six.drop && t.six.palSlot[0] < 0 && t.six.palSlot[1] < 0 && ::Log::Enabled())
+                NearLeftNote(c, n);   // research: by the held weapon, neither moved nor given a moved palette
+            return;
+        }
         if (byIndex && g_BindEnabled.load() && ViewOffsetOn()) t.legacy = BindPatchedView(c, &t.legacyPrev);
     }
     void EndTarget(ID3D11DeviceContext* c, TargetSwap& t)
@@ -5662,6 +5806,7 @@ namespace
 
         static void STDMETHODCALLTYPE DrawIndexed(ID3D11DeviceContext* c, UINT n, UINT s, INT b)
         {
+            HookClock hc;   // (LeanDrawHooks: the hook's own time)
             Record(c, KIND, eDrawIndexed, n);
             PassProfile::NoteDraw(c, n, 1, false, s, b);
             StereoFeedback::OnDraw(c);   // Foresight's distortion image, per eye
@@ -5677,13 +5822,16 @@ namespace
             TargetSwap t; BeginTarget(c, n, t);
             if (t.six.drop) { EndTarget(c, t); return; }   // the spyglass up: no arms, no weapons
             StereoTaa::Pass sp; StereoTaa::OnDraw(c, KIND, eDrawIndexed, n, sp);
-            realDrawIndexed(c, n, s, b);
+            hc.RealBegin(); realDrawIndexed(c, n, s, b);
+            hc.RealEnd();
             StereoTaa::AfterPass(c, KIND, sp);
             EndTarget(c, t);
             if (cm == 2) { ScreenShadows::Mark m; if (ScreenShadows::MarkBegin(c, m)) { realDrawIndexed(c, n, s, b); ScreenShadows::MarkEnd(c, m); } }
         }
         static void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* c, UINT n, UINT s)
-        {   // proximity targeting works off the constants, not the count, so the non-indexed paths qualify too --
+        {
+            HookClock hc;   // (LeanDrawHooks: the hook's own time)
+            // proximity targeting works off the constants, not the count, so the non-indexed paths qualify too --
             // and a weapon pass left out here would stay behind and clip the moved geometry against its own depth
             Record(c, KIND, eDraw, n);
             PassProfile::NoteDraw(c, n, 1, false, s, 0);
@@ -5700,13 +5848,15 @@ namespace
             TargetSwap t; BeginTarget(c, n, t);
             if (t.six.drop) { EndTarget(c, t); return; }   // the spyglass up: no arms, no weapons
             StereoTaa::Pass sp; StereoTaa::OnDraw(c, KIND, eDraw, n, sp);
-            realDraw(c, n, s);
+            hc.RealBegin(); realDraw(c, n, s);
+            hc.RealEnd();
             StereoTaa::AfterPass(c, KIND, sp);
             EndTarget(c, t);
             if (cm == 2) { ScreenShadows::Mark m; if (ScreenShadows::MarkBegin(c, m)) { realDraw(c, n, s); ScreenShadows::MarkEnd(c, m); } }
         }
         static void STDMETHODCALLTYPE DrawIdxInst(ID3D11DeviceContext* c, UINT n, UINT i, UINT s, INT b, UINT si)
         {
+            HookClock hc;   // (LeanDrawHooks: the hook's own time)
             Record(c, KIND, eDrawIndexedInstanced, n);
             PassProfile::NoteDraw(c, n, i, false, s, b);
             StereoFeedback::OnDraw(c);   // Foresight's distortion image, per eye
@@ -5722,13 +5872,15 @@ namespace
             TargetSwap t; BeginTarget(c, n, t);
             if (t.six.drop) { EndTarget(c, t); return; }   // the spyglass up: no arms, no weapons
             StereoTaa::Pass sp; StereoTaa::OnDraw(c, KIND, eDrawIndexedInstanced, n, sp);
-            realDrawIdxInst(c, n, i, s, b, si);
+            hc.RealBegin(); realDrawIdxInst(c, n, i, s, b, si);
+            hc.RealEnd();
             StereoTaa::AfterPass(c, KIND, sp);
             EndTarget(c, t);
             if (cm == 2) { ScreenShadows::Mark m; if (ScreenShadows::MarkBegin(c, m)) { realDrawIdxInst(c, n, i, s, b, si); ScreenShadows::MarkEnd(c, m); } }
         }
         static void STDMETHODCALLTYPE DrawInst(ID3D11DeviceContext* c, UINT n, UINT i, UINT s, UINT si)
         {
+            HookClock hc;   // (LeanDrawHooks: the hook's own time)
             Record(c, KIND, eDrawInstanced, n);
             PassProfile::NoteDraw(c, n, i, false, s, 0);
             StereoFeedback::OnDraw(c);   // Foresight's distortion image, per eye
@@ -5744,7 +5896,8 @@ namespace
             TargetSwap t; BeginTarget(c, n, t);
             if (t.six.drop) { EndTarget(c, t); return; }   // the spyglass up: no arms, no weapons
             StereoTaa::Pass sp; StereoTaa::OnDraw(c, KIND, eDrawInstanced, n, sp);
-            realDrawInst(c, n, i, s, si);
+            hc.RealBegin(); realDrawInst(c, n, i, s, si);
+            hc.RealEnd();
             StereoTaa::AfterPass(c, KIND, sp);
             EndTarget(c, t);
             if (cm == 2) { ScreenShadows::Mark m; if (ScreenShadows::MarkBegin(c, m)) { realDrawInst(c, n, i, s, si); ScreenShadows::MarkEnd(c, m); } }
@@ -6774,10 +6927,22 @@ void GpuTrace::OnPresent()
                  g_WristStaleFixed.load(), g_WristGateKept.load(), g_OtherHandDraws[0].load(), g_OtherHandDraws[1].load());
             { const std::string wr = WristRigReport(); if (!wr.empty()) LOGI("gpuhands: wrist rig (vr wristrig {}){}", g_WristRig.load(), wr); }
             WristPieceReport();
+            NearLeftReport();
             LOGI("gpuhands: HandFx {}", HandFx::Stats());
             LOGI("gpu6dof: the player's moved draws by pass kind: depth / motion-vector passes {}, other eye passes {}, static-world shadows {}, outside a known task {}; "
                  "previous rows corrected (the TAA's motion vectors) {}", g_MovedByClass[1].load(), g_MovedByClass[3].load(), g_MovedByClass[2].load(),
                  g_MovedByClass[0].load(), g_EyeFixed.load());
+            {   // LeanDrawHooks: the hooks' own time over these 30 s, and the static world's draws the trim left out
+                static unsigned long long lastC = 0, lastD = 0, lastSk = 0; static ULONGLONG lastT = 0;
+                const unsigned long long c = g_HookCycles.load(), d = g_HookDraws.load(), sk = g_LeanSkipped.load();
+                const double perMs = TscPerMs(), secs = lastT ? (now - lastT) / 1000.0 : 0.0;
+                if (perMs > 0 && secs > 0 && d > lastD)
+                    LOGI("gpu6dof: the mod's per-draw work (the draw hooks outside the real call, every thread): {:.2f} us a draw, {:.1f} ms a second over {:.0f} draws a second | "
+                         "LeanDrawHooks {}: static-world draws not tested {} (+{:.0f}/s), sampled {}, found to be the player's {}",
+                         (double)(c - lastC) / perMs * 1000.0 / (double)(d - lastD), (double)(c - lastC) / perMs / secs, (double)(d - lastD) / secs,
+                         g_Lean.load() ? "on" : "off", sk, (double)(sk - lastSk) / secs, g_LeanSampled.load(), g_LeanCaught.load());
+                lastC = c; lastD = d; lastSk = sk; lastT = now;
+            }
         }
     }
     if (g_CapturedVS) { DumpShader(g_CapturedVS); g_CapturedVS = nullptr; }
@@ -6948,6 +7113,13 @@ void GpuTrace::TargetsFromWeapon()
 }
 
 void GpuTrace::SetSkip(bool on) { g_SkipDraws = on; LOGI("GpuTrace: skip target draws {}", on); }
+void GpuTrace::SetLeanDrawHooks(bool on)
+{
+    if (g_Lean.exchange(on) != on || on)
+        LOGI("GpuTrace: LeanDrawHooks {}", on ? "on: the static world's forward pass (FORWARD_WORLD) skips the per-draw test for the player's draws (1 in 64 still tested as a check)"
+                                              : "off: every draw of every pass is tested for the player's");
+    TscPerMs();   // (starts the TSC's calibration)
+}
 
 void GpuTrace::SetSkipVsHashes(const std::vector<uint64_t>& hashes)
 {

@@ -37,7 +37,16 @@ namespace TestAids
     constexpr uint32_t kInvInfiniteAmmo = 0x178;   // DOTO (D2 0x168): arkKisculeNodeInfiniteAmmo (vtable 0x1CEA908) inc exe+0x8064AF / dec exe+0x80646F on GetComponent(entity, 0x3AB8070)+0x178
     //! arkCpntMana: current mana and the level it regenerates back to (floats). The second one drops with every cast,
     //! so it is not the maximum the bar started with.
-    constexpr uint32_t kManaCurrent = 0x20, kManaMax = 0x2C;   // DOTO: same as D2 (the heartbeat reads mana 100.0/100.0 in game, 2026-11-05)
+    // DOTO's arkCpntMana is NOT Dishonored 2's (2026-11-09, the load-a-save crash): mana comes in segments. +0x20 the
+    // current mana (float); +0x2C a byte of flags (bit 5: one more segment) -- D2's float maximum, which the infinite
+    // mana cheat wrote 100.0 into; +0x08 the decl: +0x70 the base segment count (int), +0x74 the mana a segment holds
+    // (float); +0x6C the index of the upgrade stat (-1 none) into the stats list at *(+0x48)+0x48 (40-byte entries, the
+    // extra segments as a float at +0x24). Max segments = exe+0x7A8250 (base + upgrade + bit 5); the full ones the HUD
+    // shows = current / segment size (exe+0x7A81D0). arkHUDElementMana (exe+0x6CC890) sizes its segment array to the
+    // max and writes one entry per FULL segment, unchecked: mana above max * size writes past the array (crash at the
+    // next free: "Memory corruption after block!", exe+0x159F5F).
+    constexpr uint32_t kManaCurrent = 0x20, kManaFlags = 0x2C, kManaDecl = 0x08, kManaUpgIdx = 0x6C, kManaStats = 0x48;
+    constexpr uint32_t kManaDeclSegments = 0x70, kManaDeclSegSize = 0x74, kManaStatsList = 0x48, kManaStatStride = 40, kManaStatValue = 0x24;
     //! Equipment upgrades (the black market's): arkCpntPlayerPowerSystem+0x70 is an idList of upgrade instances of
     //! 0x28 bytes {?; info*; ...; bool owned @0x20; int variant @0x24}, count in the low 24 bits of +0x78. info+0 is the
     //! upgrade's inventory item, info+0x30 an alternative one used when info+0x38 is set and variant != 1.

@@ -55,6 +55,7 @@ namespace
         case 0xE0DE0002:                      return "std::terminate in the mod";
         case 0xE0DE0003:                      return "pure virtual call in the mod";
         case 0xE0DE0004:                      return "invalid CRT parameter in the mod";
+        case 0xE0DE0005:                      return "the process terminated itself (TerminateProcess, no exception)";
         default:                              return "?";
         }
     }
@@ -90,6 +91,46 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
     bool ReadPtr(const uintptr_t* p, uintptr_t& out) { return SafeCopy(&out, p, sizeof out); }
+
+    // ---- the faults seen first chance, kept (2026-11-08) ----
+    // The load-a-save crash: an int 3 (a breakpoint, 0x80000003) on the render thread that nothing handled. Our
+    // unhandled-exception filter was never called for it; the thread's root handler (ntdll's RtlUserThreadStart)
+    // ended the process with NtTerminateProcess(exit code = the exception's code), its stack already unwound -- so the
+    // report written there showed only the exit, not the fault. Each fault worth it (Interesting, breakpoints, single
+    // steps) is kept here with its context, at first chance; an exit whose code is a fault this thread saw moments ago
+    // is reported from that fault's own context (the stack below is still there: the unwind only moved rsp up).
+    struct LastFault { CONTEXT ctx; EXCEPTION_RECORD rec; DWORD tid; ULONGLONG at; };   // (CONTEXT: 16-byte aligned)
+    constexpr unsigned kKept = 32;
+    LastFault g_Kept[kKept];
+    std::atomic<unsigned> g_KeptN{ 0 };
+    std::atomic_flag g_KeptLock = ATOMIC_FLAG_INIT;
+    void KeepFault(const EXCEPTION_POINTERS* ep)
+    {
+        if (!ep || !ep->ContextRecord || !ep->ExceptionRecord) return;
+        if (g_KeptLock.test_and_set(std::memory_order_acquire)) return;   // another thread is storing one: this one is skipped
+        LastFault& f = g_Kept[g_KeptN.fetch_add(1) % kKept];
+        memcpy(&f.ctx, ep->ContextRecord, sizeof f.ctx);
+        memcpy(&f.rec, ep->ExceptionRecord, sizeof f.rec);
+        f.rec.ExceptionRecord = nullptr;
+        f.tid = GetCurrentThreadId(); f.at = GetTickCount64();
+        g_KeptLock.clear(std::memory_order_release);
+    }
+    //! The newest fault with this code that this thread saw in the last 10 s, or null.
+    LastFault* FindFault(DWORD tid, DWORD code)
+    {
+        for (int spin = 0; g_KeptLock.test_and_set(std::memory_order_acquire); spin++) if (spin > 100000) return nullptr;
+        LastFault* best = nullptr;
+        const unsigned n = g_KeptN.load();
+        const ULONGLONG t = GetTickCount64();
+        for (unsigned i = 0; i < kKept && i < n; i++)
+        {
+            LastFault& f = g_Kept[(n - 1 - i) % kKept];
+            if (f.tid == tid && f.rec.ExceptionCode == code && t - f.at < 10000) { best = &f; break; }
+        }
+        g_KeptLock.clear(std::memory_order_release);
+        return best;
+    }
+    std::atomic<int> g_BpLogged{ 0 };
     //! One frame of the unwind: the caller's context from this one's, by the module's unwind data (x64 .pdata). False at
     //! the end (no return address) or when the stack is unreadable.
     bool UnwindStep(CONTEXT* c, DWORD64* fnStart)
@@ -177,6 +218,30 @@ namespace
     void TailLine(const char* s, size_t n, void*) { Put("  ", 2); Put(s, n); Put("\r\n", 2); }
 
     //! The whole report. On the report's thread (or, without it, on the crashing one).
+    //! The minidump's extra memory: the faulting thread's stack from the fault's rsp up. The dump takes a thread's
+    //! stack from where the thread is NOW; for a fault kept at first chance (ReportExit) the thread has unwound since,
+    //! and the frames of the fault lie below that -- without this a debugger cannot walk them.
+    struct DumpExtra { ULONG64 base = 0; ULONG size = 0; bool given = false; };
+    BOOL CALLBACK DumpCallback(PVOID param, const PMINIDUMP_CALLBACK_INPUT in, PMINIDUMP_CALLBACK_OUTPUT out)
+    {
+        DumpExtra* x = (DumpExtra*)param;
+        if (!in || !out) return FALSE;
+        switch (in->CallbackType)
+        {
+        case MemoryCallback:       // one extra range, then done
+            if (x->given || !x->size) return FALSE;
+            x->given = true; out->MemoryBase = x->base; out->MemorySize = x->size;
+            return TRUE;
+        case IncludeThreadCallback: case IncludeModuleCallback: case ThreadCallback: case ThreadExCallback: case ModuleCallback:
+            return TRUE;           // everything, as without a callback
+        case CancelCallback:
+            out->Cancel = FALSE; out->CheckCancel = FALSE; return TRUE;
+        case ReadMemoryFailureCallback:
+            out->Status = S_OK; return TRUE;   // a page gone since: left out, the dump goes on
+        default:
+            return FALSE;
+        }
+    }
     void WriteReport(const char* what, EXCEPTION_POINTERS* ep, DWORD tid)
     {
         static wchar_t base[MAX_PATH + 16];
@@ -302,7 +367,19 @@ namespace
                 // every thread's stack, what the stacks point at, the unloaded modules and the threads' times; not the
                 // data segments (the game's are large): a few MB
                 const MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo);
-                const BOOL ok = g_Dump(GetCurrentProcess(), GetCurrentProcessId(), d, type, ep ? &mei : nullptr, nullptr, nullptr);
+                DumpExtra extra;
+                if (ep && ep->ContextRecord && ep->ContextRecord->Rsp)
+                {
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    const ULONG64 lo = (ep->ContextRecord->Rsp - 0x200) & ~0xFull;
+                    if (VirtualQuery((const void*)lo, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT)
+                    {
+                        const ULONG64 end = (ULONG64)mbi.BaseAddress + mbi.RegionSize;
+                        extra.base = lo; extra.size = (ULONG)std::min<ULONG64>(end - lo, 1024 * 1024);
+                    }
+                }
+                MINIDUMP_CALLBACK_INFORMATION cb{ DumpCallback, &extra };
+                const BOOL ok = g_Dump(GetCurrentProcess(), GetCurrentProcessId(), d, type, ep ? &mei : nullptr, nullptr, extra.size ? &cb : nullptr);
                 const DWORD err = ok ? 0 : GetLastError();
                 CloseHandle(d);
                 P("");
@@ -355,6 +432,26 @@ namespace
         const EXCEPTION_RECORD* er = ep ? ep->ExceptionRecord : nullptr;
         if (!er) return EXCEPTION_CONTINUE_SEARCH;
         if (Fatal(er)) { Crash("fatal exception (seen first chance: it ends the process whoever handles it)", ep); return EXCEPTION_CONTINUE_SEARCH; }
+        const DWORD code = er->ExceptionCode;
+        const bool bp = code == EXCEPTION_BREAKPOINT || code == 0x4000001F;   // (and the WOW64 one)
+        if (Interesting(code) || bp || code == EXCEPTION_SINGLE_STEP) KeepFault(ep);
+        // A breakpoint in a release game: a debug break left in, or code run that is padding (0xCC between functions,
+        // the rest of a hook's patch) -- nothing handles one, Windows ends the process with 0x80000003. Logged with its
+        // callers now, while the stack is there (the report comes at the exit: see FindFault).
+        if (bp && !IsDebuggerPresent() && Log::Enabled() && g_BpLogged.fetch_add(1) < 4 && !g_InHandler.exchange(true))
+        {
+            Log::ForceFile();
+            LogHint("first chance: a breakpoint (int 3); unless something handles it Windows ends the game with exit code 0x80000003", ep);
+            unsigned char bytes[32] = {};
+            const bool got = SafeCopy(bytes, (const unsigned char*)er->ExceptionAddress - 16, sizeof bytes);
+            std::string hex;
+            if (got) for (int i = 0; i < 32; i++) hex += i == 16 ? fmt::format("[{:02X}]", bytes[i]) : fmt::format(" {:02X}", bytes[i]);
+            CONTEXT c; memcpy(&c, ep->ContextRecord, sizeof c);
+            std::string s; DWORD64 fn = 0;
+            for (int i = 0; i < 20 && UnwindStep(&c, &fn); i++) s += " " + CrashLog::Where((const void*)c.Rip);
+            LOGI("CrashLog: the breakpoint's code (16 bytes before it, [it], after): {}; its callers:{}", got ? hex : std::string("(unreadable)"), s);
+            g_InHandler = false;
+        }
         // a fault the game (or the mod's own guarded reads) may well handle: a hint in the log, the first few only
         if (Interesting(er->ExceptionCode) && Log::Enabled() && g_Logged.load() < kMaxLogged && !g_InHandler.exchange(true))
         {
@@ -400,6 +497,127 @@ namespace
         Crash(CodeName(code), &ep);
     }
     void OnAbort(int) { SelfCrash(0xE0DE0001); }                       // then abort goes on
+    //! The process ends itself with this exit code: the report. From the fault's own context when the code is a fault this
+    //! thread saw first chance moments ago (an unhandled exception ended by the thread's root handler, see KeepFault);
+    //! otherwise from here.
+    void ReportExit(DWORD code)
+    {
+        if (LastFault* f = FindFault(GetCurrentThreadId(), code))
+        {
+            static EXCEPTION_POINTERS ep;
+            ep.ExceptionRecord = &f->rec; ep.ContextRecord = &f->ctx;
+            Crash("unhandled exception: the process was ended with the exception's code by Windows' default handler (the thread's root __except), without our filter -- the context below is the fault's own, kept at first chance", &ep);
+            return;
+        }
+        SelfCrash(0xE0DE0005);
+    }
+    // 2026-11-08: two crashes while loading a save (from the pause menu, in a level), no crash_log written and nothing in
+    // DOTOVR.log -- no exception reached the handlers above. Either the process ended itself (the engine's or a
+    // library's TerminateProcess: no exception, no DLL detach) or a fail-fast (__fastfail / a /GS cookie: straight to the
+    // kernel, which nothing in the process can catch -- Windows' Event Viewer has those). The first is caught here:
+    // TerminateProcess on this process writes a full report (stack and minidump) first; ExitProcess is logged with its
+    // callers (a normal quit goes there too, so no report).
+    BOOL(WINAPI* g_RealTerminate)(HANDLE, UINT) = TerminateProcess;
+    VOID(WINAPI* g_RealExit)(UINT) = ExitProcess;
+    BOOL WINAPI HookTerminate(HANDLE h, UINT code)
+    {
+        if (h == GetCurrentProcess() || GetProcessId(h) == GetCurrentProcessId())
+        {
+            Log::ForceFile();
+            LOGI("CrashLog: the process is terminating itself (TerminateProcess, exit code {:#x}, thread {}): writing a crash report", code, GetCurrentThreadId());
+            if (code != 0xE0DE0003 && code != 0xE0DE0004) ReportExit(code);
+        }
+        return g_RealTerminate(h, code);
+    }
+    // 2026-11-08, second pass: with the two above hooked (log b6e13fa6) a load-a-save crash still left nothing -- neither
+    // was called, no exception was seen on any thread (the vectored handler is first in line), and Windows' Event
+    // Viewer had no Application Error either. So the process left through ntdll directly: NtTerminateProcess (what
+    // every exit path ends in, kernel32's included; a library calling it, or the game) or RtlExitUserProcess. Both
+    // hooked: a report with the callers (the kernel32 hooks above stay: they say which API it was).
+    using NtTerminateFn = LONG(NTAPI*)(HANDLE, LONG);
+    using RtlExitFn = VOID(NTAPI*)(ULONG);
+    NtTerminateFn g_RealNtTerminate = nullptr;
+    RtlExitFn g_RealRtlExit = nullptr;
+    std::atomic<bool> g_ExitSeen{ false };
+    LONG NTAPI HookNtTerminate(HANDLE h, LONG code)
+    {
+        // (ExitProcess calls it twice: once with a null handle for the other threads, then on itself)
+        const bool self = h == nullptr || h == GetCurrentProcess() || (h && GetProcessId(h) == GetCurrentProcessId());
+        if (self && !g_ExitSeen.exchange(true))
+        {
+            Log::ForceFile();
+            void* frames[14] = {}; const USHORT n = RtlCaptureStackBackTrace(1, 14, frames, nullptr);
+            std::string s; for (USHORT i = 0; i < n; i++) s += " " + CrashLog::Where(frames[i]);
+            LOGI("CrashLog: NtTerminateProcess on this process (exit code {:#x}, thread {}, handle {}); from{}", (unsigned)code, GetCurrentThreadId(), h ? "self" : "null (the other threads)", s);
+            if (code != 0 && code != 0xE0DE0003 && code != 0xE0DE0004) ReportExit((DWORD)code);
+        }
+        return g_RealNtTerminate(h, code);
+    }
+    VOID NTAPI HookRtlExit(ULONG code)
+    {
+        if (!g_ExitSeen.exchange(true))
+        {
+            Log::ForceFile();
+            void* frames[14] = {}; const USHORT n = RtlCaptureStackBackTrace(1, 14, frames, nullptr);
+            std::string s; for (USHORT i = 0; i < n; i++) s += " " + CrashLog::Where(frames[i]);
+            LOGI("CrashLog: RtlExitUserProcess (exit code {:#x}, thread {}); from{}", (unsigned)code, GetCurrentThreadId(), s);
+            if (code != 0) ReportExit(code);
+        }
+        g_RealRtlExit(code);
+    }
+    // A quit that is no crash at all (2026-11-08, "is the game mistakenly just exiting?"): the ways a game leaves cleanly,
+    // each logged with its callers -- PostQuitMessage (the message loop ends), DestroyWindow on a top-level window (the
+    // main window closed: Alt-F4, a WM_CLOSE from outside, the engine's own shutdown), a message box (the engine's fatal
+    // error / "out of memory" boxes go through MessageBoxA/W; in a headset one is easy to miss), and the DLL's own
+    // detach (Main.cpp: a clean process exit unloads the mod; a kill from outside does not).
+    std::string Narrow(const std::wstring& s);
+    std::string Callers(int skip = 1)
+    {
+        void* frames[14] = {}; const USHORT n = RtlCaptureStackBackTrace(skip, 14, frames, nullptr);
+        std::string s; for (USHORT i = 0; i < n; i++) s += " " + CrashLog::Where(frames[i]);
+        return s;
+    }
+    VOID(WINAPI* g_RealPostQuit)(int) = PostQuitMessage;
+    BOOL(WINAPI* g_RealDestroyWindow)(HWND) = DestroyWindow;
+    int(WINAPI* g_RealMsgBoxA)(HWND, LPCSTR, LPCSTR, UINT) = MessageBoxA;
+    int(WINAPI* g_RealMsgBoxW)(HWND, LPCWSTR, LPCWSTR, UINT) = MessageBoxW;
+    VOID WINAPI HookPostQuit(int code)
+    {
+        Log::ForceFile();
+        LOGI("CrashLog: PostQuitMessage({}) on thread {}: the game's message loop is told to end; from{}", code, GetCurrentThreadId(), Callers());
+        g_RealPostQuit(code);
+    }
+    BOOL WINAPI HookDestroyWindow(HWND h)
+    {
+        if (h && IsWindow(h) && !GetParent(h))
+        {
+            char title[128] = {}; GetWindowTextA(h, title, sizeof title);
+            char cls[64] = {}; GetClassNameA(h, cls, sizeof cls);
+            DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+            if (pid == GetCurrentProcessId() && (title[0] || GetWindow(h, GW_OWNER) == nullptr))
+                LOGI("CrashLog: DestroyWindow on top-level window '{}' (class {}) on thread {}; from{}", title, cls, GetCurrentThreadId(), Callers());
+        }
+        return g_RealDestroyWindow(h);
+    }
+    int WINAPI HookMsgBoxA(HWND h, LPCSTR text, LPCSTR cap, UINT type)
+    {
+        Log::ForceFile();
+        LOGI("CrashLog: MessageBoxA '{}': {} (thread {}); from{}", cap ? cap : "", text ? text : "", GetCurrentThreadId(), Callers());
+        return g_RealMsgBoxA(h, text, cap, type);
+    }
+    int WINAPI HookMsgBoxW(HWND h, LPCWSTR text, LPCWSTR cap, UINT type)
+    {
+        Log::ForceFile();
+        LOGI("CrashLog: MessageBoxW '{}': {} (thread {}); from{}", cap ? Narrow(cap) : std::string(), text ? Narrow(text) : std::string(), GetCurrentThreadId(), Callers());
+        return g_RealMsgBoxW(h, text, cap, type);
+    }
+    VOID WINAPI HookExit(UINT code)
+    {
+        void* frames[12] = {}; const USHORT n = RtlCaptureStackBackTrace(1, 12, frames, nullptr);
+        std::string s; for (USHORT i = 0; i < n; i++) s += " " + CrashLog::Where(frames[i]);
+        LOGI("CrashLog: the process is exiting (ExitProcess, exit code {:#x}, thread {}); from{}", code, GetCurrentThreadId(), s);
+        g_RealExit(code);
+    }
     void OnTerminate() { SelfCrash(0xE0DE0002); abort(); }
     void OnPurecall() { SelfCrash(0xE0DE0003); TerminateProcess(GetCurrentProcess(), 0xE0DE0003); }
     void OnInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) { SelfCrash(0xE0DE0004); TerminateProcess(GetCurrentProcess(), 0xE0DE0004); }
@@ -455,8 +673,21 @@ void CrashLog::Prepare()
     // keep our filter first: whoever sets one later is called after it
     DetourTransactionBegin(); DetourUpdateThread(GetCurrentThread());
     DetourAttach(&(PVOID&)g_RealSetFilter, HookSetFilter);
+    DetourAttach(&(PVOID&)g_RealTerminate, HookTerminate);
+    DetourAttach(&(PVOID&)g_RealExit, HookExit);
+    if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
+    {
+        g_RealNtTerminate = (NtTerminateFn)GetProcAddress(nt, "NtTerminateProcess");
+        g_RealRtlExit = (RtlExitFn)GetProcAddress(nt, "RtlExitUserProcess");
+        if (g_RealNtTerminate) DetourAttach(&(PVOID&)g_RealNtTerminate, HookNtTerminate);
+        if (g_RealRtlExit) DetourAttach(&(PVOID&)g_RealRtlExit, HookRtlExit);
+    }
+    DetourAttach(&(PVOID&)g_RealPostQuit, HookPostQuit);
+    DetourAttach(&(PVOID&)g_RealDestroyWindow, HookDestroyWindow);
+    DetourAttach(&(PVOID&)g_RealMsgBoxA, HookMsgBoxA);
+    DetourAttach(&(PVOID&)g_RealMsgBoxW, HookMsgBoxW);
     const LONG r = DetourTransactionCommit();
-    LOGI("CrashLog: minidumps {}, the unhandled-exception filter kept first: detour={}", g_Dump ? "on" : "OFF (no dbghelp)", r);
+    LOGI("CrashLog: minidumps {}, the unhandled-exception filter kept first, TerminateProcess / ExitProcess / NtTerminateProcess / RtlExitUserProcess / PostQuitMessage / DestroyWindow / MessageBox watched: detour={}", g_Dump ? "on" : "OFF (no dbghelp)", r);
 }
 
 void CrashLog::SetPhase(const char* phase) { g_Phase = phase ? phase : "?"; }

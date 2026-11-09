@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <algorithm>
 #include "GameInfo.h"
 #include "CrashLog.h"
 #include "Watchdog.h"
@@ -160,8 +161,27 @@ static std::string ReadOneLine(const wchar_t* name)
 //! names): the modules that were given those settings at startup (InitThread, below) are given them again, and the
 //! settings' commands that came out different run at the next frame. Only what changed, so a module is not touched
 //! for nothing (MeleeAim::SetFinishers patches code). The setters store atomics / take their own locks.
-static void ApplySettings(const std::vector<std::string>& changed)
+static void ApplySettings(const std::vector<std::string>& changedIn)
 {
+    std::vector<std::string> changed = changedIn;
+    {   // Fog / CheapFog (2026-11-08): one or the other. The one switched decides; the other is saved as its opposite
+        // (the game's fog on = the cheap fog off; the cheap fog off = the game's fog on, and the same the other way)
+        bool fogCh = false, cheapCh = false;
+        for (const std::string& c : changed) { if (c == "fog") fogCh = true; if (c == "cheapfog") cheapCh = true; }
+        if (fogCh || cheapCh)
+        {
+            const bool game = fogCh ? Settings::RawBool("fog") : !Settings::RawBool("cheapfog");
+            std::vector<std::pair<std::string, std::string>> fix;
+            if (Settings::RawBool("fog") != game) fix.push_back({ "Fog", game ? "1" : "0" });
+            if (Settings::RawBool("cheapfog") == game) fix.push_back({ "CheapFog", game ? "0" : "1" });
+            std::vector<std::string> live; std::string err;
+            if (!fix.empty() && Settings::Save(fix, live, err)) for (const std::string& l : live) changed.push_back(l);
+            else if (!fix.empty()) LOGI("Settings: Fog / CheapFog could not be kept opposite: {}", err);
+            if (std::find(changed.begin(), changed.end(), "fog") == changed.end()) changed.push_back("fog");
+            if (std::find(changed.begin(), changed.end(), "cheapfog") == changed.end()) changed.push_back("cheapfog");
+            LOGI("Settings: {} (Fog = {}, CheapFog = {})", game ? "the game's fog, the cheap fog off" : "the cheap fog, the game's fog off", game ? 1 : 0, game ? 0 : 1);
+        }
+    }
     Log::SetFileEnabled(Settings::WriteLog());
     CrashLog::SetInfo(CrashLog::kSettings, Settings::Summary());
     auto has = [&](std::initializer_list<const char*> keys)
@@ -229,7 +249,10 @@ static void ApplySettings(const std::vector<std::string>& changed)
     if (has({ "hudskipempty" })) ScreenMode::SetHudSkipEmpty(Settings::HudSkipEmpty());
     if (has({ "skipemptyoutlines" })) PostShare::SetOutlines(Settings::SkipEmptyOutlines());
     if (has({ "stereoexposurereuse" })) PostShare::SetExposure(Settings::StereoExposureReuse());
-    if (has({ "stereosunshadowreuse" })) StereoSync::SetReuse(Settings::StereoReuse());   // (on: only if it was on at start)
+    if (has({ "stereosunshadowreuse", "righteyesunshadows" })) StereoSync::SetReuse(Settings::StereoReuse());   // (on: only if it was on at start)
+    if (has({ "backgroundsubmit" })) VRRuntime::SetBackgroundSubmit(Settings::BackgroundSubmit());
+    if (has({ "leandrawhooks" })) GpuTrace::SetLeanDrawHooks(Settings::LeanDrawHooks());
+    if (has({ "backgroundinput" })) KbmInject::SetBackgroundInput(Settings::BackgroundInput());
     if (has({ "minimalreticle", "reticleopacity" })) Reticle::SetStyle(Settings::MinimalReticle(), Settings::ReticleOpacity());
     if (has({ "foveatedrendering" })) Foveation::SetParams(Settings::Foveated());
     if (has({ "outofviewmask" })) FovMask::SetParams(Settings::OutOfViewMask(), Settings::OutOfViewMaskMargin(), Settings::OutOfViewMaskLens());
@@ -358,6 +381,9 @@ static DWORD WINAPI InitThread(LPVOID)
     SkyMotion::SetEnabled(Settings::TaaSkyMotion());
     GpuTrace::SetHandDepth(Settings::HandDepth());
     GpuTrace::SetWeaponShadows(Settings::WeaponShadows());
+    GpuTrace::SetLeanDrawHooks(Settings::LeanDrawHooks());          // [Performance.CPU]
+    VRRuntime::SetBackgroundSubmit(Settings::BackgroundSubmit());   // (the submit thread itself starts with the session)
+    KbmInject::SetBackgroundInput(Settings::BackgroundInput());
     SimStep::SetEnabled(Settings::SimStepAtRefresh());   // (points the game clock's step rate at the mod's own float)
     StereoFeedback::SetEnabled(true);   // Foresight's distortion image kept per eye (instruments the eyes' POSTPROC tasks)
     ScreenShadows::SetLampCacheSlices(Settings::ShadowLampCacheSlices());
@@ -446,6 +472,10 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // (the silent load crash, 2026-11-08: a clean exit reaches here with `reserved` set; a crash or a kill from outside
+        // never does. The last line of a log that ends here says the game quit on purpose.)
+        Log::ForceFile();
+        LOGI("DOTOVR: unloading: {} (thread {})", reserved ? "the process is exiting (a clean exit: ExitProcess or the main thread's return, not a crash)" : "FreeLibrary", GetCurrentThreadId());
         KbmInject::ReleaseAll();
         HandAimHook::Uninstall();
         WeaponPose::Uninstall();

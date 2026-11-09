@@ -88,10 +88,14 @@ namespace GunRay
     void SetNoLock(int on);      //!< research: drop the fire's target lock (exe+0x68F8E0)
     void NearEntities(float radius); //!< research: every entity within radius of the eye (the entity table)
     void ProbeKids(float radius);    //!< research: entities near the eye that reference a held weapon entity (how parts are parented)
+    //! GpuTrace: the arm (0 / 1) whose wrist launcher the entity drawn at this world origin is a piece of (its entity's
+    //! origin within maxD m), -1 when none -- the electric attachment's card, 0.48 m from the weapon anchor
+    int WristKidSide(const float worldOrg[3], float maxD);
     void ProbeAttachment(int n); //!< research: the gun's attachment entity (+0x178, the cartridge; D2 +0x158) and its binds
     void FreezeAfterShot(int ms); //!< research: g_stopTime 1 this many ms after the next shot
     void BlockFx(int k);          //!< research: the k-th FX the next shot creates is never started
     void LogFx(int n);           //!< research: log the FX created after the next shot (callers, where they sit)
+    void LogFxNow(int n);        //!< research (`vr fxlognow n`): log the next n FX created, from now
     void WatchFx(int hits);      //!< research: write watchpoint on the next muzzle fx instance's origin
     void BurstNextShot(int frames); //!< test: the next gun shot captures `frames` consecutive frames from its launch
     //! Once a frame on the game thread: sweep the projectile's shape along the gun ray (exe+0x68D860, the engine's own

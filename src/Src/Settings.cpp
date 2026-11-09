@@ -115,7 +115,12 @@ namespace
         { "display.shadowlampfewerupdates", Kind::Bool, "1", 0, 0, nullptr }, // ScreenShadows: the lamps' moving-caster updates at Low's thresholds
         { "display.shadowlampkeepcache", Kind::Bool, "1", 0, 0, nullptr },    // ScreenShadows: the lamps' shadow maps not refitted to the camera (their cache works)
         { "display.shadowlampcacheslices", Kind::Float, "32", 0, 128, nullptr, true }, // ScreenShadows: r_shadowCacheSliceCnt (0 = the game's 12)
-        { "display.staticlodzoom",      Kind::Float,  "1.5", 0.1f, 4, nullptr },  // VrTweaks: r_lodZoomMultiplicator held at this (1 = the game's)
+        // [Performance.CPU]: the render thread's own work cut down (all live)
+        { "display.backgroundsubmit",   Kind::Bool,   "1", 0, 0, nullptr },   // XRSession: the eye images handed to the headset from a thread of their own
+        { "display.righteyesunshadows", Kind::Bool,   "1", 0, 0, nullptr },   // StereoSync: the right eye's frame leaves out the sun's copied cascades
+        { "display.leandrawhooks",      Kind::Bool,   "1", 0, 0, nullptr },   // GpuTrace: the static world's pass skips the per-draw player test
+        { "display.backgroundinput",    Kind::Bool,   "1", 0, 0, nullptr },   // KbmInject: keys / mouse sent from a thread of their own
+        { "display.staticlodzoom",      Kind::Float,  "1", 0.1f, 4, nullptr },  // VrTweaks: r_lodZoomMultiplicator held at this (1 = the game's)
         { "display.viewdistance",       Kind::Float,  "3", -1, 5, nullptr },   // VrTweaks: the game's view-distance level instead of its menu's (-1 = the game's)
         { "display.depthpassdepthonly", Kind::Bool,   "1", 0, 0, nullptr, true },     // PassProfile/GpuTrace (experimental): the depth pass's main shader drawn depth-only
         { "display.skipframesyncflush", Kind::Bool,   "1", 0, 0, nullptr, true },     // PaceLog: the game's end-of-frame Flush not made (90 instead of ~70 pairs/s, 2026-11-04)
@@ -146,13 +151,13 @@ namespace
         { "display.vrgraphicstweaks",   Kind::Bool,   "1", 0, 0, nullptr, true },   // VrTweaks: no depth of field in VR
         { "display.skipsneakoverlay",   Kind::Bool,   "1", 0, 0, nullptr, true },   // PassProfile / GpuTrace: the sneak mode's screen overlay not drawn in the eyes
         { "display.ambientocclusion",   Kind::Bool,   "0", 0, 0, nullptr },   // VrTweaks: 0 = no ambient occlusion in VR
-        { "display.ambientocclusionquality", Kind::Choice, "high", 0, 0, "game|high" },   // AoGtao: high = GTAO in the game's AO draw's place
+        { "display.ambientocclusionquality", Kind::Choice, "low", 0, 0, "game|low|high|ultra" },   // AoGtao: low = the lite GTAO (about the game's cost), high = the fast one, ultra = the full one
         { "display.ambientocclusionradius", Kind::Float, "0.6", 0.1f, 3.f, nullptr, true },   // AoGtao: metres
         { "display.ambientocclusionstrength", Kind::Float, "2.0", 0.5f, 6.f, nullptr },   // AoGtao: the power on the visibility (1.0 was too light: 2026-11-08)
-        { "display.fog",                Kind::Bool,   "0", 0, 0, nullptr, true },   // VrTweaks: 0 = no game fog in VR (but in FogMaps); hidden, core VR
+        { "display.fog",                Kind::Bool,   "1", 0, 0, nullptr },   // VrTweaks: the game's fog (1, the default since 2026-11-08) or the mod's cheap fog (0): one or the other
         { "display.fogmaps",            Kind::Text,   "void,dunwall_return_tower_p", 0, 0, nullptr, true },   // VrTweaks: ...except in maps named so
         { "display.fogmapsresolution",  Kind::Float,  "1", 0, 1, nullptr, true },      // VrTweaks: the game's fog buffers there (1 full, 0.5, 0.25, 0 = the game's)
-        { "display.cheapfog",           Kind::Bool,   "1", 0, 0, nullptr, true },      // Fog: the mod's own distance fog while the game's is off
+        { "display.cheapfog",           Kind::Bool,   "0", 0, 0, nullptr },      // Fog: the mod's own distance fog, instead of the game's (the opposite of Fog)
         { "display.cheapfogstart",      Kind::Float,  "100", 0, 5000, nullptr },  // m where it begins
         { "display.cheapfogend",        Kind::Float,  "600", 1, 20000, nullptr },// m where it is at full opacity
         { "display.cheapfogopacity",    Kind::Float,  "0.6", 0, 1, nullptr },    // its strength at the far end
@@ -167,6 +172,7 @@ namespace
         { "display.cheapfogfollowexposure", Kind::Bool, "1", 0, 0, nullptr, true },    // the fog follows the game's exposure (EngineLuminanceFactor)
         { "display.cheapfogskyheight",  Kind::Text,   "auto", 0, 0, nullptr, true },   // "auto" (up to the far background, then 10 deg more) or deg above the horizon (0: none)
         { "display.foveatedrendering",  Kind::Bool,   "0", 0, 0, nullptr },      // Foveation: NVIDIA VRS, coarser shading away from the lens centre
+        { "display.foveatedeffects",    Kind::Bool,   "1", 0, 0, nullptr },      // the mod's own full-screen effects lighter away from the centre (any GPU)
         { "display.foveatedinner",      Kind::Float,  "35", 5, 80, nullptr, true },    // deg from the centre at full shading
         { "display.foveatedouter",      Kind::Float,  "50", 5, 89, nullptr, true },    // deg to which 2x2 shading reaches (4x4 beyond)
         { "display.outofviewmask",      Kind::Float,  "2", 0, 2, nullptr },      // FovMask: 0 off, 1 all outside each eye's native fov not shaded, 2 only its outer side
@@ -497,6 +503,9 @@ float Settings::ShadowCullDistance() { return F("display.shadowculldistance"); }
 bool Settings::ShadowUltraTrim() { return B("display.shadowultratrim"); }
 bool Settings::ShadowLampFewerUpdates() { return B("display.shadowlampfewerupdates"); }
 bool Settings::ShadowLampKeepCache() { return B("display.shadowlampkeepcache"); }
+bool Settings::BackgroundSubmit() { return B("display.backgroundsubmit"); }
+bool Settings::LeanDrawHooks() { return B("display.leandrawhooks"); }
+bool Settings::BackgroundInput() { return B("display.backgroundinput"); }
 int Settings::ShadowLampCacheSlices() { return (int)std::lround(F("display.shadowlampcacheslices")); }
 float Settings::StaticLodZoom() { return F("display.staticlodzoom"); }
 int Settings::ViewDistance() { return (int)std::lround(F("display.viewdistance")); }
@@ -523,9 +532,20 @@ bool Settings::DisableMotionBlur() { return B("display.disablemotionblur"); }
 bool Settings::DisableHeadBob() { return B("display.disableheadbob"); }
 bool Settings::AmbientOcclusion() { return B("display.ambientocclusion"); }
 bool Settings::AmbientOcclusionHigh() { return V("display.ambientocclusionquality") != "game"; }
+bool Settings::AmbientOcclusionUltra() { return V("display.ambientocclusionquality") == "ultra"; }
+bool Settings::RawBool(const char* bareKey)
+{
+    for (const Key& k : kKeys) if (!strcmp(strchr(k.name, '.') + 1, bareKey)) return B(k.name);
+    return false;
+}
+bool Settings::AmbientOcclusionLow() { return V("display.ambientocclusionquality") == "low"; }
+bool Settings::FoveatedEffects() { return B("display.foveatedeffects"); }
 float Settings::AmbientOcclusionRadius() { return F("display.ambientocclusionradius"); }
 float Settings::AmbientOcclusionStrength() { return F("display.ambientocclusionstrength"); }
-bool Settings::Fog() { return B("display.fog"); }
+// Fog / CheapFog (2026-11-08): one or the other, never both, never neither -- the game's fog unless the cheap fog is
+// on and the game's off (a file with both on, or both off, gets the game's). Main.cpp's ApplySettings keeps the two
+// stored values opposite when one is switched in the VR menu.
+bool Settings::Fog() { return B("display.fog") || !B("display.cheapfog"); }
 bool Settings::ProfileRenderPasses() { return B("logging.profilerenderpasses") || B("system.debuglogging"); }
 bool Settings::LogMenuData() { return B("logging.logmenudata"); }
 bool Settings::VrOptionsMenu() { return B("advanced.vroptionsmenu"); }
@@ -552,7 +572,7 @@ std::string Settings::FogMaps() { return V("display.fogmaps"); }
 Fog::Params Settings::CheapFog()
 {
     Fog::Params p;
-    p.on = B("display.cheapfog");
+    p.on = B("display.cheapfog") && !B("display.fog");   // (the opposite of Fog(): see there)
     p.start = F("display.cheapfogstart"); p.end = std::max(p.start + 1.f, F("display.cheapfogend")); p.opacity = F("display.cheapfogopacity");
     p.brightness = F("display.cheapfogbrightness");
     p.minBrightness = F("display.cheapfogminbrightness"); p.followExposure = B("display.cheapfogfollowexposure");
@@ -602,6 +622,7 @@ StereoSync::ReuseFlags Settings::StereoReuse()
     f.streaming = B("advanced.stereostreamonceperpair");
     f.lightShadows = B("advanced.stereolightshadowreuse");
     f.sunShadows = B("advanced.stereosunshadowreuse");
+    f.sunAll = B("display.righteyesunshadows");
     return f;
 }
 
@@ -652,7 +673,7 @@ namespace
         { "taasharpening", "0.85" },
         { "disablemetaasw", "1" },
         { "ambientocclusion", "0" },
-        { "ambientocclusionquality", "high" },
+        { "ambientocclusionquality", "low" },
         { "ambientocclusionstrength", "2.0" },
         { "reticleopacity", "0.4" },
         { "huddistance", "2" },
@@ -671,10 +692,17 @@ namespace
         { "shadowultratrim", "1" },
         { "shadowlampfewerupdates", "1" },
         { "shadowlampkeepcache", "1" },
+        { "backgroundsubmit", "1" },
+        { "righteyesunshadows", "1" },
+        { "leandrawhooks", "1" },
+        { "backgroundinput", "1" },
         { "viewdistance", "3" },
-        { "staticlodzoom", "1.5" },
+        { "staticlodzoom", "1" },
         { "hudresolution", "0.5" },
         { "foveatedrendering", "0" },
+        { "foveatedeffects", "1" },
+        { "fog", "1" },
+        { "cheapfog", "0" },
         { "outofviewmask", "2" },
         { "fpscounter", "off" },
         { "unlockeverything", "0" },

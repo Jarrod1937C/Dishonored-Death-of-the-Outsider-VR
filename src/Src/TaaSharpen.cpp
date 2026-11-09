@@ -9,6 +9,7 @@
 #include "Settings.h"
 #include "VRRuntime.h"
 #include "ScreenMode.h"
+#include "CameraHook.h"
 #include <cmath>
 #include <string>
 
@@ -27,7 +28,9 @@ namespace
     // And the step past the neighbours is kept, but to at most a quarter of their range: the overshoot that draws a
     // bright or dark line beside every edge, more so where the AO darkens one side of it.
     const char* kHlsl = R"(
-cbuffer C : register(b0) { float4 g; }   // x: sharpness 0..1, y: the neighbours' distance in pixels, zw: 1 / size
+cbuffer C : register(b0) { float4 g; float4 g2; }   // x: sharpness 0..1, y: the neighbours' distance in pixels, zw: 1 / size
+// g2 (FoveatedEffects, 2026-11-08): xy the view's half extent in tan (its frustum is symmetric: the image's centre is its
+// axis), z tan^2 of the angle beyond which the pixel is only copied (huge = sharpened everywhere)
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
 SamplerState smp : register(s0);
@@ -39,6 +42,8 @@ void main(uint3 id : SV_DispatchThreadID)
     if (id.x >= w || id.y >= h) return;
     const int2 p = int2(id.xy);
     const float2 uv = (float2(id.xy) + 0.5) * g.zw, k = g.y * g.zw;
+    const float2 tn = (uv * 2.0 - 1.0) * g2.xy;
+    [branch] if (dot(tn, tn) > g2.z) { dst[uint2(id.xy)] = src.Load(int3(p, 0)); return; }   // where the lens blurs: copied
     const float3 a = S(uv + float2(-k.x, -k.y)), b = S(uv + float2(0, -k.y)), c = S(uv + float2(k.x, -k.y));
     const float3 d = S(uv + float2(-k.x, 0)),    e = sqrt(max(src.Load(int3(p, 0)).rgb, 0.0)), f = S(uv + float2(k.x, 0));
     const float3 s = S(uv + float2(-k.x, k.y)),  t = S(uv + float2(0, k.y)),  u = S(uv + float2(k.x, k.y));
@@ -65,6 +70,7 @@ void main(uint3 id : SV_DispatchThreadID)
     D3D11_TEXTURE2D_DESC g_Want{}; DXGI_FORMAT g_WantView = DXGI_FORMAT_UNKNOWN; bool g_WantValid = false;
     D3D11_UNORDERED_ACCESS_VIEW_DESC g_WantUav{};
     bool g_Failed = false; float g_CbValue = -1.f, g_CbRadius = -1.f; UINT g_CbW = 0, g_CbH = 0;
+    float g_CbFov[3] = { -1.f, -1.f, -1.f };   // FoveatedEffects: tan^2 of the copy-only angle, the half extents
     ID3D11SamplerState* g_Smp = nullptr;
     std::atomic<bool> g_On{ false };                      // the setting is on and the headset's stereo view is up
     std::atomic<unsigned long long> g_Done{ 0 }, g_Waiting{ 0 };
@@ -87,7 +93,7 @@ void main(uint3 id : SV_DispatchThreadID)
         const bool ok = SUCCEEDED(dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_Cs)) && g_Cs;
         b->Release();
         if (!ok) { LOGI("TaaSharpen: CreateComputeShader failed: no sharpening"); return false; }
-        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = 32; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         if (FAILED(dev->CreateBuffer(&bd, nullptr, &g_Cb)) || !g_Cb) { Rel(g_Cs); LOGI("TaaSharpen: no constant buffer: no sharpening"); return false; }
         D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
         sd.MaxLOD = D3D11_FLOAT32_MAX; sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
@@ -106,15 +112,24 @@ void TaaSharpen::OnPresent(IDXGISwapChain* sc)
     if (!g_Cs && !g_Failed && !Compile(dev)) g_Failed = true;
     // the neighbours one render pixel away, as CAS has them (the taps land on pixel centres: exact)
     const float radius = 1.f;
-    if (g_Cs && g_Cb && (s != g_CbValue || fabsf(radius - g_CbRadius) > 0.05f || g_Have.Width != g_CbW || g_Have.Height != g_CbH))
+    // FoveatedEffects: sharpened within FoveatedOuter degrees of the view's axis, copied beyond (where the lens blurs and
+    // the foveated shading is coarse anyway)
+    float ex = 0.f, ey = 0.f;
+    const bool fov = Settings::FoveatedEffects() && CameraHook::RenderExtent(ex, ey) && ex > 0.1f && ey > 0.1f;
+    const float tOut = tanf(std::clamp(Settings::Foveated().outerDeg, 5.f, 85.f) / 57.29578f);
+    const float fz = fov ? tOut * tOut : 1e30f;
+    if (g_Cs && g_Cb && (s != g_CbValue || fabsf(radius - g_CbRadius) > 0.05f || g_Have.Width != g_CbW || g_Have.Height != g_CbH
+                         || fz != g_CbFov[0] || ex * 0.5f != g_CbFov[1] || ey * 0.5f != g_CbFov[2]))
     {
-        const float v[4] = { s, radius, g_Have.Width ? 1.f / g_Have.Width : 0.f, g_Have.Height ? 1.f / g_Have.Height : 0.f };
+        const float v[8] = { s, radius, g_Have.Width ? 1.f / g_Have.Width : 0.f, g_Have.Height ? 1.f / g_Have.Height : 0.f, ex * 0.5f, ey * 0.5f, fz, 0.f };
+        g_CbFov[0] = fz; g_CbFov[1] = ex * 0.5f; g_CbFov[2] = ey * 0.5f;
         ID3D11DeviceContext* imm = nullptr; dev->GetImmediateContext(&imm);
         if (imm)
         {
             imm->UpdateSubresource(g_Cb, 0, nullptr, v, 0, 0); imm->Release();
             g_CbValue = s; g_CbRadius = radius; g_CbW = g_Have.Width; g_CbH = g_Have.Height;
-            LOGI("TaaSharpen: strength {:.2f} ({}x{})", s, g_Have.Width, g_Have.Height);
+            LOGI("TaaSharpen: strength {:.2f} ({}x{}){}", s, g_Have.Width, g_Have.Height,
+                 fov ? fmt::format(", only within {:.0f} deg of the view's axis (FoveatedEffects)", Settings::Foveated().outerDeg) : std::string());
         }
     }
     if (g_Cs && g_WantValid && (!g_Tmp || !Same(g_Want, g_Have) || g_WantView != g_HaveView))

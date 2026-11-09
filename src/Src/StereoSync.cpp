@@ -8,6 +8,7 @@
 #include "ScreenMode.h"
 #include "ViewMatrixHook.h"
 #include "CameraHook.h"
+#include "ScreenShadows.h"
 #include <detours/detours.h>
 
 namespace
@@ -82,8 +83,9 @@ namespace
     //! The next RunFrame will be held (the mode's left view was just built).
     bool NextHeld() { return PairHold(g_Calls.load(), nullptr); }
     bool InputWaits() { return !(g_Dbg.load() & 64) && NextHeld(); }
-    uintptr_t HkKbdPoll(void* d) { g_Polls++; if (InputWaits()) { g_PollsHeld++; return 0; } g_PolledRead = true; return g_KbdPoll(d); }
-    uintptr_t HkMousePoll(void* d) { g_Polls++; if (InputWaits()) { g_PollsHeld++; return 0; } g_PolledRead = true; return g_MousePoll(d); }
+    // (KbmInject::DrainInjected: with BackgroundInput the frame's injected input is sent before the game reads it)
+    uintptr_t HkKbdPoll(void* d) { g_Polls++; if (InputWaits()) { g_PollsHeld++; return 0; } g_PolledRead = true; KbmInject::DrainInjected(); return g_KbdPoll(d); }
+    uintptr_t HkMousePoll(void* d) { g_Polls++; if (InputWaits()) { g_PollsHeld++; return 0; } g_PolledRead = true; KbmInject::DrainInjected(); return g_MousePoll(d); }
 
     std::atomic<unsigned long long> g_Ticks{ 0 };
     std::atomic<unsigned long long> g_Lefts{ 0 }, g_Rights{ 0 }, g_SyncHeld{ 0 };
@@ -438,6 +440,48 @@ namespace
         g_SunInPrep--;
         return r;
     }
+    // ---- the sun's farther cascades ([Performance.CPU] RightEyeSunShadows) ----
+    // Measured 2026-11-08 (log 57310700): the right eye's frame still drew ~630 moving objects a frame into the sun's
+    // cascades (SHADOWS_DYNAMIC sun, 1.5 ms of CPU in the heavy places, its tasks 0.4-0.6 ms each: among the longest
+    // single ones). Its frame is the same game tick as its left one. A cascade beyond the nearest is either redrawn in a
+    // frame (fitted to that frame's camera, its static casters drawn) or copied from its cache (the matrix and split
+    // distance it was drawn with are kept) -- the cascade task's own test (exe+0x334CC0 at exe+0x334D8D, with
+    // ShadowSunUpdateEvery's thunk there: SunSliceCopied replays it). When the right frame only copies a cascade, the map
+    // its tasks would make -- the cache's copy, then this tick's moving objects drawn over it with the kept matrix -- is
+    // exactly what the left frame's tasks left in that map: both of the right frame's tasks for that cascade are skipped
+    // (only if its left frame ran them). A cascade the right frame redraws is left alone.
+    std::atomic<bool> g_SunAllOn{ false };
+    constexpr int kMaxSlices = 8;
+    std::atomic<unsigned long long> g_SunLeftK[kMaxSlices][2];   // the pair whose left frame ran cascade k's world / dynamic task
+    std::atomic<unsigned long long> g_SunAllSkipped{ 0 }, g_SunAllRedrawn{ 0 }, g_SunAllNoLeft{ 0 };
+    constexpr uint32_t kSunCounter = 0x33C841C, kSunPartial = 0x33C4748;   // the frame counter; r_shadowParallelPartialSliceUpdate's int
+    //! The cascade task's decision for slice b this frame: true = copied from its cache (not redrawn). As exe+0x334D80..DB5.
+    bool SunSliceCopied(void* task, int b, int slices)
+    {
+        const uintptr_t base = GameInfo::Base();
+        int c = 0, partial = 0; void* cache = nullptr;
+        if (!ReadMem(&c, base + kSunCounter, 4) || !ReadMem(&partial, base + kSunPartial, 4) || !ReadMem(&cache, (uintptr_t)task + 0x68, 8)) return false;
+        if (b <= 0 || !partial || !cache) return false;            // redrawn
+        const int last = slices - 1, mask = ScreenShadows::SunUpdateMask();
+        int eax;
+        if (mask && (((unsigned)c >> 1) & (unsigned)mask)) eax = b == last ? 1 : 0;   // ShadowSunUpdateEvery's thunk: a pair left out
+        else eax = c & 1;                                                              // the frame's parity
+        const bool redraw = eax ? b != last : b == last;
+        return !redraw;
+    }
+    //! a sun cascade-k task (k >= 1): true = not to be run (the right frame's copy of it is the left frame's map)
+    bool SunSliceShared(void* task, char dynamic, int slice, int slices)
+    {
+        if (slice < 1 || slice >= kMaxSlices) return false;
+        bool left = false, right = false; unsigned long long s = 0, pair = 0;
+        if (!EyeOfTask(task, left, right, s, pair)) return false;
+        if (left) { g_SunLeftK[slice][dynamic ? 1 : 0] = pair; return false; }
+        if (!right) return false;
+        if (g_SunLeftK[slice][0].load() != pair || g_SunLeftK[slice][1].load() != pair) { if (!dynamic) g_SunAllNoLeft++; return false; }
+        if (!SunSliceCopied(task, slice, slices)) { if (!dynamic) g_SunAllRedrawn++; return false; }
+        g_SunAllSkipped++;
+        return true;
+    }
     //! a sun cascade-0 task (world or dynamic pass): true = not to be run (the right frame keeps the left's map)
     bool SunSlice0(void* task, char dynamic)
     {
@@ -458,6 +502,11 @@ namespace
             if (slice == 0 && g_SunReady.load(std::memory_order_relaxed) && g_SunShareOn.load(std::memory_order_relaxed) && SunSlice0(task, dynamic))
             {
                 if (uint8_t* ctx = *(uint8_t**)((uint8_t*)task + 0x108)) ctx[0x12AD4] = 1;   // as the engine marks a task it skips
+                return false;
+            }
+            if (slice >= 1 && g_SunAllOn.load(std::memory_order_relaxed) && SunSliceShared(task, dynamic, slice, slices))
+            {   // RightEyeSunShadows: this copy-only cascade's map is the left frame's
+                if (uint8_t* ctx = *(uint8_t**)((uint8_t*)task + 0x108)) ctx[0x12AD4] = 1;
                 return false;
             }
             return g_ShadowReal(task, dynamic);
@@ -775,7 +824,7 @@ void StereoSync::Install()
         }
         if (!g_SunReady.load()) g_SunShareOn = false;
     }
-    if (g_LightShadowOn.load() || g_SunShareOn.load())
+    if (g_LightShadowOn.load() || g_SunShareOn.load() || g_SunAllOn.load())
     {   // the right eye's spot / omni shadow maps, when they are the left eye's, and its nearest sun cascade (see HkShadowTask)
         g_ShadowReal = (ShadowTaskFn)(GameInfo::Base() + kShadowTask);
         DetourTransactionBegin(); DetourUpdateThread(GetCurrentThread());
@@ -838,6 +887,9 @@ void StereoSync::OnPresent()
             LOGI("StereoSync: sun cascade 0 (StereoSunShadowReuse {}): right frames that kept the left's {}, that fitted their own (no left cascade 0 of their pair) {}; "
                  "left frames {}, drew it {}; right tasks skipped {}", g_SunShareOn.load() ? "on" : "off", g_SunKept.load(), g_SunNoLeft.load(), g_SunFitted.load(),
                  g_SunLeftDrawn.load(), g_SunSkipped.load());
+            LOGI("StereoSync: sun cascades 1+ (RightEyeSunShadows {}): right frames' tasks skipped (the left's maps) {}, cascades the right frame redrew itself {}, "
+                 "no left frame to share {}; ShadowSunUpdateEvery mask {}", g_SunAllOn.load() ? "on" : "off", g_SunAllSkipped.load(), g_SunAllRedrawn.load(),
+                 g_SunAllNoLeft.load(), ScreenShadows::SunUpdateMask());
         }
     }
     UiStackTick();
@@ -905,6 +957,10 @@ void StereoSync::SetReuse(const ReuseFlags& f)
     g_LightShadowOn = f.lightShadows;
     g_SunShareOn = f.sunShadows && (!g_Installed.load() || g_SunReady.load());   // (off: the bytes go back at the next preparation)
     if (!f.sunShadows) g_SunKeep = 0;
+    if (g_SunAllOn.exchange(f.sunAll) != f.sunAll)
+        LOGI("StereoSync: RightEyeSunShadows {}", f.sunAll ? (g_ShadowReal ? "on: the right eye's frame leaves out the sun's farther cascades whenever it only copies them (the left frame's maps)"
+                                                                        : "asked for, but the shadow task is not hooked (it is hooked at start when this or another shadow reuse is on): restart")
+                                                         : "off: the right eye's frame runs every sun cascade it does not share by StereoSunShadowReuse");
 }
 
 std::string StereoSync::Status()

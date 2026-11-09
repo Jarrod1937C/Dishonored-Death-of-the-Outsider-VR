@@ -174,10 +174,72 @@ bool AcquireWaitImage(XrSwapchain sc, uint32_t& index)
     index = w.index;
     return true;
 }
+// ---- BackgroundSubmit ([Performance.CPU]): the pair's images handed back and the frame ended on a thread of its own ----
+// Measured 2026-11-08 (DOTO, log 57310700): at the right eye's Present, xrReleaseSwapchainImage held the render thread --
+// the game's main thread, the one the frame waits on -- until the NVIDIA driver's own thread had caught up with
+// everything queued (SteamVR flushes the game's immediate context there): 0.13 ms a pair at a locked 90, 1.2 at 86-89,
+// 2.0 at 80-86, 2.4 below 80 -- the very time that pushed each pair past the refresh. The same wait as Dishonored 2's
+// end-of-frame Flush (SkipFrameSyncFlush), moved into SteamVR. With this on, the render thread only draws the eye images
+// (on the immediate context, so the GPU still sees them in order) and hands the releases and xrEndFrame to the submit
+// thread, then goes on with the next frame while that thread waits for the driver. The next frame's BeginFrame (and
+// everything else that touches a swapchain or the frame calls) first waits for the hand-off to be done (WaitSubmitDone).
+// Needs the device's multithread protection (on with KeepAliveFrames); each frame call is made under its lock, as the
+// keep-alive's are.
+std::atomic<bool> g_BgSubmitOn{ true };
+struct SubmitJob
+{
+    XrSwapchain rel[16] = {}; int nRel = 0;            // released in this order
+    XrCompositionLayerProjection proj = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    XrCompositionLayerProjectionView views[XRSession::kMaxEyes] = {};
+    XrCompositionLayerQuad quads[kXrPanels + 2] = {}; int nQuads = 0;
+    int64_t displayTime = 0, period = 0;
+};
+struct SubmitState
+{
+    std::mutex m;
+    std::condition_variable cv;
+    HANDLE thread = nullptr;
+    bool quit = false, have = false, busy = false;
+    SubmitJob job;
+    unsigned long long jobs = 0, waits = 0, longWaits = 0, endFails = 0, overflow = 0;
+    double relSum = 0, relMax = 0, endSum = 0, endMax = 0, waitSum = 0, waitMax = 0;
+} sub;
+// The render thread only: SubmitPair's frame collects its releases here (ReleaseImage) until the hand-off.
+bool g_Deferring = false;
+SubmitJob g_Pend;
+//! A swapchain image handed back: now, or (inside a background-submitted frame) by the submit thread, in this order.
+void ReleaseImage(XrSwapchain sc)
+{
+    if (!sc) return;
+    if (g_Deferring)
+    {
+        if (g_Pend.nRel < (int)(sizeof g_Pend.rel / sizeof g_Pend.rel[0])) { g_Pend.rel[g_Pend.nRel++] = sc; return; }
+        sub.overflow++;
+    }
+    XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    Watchdog::Mark mk("xrReleaseSwapchainImage");
+    xrReleaseSwapchainImage(sc, &ri);
+}
+//! The render thread: the last background submission is done (nothing of it still to call). Bounded: a runtime call that
+//! does not return is logged, and after 2 s the render thread goes on.
+void WaitSubmitDone()
+{
+    if (!sub.thread) return;
+    std::unique_lock<std::mutex> lk(sub.m);
+    if (!sub.have && !sub.busy) return;
+    const double t0 = NowSec();
+    const bool ok = sub.cv.wait_for(lk, std::chrono::milliseconds(2000), [] { return !sub.have && !sub.busy; });
+    const double w = NowSec() - t0;
+    sub.waits++; sub.waitSum += w; if (w > sub.waitMax) sub.waitMax = w;
+    if (w > 0.005) sub.longWaits++;
+    if (!ok && sub.longWaits < 20) LOGI("XRSession: BackgroundSubmit: the submit thread is still inside a runtime call after 2 s: the render thread goes on");
+}
+
 //! Destroys a swapchain and forgets what referred to it (its wait slot, the keep-alive's copy of the layers).
 void DestroySwapchain(XrSwapchain& sc)
 {
     if (!sc) return;
+    WaitSubmitDone();
     for (ImageWait& w : g_ImageWait) if (w.sc == sc) w = {};
     { std::lock_guard<std::mutex> lk(pump.m); pump.haveLayers = false; }
     xrDestroySwapchain(sc);
@@ -1414,6 +1476,7 @@ bool XRSession::Init(ID3D11Device* device)
         if (!was && !m_KeepAliveMode) { pump.mt->Release(); pump.mt = nullptr; }
     }
     StartPump();
+    StartSubmit();
     return true;
 }
 
@@ -2029,6 +2092,7 @@ bool XRVisMask::Get(int eye, std::vector<float>& tris, unsigned* gen)
 //! next one asks again (with a short bound, so the game runs at its own pace until the runtime is back).
 bool XRSession::BeginFrame()
 {
+    WaitSubmitDone();   // (BackgroundSubmit: the last frame ended first)
     if (!m_SessionRunning)
         return false;
     PassProfile::Scope prof(PassProfile::kSecBegin);     // ([Advanced] ProfileRenderPasses: the wait is this less the next)
@@ -2566,11 +2630,7 @@ bool XRSession::DrawEye(int i, ID3D11Texture2D* source, ID3D11ShaderResourceView
     const bool acquired = AcquireWaitImage(g.swapchains[i], imgIndex);   // (not: the eye keeps its last image)
     ID3D11Texture2D* dst = acquired ? g.images[i][imgIndex].texture : nullptr;
     const bool drawn = DrawInto(i, source, srv, dst, tan, warp, declare, fade, pose);
-    if (acquired)
-    {
-        XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-        Watchdog::Mark mk("xrReleaseSwapchainImage"); xrReleaseSwapchainImage(g.swapchains[i], &ri);
-    }
+    if (acquired) ReleaseImage(g.swapchains[i]);   // (BackgroundSubmit: by the submit thread)
     FillEyeView(i, pv);
     return drawn;
 }
@@ -2587,6 +2647,7 @@ bool XRSession::CopyPairLeft(ID3D11Texture2D* dst)
 
 bool XRSession::ResubmitLast()
 {
+    WaitSubmitDone();
     if (!m_FrameStarted) return false;
     XrCompositionLayerProjection layer; XrCompositionLayerProjectionView views[kMaxEyes];
     {
@@ -2613,6 +2674,10 @@ bool XRSession::SubmitPair(ID3D11Texture2D* right, const float quat[4], const fl
     TakeVignette();
     const float poseR[7] = { quat[0], quat[1], quat[2], quat[3], pos[0], pos[1], pos[2] };
     XrCompositionLayerProjectionView projViews[kMaxEyes] = {};
+    // BackgroundSubmit: this frame's releases and its xrEndFrame go to the submit thread (EndFrameWithLayers hands off)
+    WaitSubmitDone();
+    g_Pend = SubmitJob();
+    g_Deferring = g_BgSubmitOn.load(std::memory_order_relaxed) && sub.thread && pump.mt && pump.mt->GetMultithreadProtected();
     DrawEye(0, nullptr, m_PairSrv, m_PairPose, m_PairTan, m_PairWarp, fade, projViews[0]);
     DrawEye(1, right, nullptr, poseR, tanR, warp, fade, projViews[1]);
     m_PairStaged = false;
@@ -2625,6 +2690,12 @@ bool XRSession::SubmitPair(ID3D11Texture2D* right, const float quat[4], const fl
     layer.views = projViews;
     m_PairsSubmitted++;
     EndFrameWithLayers(layer);
+    if (g_Deferring)
+    {   // (EndFrameWithLayers did not get to the hand-off: its releases now, on this thread)
+        g_Deferring = false;
+        for (int i = 0; i < g_Pend.nRel; i++) ReleaseImage(g_Pend.rel[i]);
+        g_Pend.nRel = 0;
+    }
     return true;
 }
 
@@ -2690,8 +2761,7 @@ void XRSession::EndFrameWithLayers(XrCompositionLayerProjection& layer)
             {
                 if (g.context && g.quadImages[qi].texture)
                     g.context->CopyResource(g.quadImages[qi].texture, m_QuadSource);
-                XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-                xrReleaseSwapchainImage(g.quadSwapchain, &ri);
+                ReleaseImage(g.quadSwapchain);
 
                 // Locked-panel mode shows a backbuffer copy — its alpha
                 // channel is not meaningful, so composite it opaque.
@@ -2763,6 +2833,25 @@ void XRSession::EndFrameWithLayers(XrCompositionLayerProjection& layer)
     fei.layerCount = nLayers;
     fei.layers = layers;
     SaveLayers(layers, haveWrist ? nLayers - 1 : nLayers);   // the keep-alive's copy (the watch, last, left out)
+    if (g_Deferring)
+    {   // BackgroundSubmit: the releases collected so far and this xrEndFrame, to the submit thread (FrameEnded is its)
+        g_Deferring = false;
+        SubmitJob& j = g_Pend;
+        j.proj = layer;
+        for (uint32_t v = 0; v < layer.viewCount && v < (uint32_t)kMaxEyes; v++) j.views[v] = layer.views[v];
+        j.nQuads = 0;
+        for (uint32_t i = 1; i < nLayers && j.nQuads < (int)(sizeof j.quads / sizeof j.quads[0]); i++) j.quads[j.nQuads++] = *(const XrCompositionLayerQuad*)layers[i];
+        j.displayTime = (int64_t)fei.displayTime; j.period = (int64_t)g.frameState.predictedDisplayPeriod;
+        {
+            std::lock_guard<std::mutex> lk(sub.m);
+            sub.job = j; sub.have = true;
+            sub.cv.notify_all();
+        }
+        g_Pend.nRel = 0;
+        m_FrameStarted = false;
+        m_FramesSubmitted++;
+        return;
+    }
     XrResult er;
     PassProfile::BeginSection(PassProfile::kSecXrEnd);
     PaceLog::BeforeEnd(g.context, (int64_t)fei.displayTime, (int64_t)g.frameState.predictedDisplayPeriod);
@@ -2810,8 +2899,7 @@ bool XRSession::AppendWristLayer(XrCompositionLayerQuad& quad)
     if (!AcquireWaitImage(g.wristSwapchain, idx)) return false;
     const bool drawn = idx < g.wristImages.size() && g.wristImages[idx].texture
                     && g_Wrist.Draw(g.device, g.context, l, g.wristImages[idx].texture, kSize, kSize, (DXGI_FORMAT)m_SwapFormat);
-    XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-    xrReleaseSwapchainImage(g.wristSwapchain, &ri);
+    ReleaseImage(g.wristSwapchain);
     if (!drawn) return false;
     quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // premultiplied (the default)
     quad.space = ws;
@@ -2874,8 +2962,7 @@ bool XRSession::AppendPanelLayer(int slot, XrCompositionLayerQuad& quad)
     if (!AcquireWaitImage(g.panelSwapchain[slot], idx)) return false;
     const bool drawn = idx < g.panelImages[slot].size() && g.panelImages[slot][idx].texture
                     && g_PanelR.Draw(g.device, g.context, l, g.panelImages[slot][idx].texture, l.outW, l.outH, (DXGI_FORMAT)m_SwapFormat);
-    XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-    xrReleaseSwapchainImage(g.panelSwapchain[slot], &ri);
+    ReleaseImage(g.panelSwapchain[slot]);
     if (!drawn) return false;
     quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // premultiplied (the default)
     quad.space = l.head && g.viewSpace ? g.viewSpace : g.space;
@@ -3099,6 +3186,7 @@ void XRSession::SubmitFrameStereo(ID3D11Texture2D* eye0, ID3D11Texture2D* eye1)
 
 void XRSession::EndFrameNoRender()
 {
+    WaitSubmitDone();
     if (!m_FrameStarted)
         return;
     XrFrameEndInfo fei = { XR_TYPE_FRAME_END_INFO };
@@ -3222,6 +3310,80 @@ void XRSession::EndSessionWhenFree()
 }
 
 unsigned long __stdcall XRSession::PumpThread(void* self) { ((XRSession*)self)->PumpLoop(); return 0; }
+
+// ---- BackgroundSubmit: the submit thread (see SubmitJob) ----
+unsigned long __stdcall XRSession::SubmitThread(void* self) { ((XRSession*)self)->SubmitLoop(); return 0; }
+void XRSession::SubmitLoop()
+{
+    for (;;)
+    {
+        SubmitJob j;
+        {
+            std::unique_lock<std::mutex> lk(sub.m);
+            sub.cv.wait(lk, [] { return sub.have || sub.quit; });
+            if (!sub.have) break;
+            j = sub.job; sub.have = false; sub.busy = true;
+        }
+        const double t0 = NowSec();
+        for (int i = 0; i < j.nRel; i++)
+        {
+            XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+            if (pump.mt) pump.mt->Enter();
+            xrReleaseSwapchainImage(j.rel[i], &ri);
+            if (pump.mt) pump.mt->Leave();
+        }
+        const double t1 = NowSec();
+        j.proj.views = j.views;
+        const XrCompositionLayerBaseHeader* layers[1 + kXrPanels + 2]; uint32_t n = 0;
+        layers[n++] = (const XrCompositionLayerBaseHeader*)&j.proj;
+        for (int q = 0; q < j.nQuads; q++) layers[n++] = (const XrCompositionLayerBaseHeader*)&j.quads[q];
+        XrFrameEndInfo fei = { XR_TYPE_FRAME_END_INFO };
+        fei.displayTime = (XrTime)j.displayTime;
+        fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        fei.layerCount = n;
+        fei.layers = layers;
+        if (pump.mt) pump.mt->Enter();
+        PaceLog::BeforeEnd(g.context, j.displayTime, j.period);
+        const XrResult er = xrEndFrame(g.session, &fei);
+        PaceLog::AfterEnd();
+        if (pump.mt) pump.mt->Leave();
+        const double t2 = NowSec();
+        if (XR_FAILED(er) && m_EndFrameFails++ < 10)
+            LOGI("XRSession: xrEndFrame FAILED {} ({} layers, from the submit thread{})", (int)er, n, m_EndFrameFails == 10 ? "; not logged again" : "");
+        FrameEnded();
+        std::lock_guard<std::mutex> lk(sub.m);
+        sub.busy = false; sub.jobs++;
+        if (XR_FAILED(er)) sub.endFails++;
+        sub.relSum += t1 - t0; if (t1 - t0 > sub.relMax) sub.relMax = t1 - t0;
+        sub.endSum += t2 - t1; if (t2 - t1 > sub.endMax) sub.endMax = t2 - t1;
+        sub.cv.notify_all();
+    }
+}
+bool XRSession::StartSubmit()
+{
+    if (sub.thread) return true;
+    { std::lock_guard<std::mutex> lk(sub.m); sub.quit = false; sub.have = sub.busy = false; }
+    DWORD tid = 0;
+    sub.thread = CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)&XRSession::SubmitThread, this, 0, &tid);
+    if (!sub.thread) { LOGI("XRSession: BackgroundSubmit: the submit thread could not start ({}): frames are submitted on the render thread", GetLastError()); return false; }
+    SetThreadPriority(sub.thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    LOGI("XRSession: BackgroundSubmit: submit thread {} started ({}; needs the device's multithread protection: {})", tid,
+         g_BgSubmitOn.load() ? "on" : "off for now", pump.mt && pump.mt->GetMultithreadProtected() ? "on" : "OFF -- frames stay on the render thread");
+    return true;
+}
+void XRSession::StopSubmit()
+{
+    if (!sub.thread) return;
+    WaitSubmitDone();
+    { std::lock_guard<std::mutex> lk(sub.m); sub.quit = true; sub.cv.notify_all(); }
+    if (WaitForSingleObject(sub.thread, 2000) == WAIT_OBJECT_0) { CloseHandle(sub.thread); sub.thread = nullptr; }
+}
+void XRSession::SetBackgroundSubmit(bool on)
+{
+    if (g_BgSubmitOn.exchange(on) != on || on)
+        LOGI("XRSession: BackgroundSubmit {}", on ? "on: the eye images are handed back to the runtime and the frame ended on the submit thread (the render thread goes on with the next frame)"
+                                                   : "off: the frame is handed back and ended on the render thread (as before)");
+}
 
 void XRSession::PumpLoop()
 {
@@ -3374,7 +3536,14 @@ std::string XRSession::PumpStatus() const
                        pump.mainTimeouts, pump.timeoutRuns, pump.longestTimeout, pump.longestWait, pump.imageTimeouts, pump.kicks, pump.waitFails,
                        m_WaitBoundMs, m_KickSec, pump.waiting, pump.mainOpen,
                        pump.lastMainEnd > 0 ? now - (pump.lastMainEnd > pump.lastMainBegin ? pump.lastMainEnd : pump.lastMainBegin) : -1.0,
-                       pump.mt != nullptr);
+                       pump.mt != nullptr)
+         + [] {
+               std::lock_guard<std::mutex> lk2(sub.m);
+               const double n = sub.jobs ? (double)sub.jobs : 1.0, w = sub.waits ? (double)sub.waits : 1.0;
+               return fmt::format(" | bgsubmit {} thread {} frames {} release ms avg {:.2f} max {:.2f} endframe ms avg {:.2f} max {:.2f} | render thread waited for it {} times, avg {:.3f} ms max {:.2f}, over 5 ms {} | endfails {} overflow {}",
+                                  g_BgSubmitOn.load() ? "on" : "off", sub.thread != nullptr, sub.jobs, sub.relSum / n * 1e3, sub.relMax * 1e3,
+                                  sub.endSum / n * 1e3, sub.endMax * 1e3, sub.waits, sub.waitSum / w * 1e3, sub.waitMax * 1e3, sub.longWaits, sub.endFails, sub.overflow);
+           }();
 }
 
 unsigned long long XRSession::OrthoDraws() const { return g_Blit.draws; }
@@ -3385,6 +3554,7 @@ bool XRSession::Shutdown(bool processExit)
     // session alive until it does (VRRuntime calls this again every Present).
     // Briefly: VRRuntime calls this every Present until it succeeds, and a 2 s wait each time held the game at 0.5 fps
     // for as long as a hung runtime kept the frame thread inside xrWaitFrame.
+    if (!processExit) StopSubmit();
     if (!StopPump(processExit ? 0 : 50) && !processExit)
     {
         static double lastLog = -100;

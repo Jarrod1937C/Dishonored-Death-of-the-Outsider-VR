@@ -462,26 +462,39 @@ namespace
     }
     void TickMana()
     {
-        void* m = GetComponent(Game::LocalPlayer(), TestAids::kManaCpntTypeInfo);
-        if (!m || !Readable((uint8_t*)m + TestAids::kManaMax, 4)) return;
-        float* cur = (float*)((uint8_t*)m + TestAids::kManaCurrent);
-        float* cap = (float*)((uint8_t*)m + TestAids::kManaMax);
-        // `vr mana <value>`: the current mana AND the level it regenerates to, as a few casts would leave them (a
-        // test of the potions without casting: Blink threw Emily overboard and she drowned, 2026-10-05)
+        using namespace TestAids;
+        uint8_t* m = (uint8_t*)GetComponent(Game::LocalPlayer(), kManaCpntTypeInfo);
+        if (!m || !Readable(m, 0x70)) return;
+        // DOTO (see TestAids.h): the full bar is the max segment count times a segment's mana, as exe+0x7A8250 counts
+        // them. (Dishonored 2's rule -- current and a "maximum" at +0x2C both 100 -- put 5 full segments in a 4-segment
+        // bar: the HUD's array overflowed and the game died at the next load.)
+        uint8_t* decl = *(uint8_t**)(m + kManaDecl);
+        if (!decl || !Readable(decl + kManaDeclSegments, 8)) return;
+        const float segSize = *(float*)(decl + kManaDeclSegSize);
+        int segs = *(int*)(decl + kManaDeclSegments) + ((m[kManaFlags] >> 5) & 1);
+        const int up = *(int*)(m + kManaUpgIdx);
+        if (up > -1)
+        {
+            uint8_t* stats = *(uint8_t**)(m + kManaStats);
+            uint8_t* list = stats && Readable(stats + kManaStatsList, 8) ? *(uint8_t**)(stats + kManaStatsList) : nullptr;
+            uint8_t* e = list ? list + (size_t)up * kManaStatStride + kManaStatValue : nullptr;
+            if (e && Readable(e, 4)) segs += (int)*(float*)e;
+        }
+        if (!(segSize > 0.f && segSize < 10000.f) || segs < 0 || segs > 64) return;
+        const float full = segs * segSize;
+        float* cur = (float*)(m + kManaCurrent);
+        static void* loggedFor = nullptr;
+        if (loggedFor != m && (loggedFor = m) != nullptr)
+            LOGI("TestAids: mana {:.1f}, the full bar {:.1f} ({} segments of {:.1f})", *cur, full, segs, segSize);
+        // above the full bar (Dishonored 2's 100 written by an older build, kept in a save): back to it, cheat or not --
+        // the HUD writes past its array otherwise
+        if (*cur > full + 0.01f) { LOGI("TestAids: mana {:.1f} above the full bar {:.1f}: set to it", *cur, full); *cur = full; }
+        // `vr mana <value>`: the current mana (a test of the potions without casting), at most the full bar
         const float set = g_SetMana.exchange(-1.f);
-        if (set >= 0.f && set < 10000.f) { LOGI("TestAids: mana {:.1f}/{:.1f} -> {:.1f}", *cur, *cap, set); *cur = set; *cap = set; }
-        g_ManaLast = *cur; g_ManaMaxLast = *cap;
-        // +0x2C is not a fixed maximum: it is the level mana regenerates back to, and the game lowers it with every
-        // cast (measured: 100 -> 80 after a possession; 100 -> 30 after two swarms and a few casts, and it stayed
-        // there). Filling up to it made "infinite" mana run dry. Keep the highest value this component ever had, and at
-        // least the full bar (100): a save made after a few casts loads with the level already lowered (55.7 measured
-        // 2026-10-18), and filling to that left the bar half empty for the whole session.
-        static void* seenFor = nullptr; static float seen = 0.f;
-        if (m != seenFor) { seenFor = m; seen = 100.f; }
-        if (*cap > seen && *cap < 10000.f) seen = *cap;
-        if (!g_InfMana.load() || !(seen > 0.f)) return;
-        if (*cap < seen) *cap = seen;
-        if (*cur < seen) { *cur = seen; g_ManaRefills++; }
+        if (set >= 0.f && set < 10000.f) { LOGI("TestAids: mana {:.1f}/{:.1f} -> {:.1f}", *cur, full, std::min(set, full)); *cur = std::min(set, full); }
+        g_ManaLast = *cur; g_ManaMaxLast = full;
+        if (!g_InfMana.load()) return;
+        if (*cur < full) { *cur = full; g_ManaRefills++; }
     }
 }
 

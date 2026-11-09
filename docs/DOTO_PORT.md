@@ -563,6 +563,181 @@ Logging:
 - Heartbeat: `people: N standing near (scans N), the ring on one: gun ray N hand ray N`.
 - Reticle jump log: source `hand ray traced`, and `A PERSON` on samples on a person.
 
+### CPU work off the render thread: `[Performance.CPU]` (same session)
+
+Log 57310700 (logging on, settings flipped in heavy areas): the game is CPU-bound on its main thread (which is also the
+render thread). Below 90, `xrReleaseSwapchainImage` held that thread 2-2.4 ms a pair (SteamVR flushes the immediate
+context there and waits for the NVIDIA driver thread); shadows were about half of the recording CPU; the mod's own
+per-draw test was ~14 % of the render threads' active time. Four switches, all default 1, all live from the VR menu
+(Performance > CPU) or `DOTOVR.ini [Performance.CPU]`, each with its own log line:
+
+| Setting | Where | What |
+|---|---|---|
+| `BackgroundSubmit` | XRSession (`SubmitJob`, `SubmitLoop`, `ReleaseImage`, `WaitSubmitDone`) | The pair's swapchain releases and `xrEndFrame` go to a submit thread (under `ID3D11Multithread`, needs KeepAliveFrames' protection on); the render thread draws the eyes and goes on. Every frame call and swapchain touch first waits for the last hand-off (bounded 2 s). Report: `PumpStatus` `| bgsubmit ...` |
+| `RightEyeSunShadows` | StereoSync (`SunSliceCopied`, `SunSliceShared`, `ReuseFlags::sunAll`) | In the right (draw-only) frame, the sun cascades >= 1 that the frame would only copy from their cache (the cascade task's own decision at exe+0x334D8D replayed, ShadowSunUpdateEvery's thunk included) skip both tasks, when the pair's left frame ran them. Needs the shadow-task hook (installed at start when any shadow reuse is on). 60 s line `StereoSync: sun cascades 1+` |
+| `LeanDrawHooks` | GpuTrace (`LeanSkip`, `HookClock`), PassProfile (`StaticWorldNow`) | FORWARD_WORLD's draws skip the player test (1 in 64 still tested; a hit switches the trim off for the session). All four draw hooks time themselves outside the real call (TSC): 30 s line `gpu6dof: the mod's per-draw work` |
+| `BackgroundInput` | KbmInject (`Inject`, `InputThread`, `DrainInjected`), StereoSync poll hooks | Keys / buttons / mouse moves queued and sent by an input thread in one batched `SendInput`; the game's keyboard / mouse reads wait (<= 1.5 ms) for the queue to empty first. 60 s line `KbmInject: BackgroundInput ...` |
+
+Not done: the lamps' shadows reused by the right eye when the atlas placement differs. One light changing moves every
+face of the frame in the atlas (SHADOWS_PREPARE exe+0x3392C0 packs them afresh), so the left frame's faces sit
+elsewhere; D3D11 cannot copy part of a depth texture to another place (CopySubresourceRegion of depth needs the whole
+subresource), so it needs either a depth-blit shader (GPU work for CPU) or the packer reverse-engineered so the
+right frame keeps the left's placement.
+
+## Thirteenth session (2026-11-08, night): what the `[Performance.CPU]` test showed
+
+Log 47e17c17 (rich_district, AmbientOcclusion turned on mid-session, the four switches flipped off at 21:25:19 and on at
+21:27:05):
+
+- **GPU-bound here, not CPU-bound.** The render thread was 0.45-0.55 of a core busy, ~57 % of its samples waiting; the
+  recording threads ~0.3 each. Its waits: SteamVR (`xrBeginFrame`, or `xrReleaseSwapchainImage` / the submit thread's
+  hand-off) ~22 %, the game's own task waits (exe+0x15BA10 < exe+0x2CD860, exe+0x15BB40 < exe+0xA1AB0) ~25 %. The pairs a
+  second match the timed GPU work per pair exactly (e.g. 4.33 + 4.50 + 2 x 1.82 = 12.5 ms at 79.9 pairs/s; 11.0 ms at a
+  locked 90). The largest single pass was SSAO, 1.06 ms an eye (GTAO, AmbientOcclusion = 1).
+- **BackgroundSubmit gains nothing:** the release's wait is SteamVR's back-pressure on the GPU, not CPU work; on, the
+  render thread waited for the submit thread instead (`bgsubmit` avg 2.19 ms; "overlay + VR submit" 1.478 vs 1.471 ms CPU
+  a Present on / off). The other three save CPU that this scene did not need (RightEyeSunShadows ~290 tasks/s skipped,
+  BackgroundInput 273 us a SendInput off the render thread, LeanDrawHooks ~140 k draws/s untested; the mod's draw hooks
+  ~0.4 us a draw, ~250 ms a second over all threads either way).
+- **"80 feels worse than 80":** NOT motion smoothing (it was off). SteamVR reported a 22.22 ms display period on single
+  frames 34 times (SimStep's log), but 81-82 pairs a second were still submitted in those windows -- a sustained half
+  rate would have held xrWaitFrame to 45. The doubled period marks a frame shown two refreshes after the one before (a
+  missed refresh). At ~81 pairs on a 90 Hz display about 9 refreshes a second repeat the last frame, irregularly (submits
+  9-18 ms apart): reprojection corrects the head's turn only, so the world's and the player's own motion stutters. Note:
+  PaceLog's "shown N refreshes after the frame before" divides by each frame's own reported period, so it reads 1 for
+  exactly these frames -- to be fixed (divide by the shortest period seen).
+- **StaticLodZoom 1.5 culled geometry** (the stairs at the end of the street): r_lodZoomMultiplicator also sets how far
+  static models are drawn at all, and 1.5 is twice the game's own at ViewDistance 3 (0.7; its lowest level is 1). Also
+  a change back to 1 never restored the cvar (the session stayed at 1.2), so the player went to 0.1 (7x Very High's
+  detail). Fixed: 1 puts the game's value back (`g_GameLod`, seen before the first hold and after each view-distance
+  change); the default is now 1.
+- Screenshots (`Capture`) freeze the render thread ~3 s each (WindowsCodecs PNG encoding in `XRCapture::SaveTextureToPng`).
+
+### GPU work, pass by pass (same session)
+
+Per eye at a locked 90 vs 70-80 pairs/s (log 57310700): GPU 4.36 -> 5.02 ms, draws 2076 -> 5005, triangles rasterised
+1.85 -> 4.41 M, pixels shaded 170 -> 212 M, the recording threads' CPU 4.2 -> 8.2 ms. About 3 ms an eye is fixed
+per-pixel work: GTAO 1.1-1.5 (one draw, 12 M pixels, 1085 instructions), the depth pass's 29 M pixel invocations (its
+7-instruction motion-vector shader, 2.3 per pixel; triangles ~14 pixels each), POSTPROC 0.5 (TAA compute 0.18, the
+mod's TaaSharpen 0.11, PS 6b05662764a19199 twice at 0.046 reading the motion vectors and the colour -- not identified,
+motion blur?, bloom / luminance / composite), the HUD (IGGY_3D) 0.22-0.26, SCREENSHADOWS 0.13. Geometry (draws and
+triangles together) adds ~0.65 ms between the light and the heavy scenes.
+
+- **GTAO, fast variant** (`AmbientOcclusionQuality = high`; the previous shader is `ultra`): the 2x2 quad shares its
+  slices (ddx_fine / ddy_fine exchange, each neighbour weighted by its distance from this pixel's plane: 2 % of the
+  depth all, 4 % nothing), so a pixel integrates 1-2 slices of its own instead of 3 and gets 4-8 directions; foveated in
+  the shader (`FoveatedEffects`): 2 slices within FoveatedInner degrees of the view's axis, 1 beyond. No early return
+  before the exchange (derivatives need the whole quad). Expected ~0.4-0.6 ms an eye (to be measured).
+- **NVIDIA VRS cannot take the AO draw:** its output carries the packed linear depth (z / w) the game's blur and the
+  lighting read per pixel; a coarse rate would replicate it over 2x2 / 4x4 pixels. The other full-screen passes VRS
+  could take are compute (TAA) or under 0.06 ms.
+- **TaaSharpen foveated** (`FoveatedEffects`): beyond FoveatedOuter degrees the pixel is copied, not sharpened (the
+  frustum is symmetric, so the image centre is its axis; CameraHook::RenderExtent gives the tan half extents).
+- **DOF:** already off (VrTweaks' per-view flag). What still runs in the DOF task (0.08 ms an eye) is DOF #0, a
+  full-resolution colour pass (reads the view colour, the colour-grading mask, the exposure), and DOF #1, its half-size
+  copy, which water, electricity and faces read (SkipDisabledEffects = 2 skips it and breaks them). Nothing to remove.
+- Not done yet: the depth pass drawn depth-only for the static world with its camera motion computed in one full-screen
+  pass from depth (0.3-0.5 ms an eye, TAA-sensitive); the HUD's IGGY_3D work once per pair; POSTPROC's unidentified
+  pair; a vendor-neutral replacement for VRS on the game's own passes (radial density masking: a stencil checkerboard
+  in the periphery and a reconstruction pass before the TAA).
+
+### Fourteenth session (2026-11-08, late night): AO costs measured, a lite GTAO, fog size, silent crashes
+
+- **Measured** (log ab4a512e, SSAO pass, left eye, 3492x3607): the game's DWAO 0.11 ms, GTAO fast (high) 0.59-0.63 ms,
+  full (ultra) 1.51 ms. The fast variant's cut matched the estimate; DWAO stays ~5x cheaper.
+- **GTAO lite** (`AmbientOcclusionQuality = low`, the new default): one slice, two steps each way (one beyond
+  FoveatedInner), the normal from the quad's own positions exchanged by ddx_fine / ddy_fine (no extra taps; a depth edge
+  > 5 % of the depth faces the eye instead), the quad's slices shared as in FAST: ~5 depth taps a pixel. The radius is in
+  world units -- DWAO's is a fixed screen size (the player: it "grows further away and shrinks as you approach", differs
+  between the eyes, and keeps a slight halo).
+- **FogMapsResolution** only applied in FogMaps maps; with `Fog = 1` (the game's fog everywhere) the fog stayed at the
+  game's reduced size. Now whenever the game's fog is drawn.
+- **Two crashes on loading a save** from the pause menu in a level, ~0.2 s after LoadSave: no crash_log, nothing in the
+  log -- no exception reached the vectored handler or the filter, and no DLL detach. So either the process terminated
+  itself (TerminateProcess) or a fail-fast (kernel; only Windows' Event Viewer / WER LocalDumps see it). CrashLog now
+  hooks TerminateProcess on this process (full report) and ExitProcess (a log line with the callers).
+
+### The stray electric effect and the dark card: found (same session, log b6e13fa6)
+
+- The effect is `models/effects/weapons/dlc01/gauss_gun/bolts/gauss_elec_idle_equiped.fx`, created every ~2.5 s on
+  the entity **`gauss_electric_attachment_5274`** (idEntity, id 0x149a83f9, 7 cm from the launcher's flat entity) by the
+  launcher's own code: exe+0x500A00 -> the FX world's create (0x1A07B0, entity id = the attachment's), the pose copied
+  from the attachment entity's +0x310, start 0x1A67C0. Never through the bound-FX spawn (0x5337F0), so `FxSpawnHook`
+  set no context and `FxStartHook` left it; its per-frame update is not the bound slot's (`FxUpdateHook` never saw it:
+  "fx re-placed 0"). Its bind never asked the launcher for a joint, so `NoteWristKid` never learned the entity.
+  Position each time: eye frame fwd 0.22 left 0.19 up -0.09 m -- the flat game's arm.
+- The dark card: a 6-vertex draw (ALPHA_LIT + two DEPTHALPHA_LIT shaders) at the attachment entity's origin, 0.48 m from
+  the weapon anchor -- beyond GpuTrace's 0.35 m anchor radius, so never claimed as a launcher piece (`nearleft` census:
+  ~1900 times per 30 s per eye, the only draws by the launcher left unmoved every frame).
+- Fix: `ScanWristKids` (GunRay, once a second while a launcher is held) takes every entity with a model within 0.3 m of
+  the launcher's entity origin (not the player, arms, weapons) as a wrist kid; `GunRay::WristKidSide(worldOrg)` lets
+  GpuTrace claim a draw at a kid's origin as a launcher piece (rigid pose); `FxCreateHook` remembers the entity of the
+  last four instances and `FxStartHook` carries an FX started on a kid / the launcher outside a spawn onto the drawn
+  launcher. The periodic re-creation means the fix takes effect within ~2.5 s.
+- The load-a-save crash (third time, with TerminateProcess / ExitProcess hooked): still nothing -- neither API called, no
+  exception on any thread, no Event Viewer entry. Now also hooked: ntdll `NtTerminateProcess` and `RtlExitUserProcess`
+  (callers logged, report when the code is not 0), and a failing `Present` is logged with `GetDeviceRemovedReason`.
+
+### The load-a-save crash: an unhandled int 3 (fifteenth session, crash_log 2026-11-08_23-43)
+
+- Caught at last by the `NtTerminateProcess` hook: the render thread (2724) ended the process with exit code
+  **0x80000003 (STATUS_BREAKPOINT)**, called from ntdll+0x7EE20 = `RtlUserThreadStart` (its return address +0x7EE4C is
+  the thread-start frame seen in other stacks), with the thread's stack already unwound to the top. That is the thread's
+  root `__except`: an **int 3 on the render thread that nothing handled**, 0.14 s after `LoadSave`. Our top-level filter
+  was never called for it (no "unhandled exception" report, no Event Viewer entry), which is why the first two crashes
+  left nothing. Where the int 3 was is not recoverable from this report (the minidump has the stack only from the top).
+- CrashLog now keeps every interesting first-chance fault (and every breakpoint / single step) with its full context in a
+  32-slot ring (`KeepFault`). An exit (TerminateProcess / NtTerminateProcess / RtlExitUserProcess) whose code is a fault
+  the same thread saw in the last 10 s is reported from **that fault's context** (`ReportExit`): the text unwind walks
+  the original frames (the unwind only moved rsp up; the memory below is intact). A breakpoint is also logged at first
+  chance with its code bytes (padding `CC CC [CC] CC` vs a lone debug break) and its callers. The minidump gets the
+  faulting thread's stack from the fault's rsp up as extra memory (MemoryCallback), so a debugger can walk it too.
+
+### The "box" by the left hand: effect cards claimed by the held item (same session)
+
+- `nearleft` in play: only the 6-index cards (ALPHA_LIT + two DEPTHALPHA_LIT) are left unmoved every frame, 0.23-0.48 m
+  from the launcher's entity -- next to where the hook mine's in-hand effect (`hook_inhand_nonleth.fx`, made by the same
+  exe+0x500A00 as the gauss idle effect) is created, at the flat game's hand (eye frame fwd 0.33 left 0.20 up -0.12).
+  Seen in the headset as a large reddish / dark sheet in the lower left.
+- GpuTrace: a draw of at most 36 indices whose origin is within 0.6 m (`g_FxCardRadius`) of a held item's entity, and
+  that no closer rule took, is claimed by that item (`fxCard`; the wrist rig poses it with the launcher). Not added to the
+  launcher's mesh keys (the effects share one vertex buffer). Count per side in the wrist-rig line ("effect cards taken
+  by the held item").
+- The blue squiggle in the 2026-11-08 screenshots sits by the canister on the floor and moves with the world between the
+  two shots, not with the head: possibly that object's own effect, to be confirmed in play.
+
+### The load-a-save crash: found -- the infinite-mana cheat (2026-11-09, crash_log 00-10)
+
+- With the fault's own context kept (KeepFault / ReportExit) the report showed it: an int 3 at exe+0x159F6B, the engine's
+  fatal path after `"Memory corruption after block!"` (exe+0x1BFA558): the allocator's free found a block's trailing guard
+  overwritten. The block (minidump): 32 bytes = 4 entries of 8 bytes {float 1.0, 00 01 00/01 01}, and a FIFTH such entry
+  written over the guard. Freed by exe+0x532C00 (an idList's clear) from exe+0x6CBEA0, the destructor of
+  `arkHUDElementMana` (vtable 0x1CBA768; folded with arkHUDElementTutorialMessage's), its list at +0x60, in the HUD's
+  teardown on LoadSave (gameLocal+0x1F75F8 -> exe+0x7EDA10 -> exe+0x7F11B0).
+- The writer: `arkHUDElementMana` update exe+0x6CC890 sizes that list to the MAX segment count (arkCpntMana, exe+0x7A8250
+  = decl+0x70 + upgrade stat + bit 5 of +0x2C) and then writes one entry per FULL segment (exe+0x7A81D0 = current mana
+  +0x20 / decl+0x74), unchecked. TestAids' infinite mana kept Dishonored 2's layout: current +0x20 = 100 and a float
+  "maximum" 100 at +0x2C -- in DOTO a flags byte. 100 / segment size = 5 full segments in a 4-segment bar: one entry past
+  the array every HUD update, fatal at the next free.
+- Fix (TestAids::TickMana): the full bar is max segments x segment size, computed as the game does; infinite mana fills to
+  it; mana above it (a save from the old build) is set back to it, cheat or not; +0x2C is never written. `vr mana <v>`
+  is capped at the full bar. Saves made with the old build may keep +0x2C..0x2F as the float's bytes (bit 5 cleared).
+
+### Sword contact: the launcher's parts are not targets
+
+- `SwordContact` struck `gauss_electric_attachment_5274` (0.13 x 0.02 x 0.02 m, at the flat game's arm, 0.45 m from the
+  eye) and `ply_billie_gaussgun01_4` as targets ("CONTACT ... clicks a Slash"). The wrist launcher's entity and every
+  entity within 30 cm of it are now skipped ("the wrist launcher or a piece of it").
+
+### The electric effect: why the kid fix missed it
+
+- This session's scan took entity id 0x5230142 as the launcher's piece; the attachment (id 0x149a83f9) carries a render
+  model only for its box and was not taken. The effect (`gauss_elec_idle_equiped.fx`) is created once on it and is a
+  long-lived looping effect, re-placed every frame from the attachment entity (flat pose: eye frame fwd 0.15 left 0.29
+  up -0.34 m) by an update not yet found; its particles are in world space (no instance origin), so neither the GPU
+  claims nor the census see them. Next: move the attachment entity itself to the drawn launcher each frame (its effect
+  and its box follow), with its own draws then excluded from the GPU carry.
+
 ## Not yet DOTO-specific
 
 - Billie's powers (Displace, Foresight, Semblance) have no dedicated support yet: the Dishonored 2 power code paths that exist in DOTO were ported, the ones that don't are dormant.

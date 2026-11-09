@@ -178,17 +178,28 @@ bool Foveation::Begin(ID3D11DeviceContext* c, const void* view, int eye)
 void Foveation::End(ID3D11DeviceContext* c, bool begun)
 {
     if (!c) return;
-    // the render size, for the masks: the depth buffer the task drew with (all foveated passes bind the eye's)
+    // the render size, for the masks: the depth buffer the task drew with (all foveated passes bind the eye's) -- with a
+    // colour target of the same size bound beside it. (2026-11-08: a task sometimes ended with a 2048x2048 shadow map's
+    // depth bound alone: the size flipped to it and back every few seconds, 231 times in 10 min, each flip rebuilding the
+    // masks and giving the next eye task one built for the wrong size.)
     ID3D11RenderTargetView* rtv = nullptr; ID3D11DepthStencilView* dsv = nullptr;
     c->OMGetRenderTargets(1, &rtv, &dsv);
-    if (dsv)
+    UINT rtW = 0, rtH = 0;
+    if (rtv)
+    {
+        ID3D11Resource* r = nullptr; rtv->GetResource(&r);
+        D3D11_RESOURCE_DIMENSION dim{}; if (r) r->GetType(&dim);
+        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) { D3D11_TEXTURE2D_DESC d{}; static_cast<ID3D11Texture2D*>(r)->GetDesc(&d); rtW = d.Width; rtH = d.Height; }
+        if (r) r->Release();
+    }
+    if (dsv && rtW)
     {
         ID3D11Resource* r = nullptr; dsv->GetResource(&r);
         D3D11_RESOURCE_DIMENSION dim{}; if (r) r->GetType(&dim);
         if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
         {
             D3D11_TEXTURE2D_DESC d{}; static_cast<ID3D11Texture2D*>(r)->GetDesc(&d);
-            if (d.Width >= 256 && d.Height >= 256 && (d.Width != g_W || d.Height != g_H))
+            if (d.Width >= 256 && d.Height >= 256 && d.Width == rtW && d.Height == rtH && (d.Width != g_W || d.Height != g_H))
             {
                 std::lock_guard lk(g_M);
                 if (d.Width != g_W || d.Height != g_H) { LOGI("Foveation: the eyes render at {}x{}", d.Width, d.Height); g_W = d.Width; g_H = d.Height; }

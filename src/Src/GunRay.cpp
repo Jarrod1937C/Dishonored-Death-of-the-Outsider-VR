@@ -11,6 +11,7 @@
 #include "PlayerState.h"
 #include "BodyHide.h"
 #include "Collision.h"
+#include "Game.h"
 #include <detours/detours.h>
 #include <cmath>
 #include <sstream>
@@ -699,6 +700,65 @@ namespace
                                     g_WristFxMoved{ 0 }, g_WristFxStarts{ 0 }, g_WristKidBinds{ 0 };
     std::atomic<float> g_WristGap{ 0.f };
     std::atomic<int> g_WristLogLeft{ 24 };
+    // 2026-11-08, log b6e13fa6: the electric effect is gauss_elec_idle_equiped.fx on the entity 'gauss_electric_attachment'
+    // (an idEntity with a small model: the dark card with the glow), created every ~2.5 s by the launcher's own code
+    // (exe+0x500A00 -> the FX world's create 0x1A07B0, the pose copied from THAT entity's +0x310, then start 0x1A67C0:
+    // not through the bound-FX spawn 0x5337F0, so FxSpawnHook never saw it). The entity sits 7 cm from the launcher's
+    // flat entity; its bind never asked the launcher for a joint, so NoteWristKid (binds) never learned it, its FX stayed
+    // where the flat game holds the arm and its card (6 vertices, ALPHA_LIT, 0.48 m from the weapon anchor: beyond
+    // GpuTrace's 0.35 m) was never claimed as a launcher piece. Now: every second, while a launcher is held, the entity
+    // table (GetEntityById's: game+0x327770, 0x4000 slots) is scanned for entities with a model within 0.3 m of the
+    // launcher's entity origin (not the player, the arms, the other weapon): they become wrist kids. GpuTrace asks
+    // WristKidSide for a draw whose origin matches one; FxStartHook carries an FX created on one onto the drawn launcher.
+    std::atomic<unsigned long long> g_WristKidScans{ 0 }, g_WristKidByNear{ 0 };
+    int WristOwner(const void* ent);
+    void NoteWristKid(int side, void* ent, const void* parent, int joint);
+    void ScanWristKids()
+    {
+        static ULONGLONG next = 0; const ULONGLONG now = GetTickCount64();
+        if (now < next) return;
+        next = now + 1000;
+        const uint8_t* game = *(const uint8_t* const*)(GameInfo::Base() + 0x3A72280);
+        if (!game || !Readable(game + 0x327770, 8)) return;
+        uint8_t* const* table = (uint8_t* const*)(game + 0x327770);
+        const uint8_t* skip[8] = { (const uint8_t*)BodyHide::LeftWeaponEntity(), (const uint8_t*)BodyHide::RightWeaponEntity(),
+                                   (const uint8_t*)BodyHide::LeftArmEntity(), (const uint8_t*)BodyHide::RightArmEntity(), (const uint8_t*)Game::LocalPlayer() };
+        for (int s = 0; s < 2; s++)
+        {
+            const uint8_t* we = (const uint8_t*)HandFx::WristLauncherEntity(s);
+            if (!we || !Readable(we + kEntOrigin, 12)) continue;
+            const float* wo = (const float*)(we + kEntOrigin);
+            g_WristKidScans++;
+            for (int i = 0; i < 0x4000; i++)
+            {
+                uint8_t* e = table[i];
+                if (!e || e == we || !Readable(e, 0x400)) continue;
+                bool sk = false; for (const uint8_t* x : skip) if (x && x == e) sk = true;
+                if (sk || !*(void* const*)(e + kEntModel)) continue;
+                const float* o = (const float*)(e + kEntOrigin);
+                const float d[3] = { o[0] - wo[0], o[1] - wo[1], o[2] - wo[2] };
+                if (!(Dot(d, d) < 0.3f * 0.3f)) continue;
+                if (WristOwner(e) >= 0) continue;
+                g_WristKidByNear++;
+                NoteWristKid(s, e, we, -1);
+            }
+        }
+    }
+    //! GpuTrace: the arm whose launcher the entity drawn at this world origin hangs off (a kid's entity origin within
+    //! `maxD` of it), -1 when none. Lock-free reads of the kid slots; the entities' origins read guarded.
+    int WristKidSideAt(const float w[3], float maxD)
+    {
+        for (int s = 0; s < 2; s++)
+            for (int k = 0; k < 4; k++)
+            {
+                const uint8_t* e = (const uint8_t*)g_WristKid[s][k].load(std::memory_order_relaxed);
+                if (!e || !Readable(e + kEntOrigin, 12)) continue;
+                const float* o = (const float*)(e + kEntOrigin);
+                const float d[3] = { w[0] - o[0], w[1] - o[1], w[2] - o[2] };
+                if (Dot(d, d) <= maxD * maxD) return s;
+            }
+        return -1;
+    }
     //! The arm whose worn launcher this entity is, or hangs off; -1 when neither.
     int WristOwner(const void* ent)
     {
@@ -712,9 +772,13 @@ namespace
         std::lock_guard lk(g_WristKidM);
         for (int k = 0; k < 4; k++) if (g_WristKid[side][k].load() == ent) return;
         g_WristKid[side][g_WristKidNext[side]++ & 3].store(ent);
-        LOGI("GunRay: entity {} (vt exe+{:#x}) is bound to joint {} of {} ({}): it hangs off the {} wrist launcher -- the effects placed by it go where the launcher is drawn",
-             ent, Readable(ent, 8) ? *(uintptr_t*)ent - GameInfo::Base() : 0, joint, parent, parent == HandFx::WristLauncherEntity(side) ? "the launcher" : "a piece on it",
-             side ? "right" : "left");
+        if (joint >= 0)
+            LOGI("GunRay: entity {} (vt exe+{:#x}) is bound to joint {} of {} ({}): it hangs off the {} wrist launcher -- the effects placed by it go where the launcher is drawn",
+                 ent, Readable(ent, 8) ? *(uintptr_t*)ent - GameInfo::Base() : 0, joint, parent, parent == HandFx::WristLauncherEntity(side) ? "the launcher" : "a piece on it",
+                 side ? "right" : "left");
+        else
+            LOGI("GunRay: entity {} (vt exe+{:#x}, id {:#x}) has its model within 0.3 m of the {} wrist launcher's entity {}: taken as a piece of it -- its draws and effects go where the launcher is drawn",
+                 ent, Readable(ent, 8) ? *(uintptr_t*)ent - GameInfo::Base() : 0, Readable((uint8_t*)ent + kEntId, 4) ? *(uint32_t*)((uint8_t*)ent + kEntId) : 0, side ? "right" : "left", parent);
     }
     //! A world pose, carried by the rigid pose the launcher's draws got (p' = R p + T, the axis rows turned by R).
     bool OntoWrist(int side, const float* p, const float* a, float* po, float* ao)
@@ -930,10 +994,24 @@ namespace
     std::atomic<int> g_FxBlock{ 0 };           // research: the k-th FX created in the next shot is never started
     std::atomic<void*> g_FxBlockInst{ nullptr };
     thread_local int t_ShootFxCount = 0;
+    // the entity each of the last few FX instances was created on (FxStartHook: an FX started outside the bound spawn)
+    thread_local void* t_FxMadeInst[4] = {}; thread_local uint32_t t_FxMadeEnt[4] = {}; thread_local int t_FxMadeNext = 0;
+    std::atomic<unsigned long long> g_WristFxStartsByEntity{ 0 };
     uintptr_t FxStartHook(void* world, void* inst, uintptr_t a3, uintptr_t a4, float a5)
     {
         if (inst && inst == g_FxBlockInst.load()) { g_FxBlockInst = nullptr; LOGI("GunRay: fx {} NOT started (vr gunfxblock)", inst); return 0; }
-        const FxSpawnCtx c = t_FxSpawn;
+        FxSpawnCtx c = t_FxSpawn;
+        if (!c.ent && inst && (g_Mode.load() & 32) && HandAimHook::Mode() >= 2)
+        {   // started outside the bound spawn (the launcher's idle electric effect, exe+0x500A00): the entity it was created on
+            for (int k = 0; k < 4; k++)
+                if (t_FxMadeInst[k] == inst)
+                {
+                    uint8_t* e = (uint8_t*)BodyHide::EntityById((int)t_FxMadeEnt[k]);
+                    if (const int ws = WristOwner(e); ws >= 0 && Readable(e + kEntOrigin, 48)) { c = { e, nullptr, -1, nullptr, ws }; g_WristFxStartsByEntity++; }
+                    t_FxMadeInst[k] = nullptr;
+                    break;
+                }
+        }
         if (c.ent && inst && (g_Mode.load() & 32) && Readable(inst, 0x80))
         {
             const uintptr_t base = GameInfo::Base();
@@ -970,6 +1048,7 @@ namespace
     }
     // research (`vr gunfxlog n`): every FX created after the next shot, who created it, and where it sits a frame later
     std::atomic<int> g_FxLogArm{ 0 }, g_FxLogLeft{ 0 };
+    std::atomic<bool> g_FxLogNearOnly{ false };   // (the launcher's equip: only the FX that come out near the eye -- the level's own filled the 40 before)
     struct FxSeenRec { uint8_t* inst = nullptr; int frames = 0; std::string who; };
     std::mutex g_FxLogM;
     std::vector<FxSeenRec> g_FxLogRecs;
@@ -994,6 +1073,7 @@ namespace
     void* FxCreateHook(void* world, uint32_t entId, void* decl)
     {
         void* inst = g_RealFxCreate(world, entId, decl);
+        if (inst) { t_FxMadeInst[t_FxMadeNext & 3] = inst; t_FxMadeEnt[t_FxMadeNext & 3] = entId; t_FxMadeNext++; }
         if (t_InShoot && inst)
         {
             const int k = ++t_ShootFxCount;
@@ -1037,6 +1117,17 @@ namespace
     }
     void TrackFx()
     {
+        ScanWristKids();
+        {   // the wrist launcher just equipped: the next FX created are logged (its idle effects start then)
+            static void* lastL = nullptr, * lastR = nullptr;
+            void* l = HandFx::WristLauncherEntity(0); void* r = HandFx::WristLauncherEntity(1);
+            if ((l && l != lastL) || (r && r != lastR))
+            {
+                g_FxLogLeft = 400; g_FxLogNearOnly = true;
+                LOGI("GunRay: the wrist launcher is on ({} / {}): of the next 400 FX created, those within 2.5 m of the eye are logged (GunFxLog: their name, who made them, where they sit)", l, r);
+            }
+            lastL = l; lastR = r;
+        }
         {
             std::lock_guard lk(g_FxLogM);
             for (auto it = g_FxLogRecs.begin(); it != g_FxLogRecs.end();)
@@ -1049,8 +1140,24 @@ namespace
                     const float* o = (const float*)(it->inst + 0x38); const float* a = (const float*)(it->inst + 0x44);
                     const float d[3] = { o[0] - dm[0], o[1] - dm[1], o[2] - dm[2] };
                     const float e[3] = { o[0] - eye[0], o[1] - eye[1], o[2] - eye[2] };
-                    LOGI("GunFxLog: {} | at ({:.3f},{:.3f},{:.3f}) ax0 ({:.3f},{:.3f},{:.3f}) | drawn muzzle {:.3f} m, barrel {:.1f} deg | eye {:.3f} m, view {:.1f} deg",
-                         it->who, o[0], o[1], o[2], a[0], a[1], a[2], drawn ? sqrtf(Dot(d, d)) : -1.f, drawn ? AngleDeg(a, df) : -1.f, cam ? sqrtf(Dot(e, e)) : -1.f, cam ? AngleDeg(a, cax) : -1.f);
+                    if (g_FxLogNearOnly.load() && cam && Dot(e, e) > 2.5f * 2.5f) { it = g_FxLogRecs.erase(it); continue; }
+                    // the wrist launcher (2026-11-08, the electric effect that stays by the head): how far the FX sits
+                    // from the launcher's flat pose and from where it is drawn, and where it is in the camera's frame
+                    std::string wr;
+                    for (int s = 0; s < 2; s++)
+                        if (const uint8_t* we = (const uint8_t*)HandFx::WristLauncherEntity(s); we && Readable(we + kEntOrigin, 48))
+                        {
+                            const float* wo = (const float*)(we + kEntOrigin);
+                            const float d1[3] = { o[0] - wo[0], o[1] - wo[1], o[2] - wo[2] };
+                            float dp[3], da[9]; std::string drawnPart;
+                            if (OntoWrist(s, wo, (const float*)(we + kEntAxis), dp, da))
+                            { const float d2[3] = { o[0] - dp[0], o[1] - dp[1], o[2] - dp[2] }; drawnPart = fmt::format(", from it as drawn {:.3f} m", sqrtf(Dot(d2, d2))); }
+                            wr += fmt::format(" | {} wrist launcher: from its flat pose {:.3f} m{}", s ? "right" : "left", sqrtf(Dot(d1, d1)), drawnPart);
+                        }
+                    const std::string camFrame = cam ? fmt::format(" (camera frame fwd {:.3f} left {:.3f} up {:.3f})", Dot(e, cax), Dot(e, cax + 3), Dot(e, cax + 6)) : std::string();
+                    LOGI("GunFxLog: {} | at ({:.3f},{:.3f},{:.3f}) ax0 ({:.3f},{:.3f},{:.3f}) | drawn muzzle {:.3f} m, barrel {:.1f} deg | eye {:.3f} m{}, view {:.1f} deg{}",
+                         it->who, o[0], o[1], o[2], a[0], a[1], a[2], drawn ? sqrtf(Dot(d, d)) : -1.f, drawn ? AngleDeg(a, df) : -1.f, cam ? sqrtf(Dot(e, e)) : -1.f, camFrame,
+                         cam ? AngleDeg(a, cax) : -1.f, wr);
                 }
                 else LOGI("GunFxLog: {} | gone", it->who);
                 it = g_FxLogRecs.erase(it);
@@ -1173,6 +1280,7 @@ void GunRay::SetTrack(int on) { g_Track = on; LOGI("GunRay: projectile tracking 
 void GunRay::BurstNextShot(int frames) { g_ShotBurst = frames; LOGI("GunRay: the next shot captures {} frames (DVR_gunshot{}_b)", frames, g_ShotBurstN.load() + 1); }
 //! Research (vr gunkids): which entities near the eye hold a reference to a held weapon entity -- its pointer or its
 //! spawn id -- and at which offset of the entity (or of the object one pointer away), to find how a part is parented.
+int GunRay::WristKidSide(const float worldOrg[3], float maxD) { return WristKidSideAt(worldOrg, maxD); }
 void GunRay::ProbeKids(float radius)
 {
     uint8_t* game = *(uint8_t**)(GameInfo::Base() + 0x3A72280);
@@ -1273,7 +1381,8 @@ void GunRay::ProbeAttachment(int n)
 }
 void GunRay::FreezeAfterShot(int ms) { g_FreezeMs = ms; LOGI("GunRay: the next shot freezes the game {} ms later", ms); }
 void GunRay::BlockFx(int k) { g_FxBlock = k; LOGI("GunRay: the next shot does not start its fx #{}", k); }
-void GunRay::LogFx(int n) { g_FxLogArm = n; g_JointDiag = 12; LOGI("GunRay: the next shot logs the next {} fx created", n); }
+void GunRay::LogFx(int n) { g_FxLogNearOnly = false; g_FxLogArm = n; g_JointDiag = 12; LOGI("GunRay: the next shot logs the next {} fx created", n); }
+void GunRay::LogFxNow(int n) { g_FxLogNearOnly = false; g_FxLogLeft = n; LOGI("GunRay: the next {} fx created are logged (vr fxlognow)", n); }
 void GunRay::WatchFx(int hits) { g_FxWatch = hits; LOGI("GunRay: the next muzzle fx arms a write watchpoint on its origin ({} hits)", hits); }
 void GunRay::SetSensorTolerance(float m) { if (m > 0.f && m < 2.f) g_SensorBodyTol = m; LOGI("GunRay: the aim sensor's hit on a target counts within {:.2f} m of the ray", g_SensorBodyTol.load()); }
 void GunRay::SetNoLock(int on) { g_NoLock = on; LOGI("GunRay: fire target lock {}", on ? "DROPPED" : "kept"); }
@@ -1569,6 +1678,7 @@ bool GunRay::Command(const std::string& what, std::istringstream& ss)
     else if (what == "gunkids") { float r = 1.5f; ss >> r; GunRay::ProbeKids(r); }
     else if (what == "guncull") { int m = 1; ss >> m; g_CullFix = m; LOGI("GunRay: held equipment culled {}", m ? "by its flat AND drawn pose" : "by the flat pose only (the game's)"); }
     else if (what == "gunfxlog") { int n = 30; ss >> n; GunRay::LogFx(n); }
+    else if (what == "fxlognow") { int n = 40; ss >> n; GunRay::LogFxNow(n); }
     else if (what == "gunfxwatch") { int n = 20; ss >> n; GunRay::WatchFx(n); }
     else if (what == "gunburst") { int n = 12, k = 1; ss >> n >> k; g_ShotBurstStride = k < 1 ? 1 : k; GunRay::BurstNextShot(n); }
     else if (what == "gunpix") { float x = -1.f, y = 0.5f; ss >> x >> y; if (x < 0.f) GunRay::ClearTarget(); else GunRay::Pixel(x, y); }
@@ -1590,5 +1700,6 @@ std::string GunRay::Stats()
            + " | " + HandTraceStatus()
            + fmt::format(" | wrist fx: joints carried onto the drawn launcher {} (on pieces hung off it {}), already moved by HandFx {}, no pose {}, last gap {:.3f} m; fx re-placed {}, started {}; binds of pieces left to the GPU {}; pieces L {} {} R {} {}",
                          g_WristJointMoved.load(), g_WristKidJointMoved.load(), g_WristJointByHandFx.load(), g_WristNoPose.load(), g_WristGap.load(),
-                         g_WristFxMoved.load(), g_WristFxStarts.load(), g_WristKidBinds.load(), g_WristKid[0][0].load(), g_WristKid[0][1].load(), g_WristKid[1][0].load(), g_WristKid[1][1].load());
+                         g_WristFxMoved.load(), g_WristFxStarts.load(), g_WristKidBinds.load(), g_WristKid[0][0].load(), g_WristKid[0][1].load(), g_WristKid[1][0].load(), g_WristKid[1][1].load())
+                 + fmt::format("; kids by proximity {} (scans {}), fx started on a kid / the launcher outside a spawn {}", g_WristKidByNear.load(), g_WristKidScans.load(), g_WristFxStartsByEntity.load());
 }

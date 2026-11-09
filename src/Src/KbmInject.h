@@ -8,6 +8,14 @@
 namespace KbmInject
 {
     void Tick();                 //!< call once per rendered frame (render thread)
+    //! [Performance.CPU] BackgroundInput: keys, buttons and mouse moves sent from a thread of their own, batched (1, the
+    //! default) or from the render thread, one SendInput each (0). Live.
+    void SetBackgroundInput(bool on);
+    bool BackgroundInput();
+    //! The game is about to read the keyboard / mouse (StereoSync's poll hooks): waits, at most 1.5 ms, for what was
+    //! queued to have been sent.
+    void DrainInjected();
+    std::string BackgroundInputInfo();   //!< the 60 s report line
     void SetEnabled(bool on);
     bool Enabled();
     void SetSnapAngle(float deg);          //!< 0 = smooth turning

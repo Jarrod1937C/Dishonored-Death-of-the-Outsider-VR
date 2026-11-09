@@ -69,6 +69,9 @@ namespace PassProfile
     //! own targets (forward, water, transparent, emissive, dynamic shadows, screen shadows, SSAO, DOF), never the backbuffer
     enum { kTaskNone = 0, kTaskMotion = 1, kTaskStaticShadow = 2, kTaskScene = 3 };
     int TaskClass();
+    //! The task running on this thread is the static world's forward pass (FORWARD_WORLD: lightmapped / static models,
+    //! never what the player holds) -- GpuTrace's LeanDrawHooks
+    bool StaticWorldNow();
     //! The render pass (task row) running on this thread, by name ("" outside a task): GpuTrace's sword watch
     const char* PassNow();
     void NoteDispatch(ID3D11DeviceContext* c, unsigned x, unsigned y, unsigned z, bool indirect);
