@@ -297,7 +297,7 @@ namespace
             }
             LOGI("TestAids: give{} for {}", a.kind == 7 ? "all" : fmt::format(" parts {:#x}", mask), who);
             const struct { unsigned bit; Action act; } subs[] = {
-                { TestAids::kUnlockMark | TestAids::kUnlockPowers, { 0, {} } }, { TestAids::kUnlockPowers, { 1, "all" } },
+                { TestAids::kUnlockMark, { 0, {} } }, { TestAids::kUnlockPowers, { 1, "all" } },   // DOTO: powers without the mark (Billie has none; D2 gave it with them)
                 { TestAids::kUnlockPowerUpgrades, { 3, "all" } }, { TestAids::kUnlockEquipUpgrades, { 5, "all" } },
                 { TestAids::kUnlockWeapons, { 6, "models/weapons/gun_player/" } }, { TestAids::kUnlockWeapons, { 6, "models/weapons/crossbow/crossbow_" + who + "." } },
                 // NOT the Heart: it is a story item the Outsider hands over in the Void at the start of the game, and
@@ -443,8 +443,8 @@ namespace
     }
     // Infinite health (vr hp inf): `ark_god_player 1` does not keep Corvo alive against a guard's sword in the prologue
     // (measured twice: Game Over ~35 s into a fight with it at 1). The player's arkCpntHealthEvolved keeps the current
-    // health at +0x20 and its maximum at +0x114 (both 56 on Corvo, easy, measured 2026-10-05).
-    constexpr uint32_t kHealthCpntTypeInfo = 0x3AB22D0, kHealthCurrent = 0x20, kHealthMax = 0x114;   // TODO(DOTO): +0x20 / +0x114 unverified (D2 layout)
+    // health at +0x20 and its maximum at +0x114 in D2 (both 56 on Corvo, easy, measured 2026-10-05); +0x11C in DOTO.
+    constexpr uint32_t kHealthCpntTypeInfo = 0x3AB22D0, kHealthCurrent = 0x20, kHealthMax = 0x11C;   // DOTO: max moved +8 (D2 +0x114): its init exe+0x77C7D9 copies +0x20 to +0x11C (D2 exe+0x71A5B4); current +0x20 read at exe+0x7A3FDB
     std::atomic<float> g_SetMana{ -1.f };   //!< `vr mana <value>`: set once
     std::atomic<float> g_SetHealth{ -1.f }, g_HealthLast{ -1.f }, g_HealthMaxLast{ -1.f };   //!< `vr hp <value>`: set once
     void TickHealth()
@@ -563,7 +563,6 @@ void TestAids::Tick()
         const bool playing = GpuTrace::FirstPersonDraws() > 0;
         if ((!g_AutoPowers.empty() || g_AutoAll || g_AutoMask) && playing && g_AutoTicks < 180 && ++g_AutoTicks == 180)
         {
-            if (!g_AutoPowers.empty() || g_AutoAll) g_Actions.push_back({ 0, {} });
             if (!g_AutoPowers.empty()) g_Actions.push_back({ 1, g_AutoPowers });
             if (g_AutoPowers.find("all") != std::string::npos) g_Actions.push_back({ 3, "all" });   // and every upgrade (possessing humans...)
             if (g_AutoAll) g_Actions.push_back({ 7, {} });

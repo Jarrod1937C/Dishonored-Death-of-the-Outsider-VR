@@ -39,5 +39,11 @@ namespace HandFx
     //! The entity whose bind transform (exe+0x7B3150) is running on this thread -- what a joint query made now will
     //! place -- or null outside a bind.
     void* BoundEntity();
+    //! DOTO: the wrist launcher's entity on that arm (remembered from when it was last the held item), or null.
+    void* WristLauncherEntity(int side);
+    //! DOTO: how many launcher joints this thread has had moved onto the drawn forearm so far (GunRay compares it across a
+    //! world-space joint query: the engine's world query asks the model-space one HandFx corrects, and a joint moved
+    //! there must not be carried again).
+    unsigned WristFixesOnThread();
     std::string Stats();
 }

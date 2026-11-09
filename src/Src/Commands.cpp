@@ -38,6 +38,7 @@
 #include "Settings.h"
 #include "RenderRes.h"
 #include "StereoTaa.h"
+#include "StereoFeedback.h"
 #include "StereoSync.h"
 #include "VrTweaks.h"
 #include "MetaAsw.h"
@@ -150,6 +151,10 @@ namespace
         else if (what == "carrygaze") { int m = 1; ss >> m; GrabHand::SetCarryGaze(m != 0); }
         else if (what == "grabrelease") { int m = 2; ss >> m; GrabHand::SetReleaseMode(m); }
         else if (what == "armforeign") { int m = 1; ss >> m; GpuTrace::SetArmForeign(m); }
+        else if (what == "weaponshadows") { int m = 1; ss >> m; GpuTrace::SetWeaponShadows(m != 0); }
+        else if (what == "flightcamswap") { int m = 0; ss >> m; HandAimHook::SetFlightCamSwap(m != 0); }   // Foresight double: A/B
+        else if (what == "wristrig") { int m = 1; ss >> m; GpuTrace::SetWristRig(m != 0 ? 1 : 0); }   // the wrist launcher as one rigid piece per view (A/B)
+        else if (what == "stereofeedback") { int m = 1; ss >> m; StereoFeedback::SetEnabled(m != 0); }   // Foresight A/B
         else if (what == "weapongrip")
         {   // vr weapongrip <0|1|2> | forget | forgetall
             std::string a; ss >> a;
@@ -1183,7 +1188,7 @@ namespace
               << " ctrl_org " << hs.ctrlOrg[0] << " " << hs.ctrlOrg[1] << " " << hs.ctrlOrg[2]
               << " ctrl_fwd " << hs.ctrlFwd[0] << " " << hs.ctrlFwd[1] << " " << hs.ctrlFwd[2]
               << " last_aimpoint " << hs.lastAimPoint[0] << " " << hs.lastAimPoint[1] << " " << hs.lastAimPoint[2] << "\n";
-            f << "poweraim override " << HandAimHook::AimOverride() << "/" << hs.aimOverrides << " mask " << HandAimHook::PowerAimMask() << " hand " << HandAimHook::PowerHand() << " power " << hs.powerCalls << "/" << hs.powerApplied << " throw " << hs.throwCalls << "/" << hs.throwApplied << " place " << hs.placeCalls << "/" << hs.placeApplied << " search " << hs.searchCalls << "/" << hs.searchApplied << " grapple " << hs.grappleCalls << "/" << hs.grappleApplied
+            f << "poweraim override " << HandAimHook::AimOverride() << "/" << hs.aimOverrides << " mask " << HandAimHook::PowerAimMask() << " hand " << HandAimHook::PowerHand() << " power " << hs.powerCalls << "/" << hs.powerApplied << " throw " << hs.throwCalls << "/" << hs.throwApplied << " place " << hs.placeCalls << "/" << hs.placeApplied << " search " << hs.searchCalls << "/" << hs.searchApplied << " grapple " << hs.grappleCalls << "/" << hs.grappleApplied << " flightskips " << HandAimHook::FlightSwapsSkipped() << " flightaimskips " << HandAimHook::FlightOverrideSkipped()
               << " org " << hs.powerOrg[0] << " " << hs.powerOrg[1] << " " << hs.powerOrg[2] << " fwd " << hs.powerFwd[0] << " " << hs.powerFwd[1] << " " << hs.powerFwd[2] << "\n";
             f << "poweraim_target active " << hs.powerActive << " hit " << hs.powerHit[0] << " " << hs.powerHit[1] << " " << hs.powerHit[2] << " dest " << hs.powerTarget[0] << " " << hs.powerTarget[1] << " " << hs.powerTarget[2]
               << " end " << hs.powerEnd[0] << " " << hs.powerEnd[1] << " " << hs.powerEnd[2] << "\n";

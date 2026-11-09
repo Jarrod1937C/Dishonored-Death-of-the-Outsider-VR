@@ -71,6 +71,11 @@ namespace HandAimHook
     //! power component update. Research knob; 1..16 on by default.
     void SetPowerAimMask(int mask);
     int  PowerAimMask();
+    //! DOTO: the sensors' camera swaps to the hand during Foresight's flight (`vr flightcamswap 0|1`, default 0 = skipped:
+    //! the flight's camera read the hand mid-swap every other frame -- the double image)
+    void SetFlightCamSwap(bool on);
+    unsigned long long FlightSwapsSkipped();
+    unsigned long long FlightOverrideSkipped();   //!< frames of the flight without the aim override (m_aimOrigin from the hand)
     //! 1 = after UpdateAim, the camera's m_aimOrigin/m_aimAxis hold the power hand's controller pose for the rest
     //! of the frame (what every power / player sensor aims with). 0 = leave them to the view.
     void SetAimOverride(int on);

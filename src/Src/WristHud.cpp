@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "WristHud.h"
+#include "PortCheck.h"
 #include "PassProfile.h"
 #include "GpuTrace.h"
 #include "GameInfo.h"
@@ -308,7 +309,7 @@ bool WristHud::MirrorBegin(ID3D11DeviceContext* ctx, int kind, Mirror& m)
 
 namespace
 {
-    // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with hudprobe
+    // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
     constexpr uint64_t kScaleformVs = 0x7ACC1A9A27C4D9E2ull;   // the interface's vertex shader for fills and masks (hudprobe)
     std::atomic<bool> g_DropBars{ false };
     std::atomic<int> g_BarsMode{ 1 };
@@ -331,6 +332,7 @@ bool WristHud::DropDraw(ID3D11DeviceContext* ctx, int kind)
     ID3D11VertexShader* vs = nullptr; ctx->VSGetShader(&vs, nullptr, nullptr);
     const uint64_t vh = vs ? GpuTrace::VsHashOf(vs) : 0;
     if (vs) vs->Release();
+    PortCheck::Candidate(PortCheck::kSiteHudVs, vh);   // the DOTO port: the interface's vertex shaders
     if (vh != kScaleformVs) return false;
     ID3D11PixelShader* ps = nullptr; ctx->PSGetShader(&ps, nullptr, nullptr);
     if (!ps) return false;                               // a stencil mask, not a fill

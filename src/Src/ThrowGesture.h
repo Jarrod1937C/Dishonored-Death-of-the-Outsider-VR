@@ -11,7 +11,7 @@ struct XRInputState;
 //! How the game throws (RESEARCH "Throwing"): arkCpntWeaponThrowable::Throw (exe+0x687BA0) builds the velocity from
 //! two decl constants -- m_throwSpeed (+0x29C) along the aim direction tilted up by m_throwAngle (+0x298), or the
 //! m_lowThrow* pair when looking down -- and hands it to the projectile entity with a one-line setter
-//! (exe+0x8E9C20: entity+0x34C = v) at D2 exe+0x63333C (TODO(DOTO): no such call in DOTO's Throw), right before the launch (exe+0x68E970), which for a throwable
+//! (exe+0x8E9C20: entity+0x34C = v) (DOTO: in the launch helper exe+0x691320 that Throw calls, at exe+0x691668; D2 inside Throw, exe+0x63333C), right before the launch (exe+0x68E970), which for a throwable
 //! is passed speed 1.0 and so leaves that velocity alone. Holding longer only cooks: the speed is a constant.
 //! That one call site is redirected here; for a projectile with an arkCpntGrenade the velocity becomes
 //!   gain * (hand velocity at the release) + inherit * (the player's own velocity)

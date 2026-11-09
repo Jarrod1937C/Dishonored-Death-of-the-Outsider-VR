@@ -69,7 +69,7 @@ namespace
     void DoorName(const void* ent, char* out, size_t cap)
     {
         out[0] = 0;
-        const char* s = (const char*)PtrAt(ent, 0x20);
+        const char* s = (const char*)PtrAt(ent, 0x28);   // DOTO (D2 0x20): the entity's name text
         if (!s) return;
         char tmp[48] = {};
         if (!Rd(tmp, s, sizeof tmp - 1)) return;

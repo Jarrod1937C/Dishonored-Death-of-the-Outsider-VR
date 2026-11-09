@@ -30,6 +30,8 @@ namespace PassProfile
     void SetSkipEffects(int mode);  //!< [Advanced] SkipDisabledEffects (experimental): 0 off, 1 SSAO, 2 SSAO + DOF; before Install
     void Install();                 //!< hooks only when enabled
     bool On();
+    //! The next draw-by-draw frame (ProfileRenderPasses) within `ms` (e.g. after a setting that changes the frame)
+    void DrawByDrawSoon(int ms);
     void OnPresent(IDXGISwapChain* sc);
     bool BeginSection(int s);       //!< render thread, around the mod's own work at Present (immediate context)
     void EndSection(int s);
@@ -49,6 +51,9 @@ namespace PassProfile
     void SetSkipSneakOverlay(bool on);   //!< [Display] SkipSneakOverlay, before Install
     bool SneakOverlayNow();       //!< in an eye's POSTPROC task with SkipSneakOverlay on (GpuTrace's draw hooks)
     bool SsaoTaskNow();           //!< in an eye's SSAO task with SkipDisabledEffects on (GpuTrace's DWAO skip)
+    bool SsaoAnyNow();            //!< in an eye's SSAO task (AoGtao's replacement of the game's AO draw)
+    bool PostTaskNow();           //!< in an eye's POSTPROC task (StereoFeedback; only while SetPostWatch is on)
+    void SetPostWatch(bool on);   //!< StereoFeedback: the POSTPROC tasks instrumented (PostTaskNow)
     //! DepthPassSkipRedundantCopies: an eye's main DEPTHPASS task runs on this thread, and which one (a serial)
     bool DepthCopiesNow();
     unsigned long long DepthTaskSerial();
@@ -64,6 +69,8 @@ namespace PassProfile
     //! own targets (forward, water, transparent, emissive, dynamic shadows, screen shadows, SSAO, DOF), never the backbuffer
     enum { kTaskNone = 0, kTaskMotion = 1, kTaskStaticShadow = 2, kTaskScene = 3 };
     int TaskClass();
+    //! The render pass (task row) running on this thread, by name ("" outside a task): GpuTrace's sword watch
+    const char* PassNow();
     void NoteDispatch(ID3D11DeviceContext* c, unsigned x, unsigned y, unsigned z, bool indirect);
     //! ... and the uploads / copies: what a slow task did (the hitch lines)
     void NoteMap(int type);         //!< D3D11_MAP: 1 read, 3 read-write, 4 discard, 5 no-overwrite, 2 write

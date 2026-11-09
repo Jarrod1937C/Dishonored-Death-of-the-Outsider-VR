@@ -21,6 +21,11 @@ namespace
     // texture is far smaller and CAS all but switched itself off. The headroom is the ratio min / max only (HDR: for values
     // within 0..1 that is CAS's own min(mn, 2 - mx) / mx); no clamp to the 3x3's range (v1 had one: it took away the very
     // step past the neighbours that a sharpen is). v1 showed no difference at 0 / 0.5 / 1 (2026-11-03).
+    // v3 (2026-11-08, "the sharpening outlines halos" with the game's ambient occlusion on): two limits on what it
+    // sharpens. Faint detail is left alone (a 3x3 neighbourhood whose range is under ~2% of its brightness, fading in to
+    // ~6%): the residue of the AO's dither and of the TAA's own noise, which the sharpen turned into rings round edges.
+    // And the step past the neighbours is kept, but to at most a quarter of their range: the overshoot that draws a
+    // bright or dark line beside every edge, more so where the AO darkens one side of it.
     const char* kHlsl = R"(
 cbuffer C : register(b0) { float4 g; }   // x: sharpness 0..1, y: the neighbours' distance in pixels, zw: 1 / size
 Texture2D<float4> src : register(t0);
@@ -40,9 +45,12 @@ void main(uint3 id : SV_DispatchThreadID)
     const float3 mnCross = min(min(min(d, e), min(f, b)), t), mxCross = max(max(max(d, e), max(f, b)), t);
     const float3 mnAll = min(mnCross, min(min(a, c), min(s, u))), mxAll = max(mxCross, max(max(a, c), max(s, u)));
     const float3 amp = sqrt(saturate((mnCross + mnAll) / max(mxCross + mxAll, 1e-6)));
-    const float3 wt = amp * (-1.0 / lerp(8.0, 5.0, saturate(g.x)));
+    const float3 range = mxAll - mnAll;
+    const float3 rel = range / max(mxAll, 1e-4);                      // the neighbourhood's contrast, relative
+    const float3 gate = saturate((rel - 0.02) / 0.04);                // faint detail (AO dither, noise): not sharpened
+    const float3 wt = amp * gate * (-1.0 / lerp(8.0, 5.0, saturate(g.x)));
     const float3 o = ((b + d + f + t) * wt + e) / (1.0 + 4.0 * wt);
-    const float3 q = max(o, 0.0);
+    const float3 q = max(clamp(o, mnAll - 0.25 * range, mxAll + 0.25 * range), 0.0);   // overshoot: a quarter of the range at most
     dst[uint2(id.xy)] = float4(q * q, src.Load(int3(p, 0)).a);
 }
 )";

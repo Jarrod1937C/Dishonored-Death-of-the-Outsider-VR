@@ -34,10 +34,10 @@ namespace TestAids
     constexpr uint32_t kEnhancementEnumDesc = 0x33998D8, kEnhancementArray = 0x2F8;
     //! arkCpntInventory+0x168: the game's own "infinite ammo" counter (int; > 0 = on). The script node
     //! arkKisculeNodeInfiniteAmmo increments it on one pin (exe+0x806480) and decrements it on the other (exe+0x806440).
-    constexpr uint32_t kInvInfiniteAmmo = 0x178;   // DOTO, inferred: the inventory field after it moved +0x16C -> +0x17C (exe+0x66B336); D2 0x168. TODO(DOTO): unverified
+    constexpr uint32_t kInvInfiniteAmmo = 0x178;   // DOTO (D2 0x168): arkKisculeNodeInfiniteAmmo (vtable 0x1CEA908) inc exe+0x8064AF / dec exe+0x80646F on GetComponent(entity, 0x3AB8070)+0x178
     //! arkCpntMana: current mana and the level it regenerates back to (floats). The second one drops with every cast,
     //! so it is not the maximum the bar started with.
-    constexpr uint32_t kManaCurrent = 0x20, kManaMax = 0x2C;   // TODO(DOTO): unverified (D2 layout)
+    constexpr uint32_t kManaCurrent = 0x20, kManaMax = 0x2C;   // DOTO: same as D2 (the heartbeat reads mana 100.0/100.0 in game, 2026-11-05)
     //! Equipment upgrades (the black market's): arkCpntPlayerPowerSystem+0x70 is an idList of upgrade instances of
     //! 0x28 bytes {?; info*; ...; bool owned @0x20; int variant @0x24}, count in the low 24 bits of +0x78. info+0 is the
     //! upgrade's inventory item, info+0x30 an alternative one used when info+0x38 is set and variant != 1.

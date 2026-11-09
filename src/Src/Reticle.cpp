@@ -57,10 +57,12 @@ namespace
     // 0.1 s apart at most; three within a second write the whole last second to the log, runs of like frames merged,
     // with what the aim sensor hit (at most once a second per hand, 300 in all). Flips (A -> B -> A) are counted too.
     int g_FrameEye = -1; unsigned long long g_FrameSerial = 0;   // the image being presented (Present thread)
-    enum Src { kSrcFixed, kSrcGun, kSrcPointer, kSrcPower };
-    const char* kSrcName[4] = { "fixed range", "gun", "grab pointer", "power's landing point" };
+    thread_local bool t_HandPerson = false;   // the hand ray's ring is on a person (DrawHand -> NoteRing)
+    enum Src { kSrcFixed, kSrcGun, kSrcPointer, kSrcPower, kSrcHand };
+    const char* kSrcName[5] = { "fixed range", "gun", "grab pointer", "power's landing point", "hand ray traced" };
     struct Sample { double t = 0; float len = 0, shown = 0; int src = 0; bool hit = false; int eye = -1;
-                    float sweepT = 0, sensorT = 0; bool sweepHit = false, sensorUsed = false, sensorHas = false; int sensorEnt = -1; };
+                    float sweepT = 0, sensorT = 0, sensorOff = -1.f; bool sweepHit = false, sensorUsed = false, sensorHas = false; int sensorEnt = -1;
+                    bool person = false; };
     constexpr int kHist = 512;
     struct Track { Sample s[kHist]; int n = 0; double flipT[8] = {}; int fn = 0; double jumpT[16] = {}; int jn = 0; double lastLog = -10;
                    double jumpAt = -1; float jumpFrom = 0; int jumpSign = 0; };
@@ -73,11 +75,12 @@ namespace
         const double now = NowS();
         const Sample* prev = T.n ? &T.s[(T.n - 1) % kHist] : nullptr;
         Sample cur; cur.t = now; cur.len = len; cur.shown = shown; cur.src = src; cur.hit = hit; cur.eye = g_FrameEye;
+        if (src == kSrcHand) cur.person = t_HandPerson;
         if (src == kSrcGun)
         {
             const GunRay::TraceDbg g = GunRay::LastTrace();
             cur.sweepT = g.sweepT; cur.sweepHit = g.sweepHit; cur.sensorUsed = g.sensorUsed; cur.sensorHas = g.sensorHas; cur.sensorT = g.sensorT;
-            cur.sensorEnt = g.sensorEnt;
+            cur.sensorEnt = g.sensorEnt; cur.sensorOff = g.sensorOff; cur.person = g.person;
         }
         if (prev && now - prev->t < 0.1)
         {
@@ -109,14 +112,14 @@ namespace
             while (m < T.n)
             {
                 const Sample& b = T.s[m % kHist];
-                if (b.src != a.src || b.hit != a.hit || b.sensorUsed != a.sensorUsed || fabsf(b.len - a.len) > 0.03f * std::max(a.len, 0.1f)) break;
+                if (b.src != a.src || b.hit != a.hit || b.sensorUsed != a.sensorUsed || b.person != a.person || fabsf(b.len - a.len) > 0.03f * std::max(a.len, 0.1f)) break;
                 m++;
             }
             const Sample& z = T.s[(m - 1) % kHist];
-            seq += fmt::format(" [{:.0f}ms x{} {:.2f}m (shown {:.2f}) {}{}", (a.t - now) * 1000.0, m - k, z.len, z.shown, kSrcName[a.src], a.hit ? " HIT" : "");
+            seq += fmt::format(" [{:.0f}ms x{} {:.2f}m (shown {:.2f}) {}{}{}", (a.t - now) * 1000.0, m - k, z.len, z.shown, kSrcName[a.src], a.hit ? " HIT" : "", a.person ? " A PERSON" : "");
             if (a.src == kSrcGun)
                 seq += fmt::format(" (sweep {} {:.2f}, sensor {} {:.2f}{}{})", a.sweepHit ? "hit" : "clear", a.sweepT, a.sensorHas ? "hit" : "none", a.sensorT,
-                                   a.sensorUsed ? " USED" : "", a.sensorEnt >= 0 ? fmt::format(" ent {}", a.sensorEnt) : std::string());
+                                   a.sensorUsed ? " USED" : "", a.sensorEnt >= 0 ? fmt::format(" ent {} off the ray {:.0f} cm", a.sensorEnt, a.sensorOff * 100.f) : std::string());
             seq += "]";
             if (a.sensorEnt >= 0 && ne < 3 && (ne == 0 || ents[0] != a.sensorEnt) && (ne < 2 || ents[1] != a.sensorEnt)) ents[ne++] = a.sensorEnt;
             k = m;
@@ -216,7 +219,8 @@ namespace
         // running (Far Reach's marker, the throw preview); that is worth far more than a guess at a fixed range,
         // because it accounts for geometry. Everything else gets the fixed range.
         float end[3];
-        bool engineTarget = false;
+        bool engineTarget = false, handTraced = false;
+        t_HandPerson = false;
         float pick[3];
         bool picked = false;            // the grab hand's ray is on something it can take
         const HandAimHook::Stats hs = HandAimHook::GetStats();
@@ -252,8 +256,12 @@ namespace
             st.engineTarget |= 1 << h;
         }
         else
-        {
-            const float r = g_Range.load();
+        {   // DOTO: the gun hand without a gun pose (the wrist launcher, a grenade, a power not yet cast): its ray traced
+            // against the world (GunRay::HandHit), so the ring sits on the wall it points at; the fixed range otherwise
+            // (and the people it passes through: GunRay::PersonOnRay)
+            float r = g_Range.load(); bool hit = false;
+            if (h == HandAimHook::GunHand() && GunRay::HandHit(h, r, hit, &t_HandPerson) && hit) { engineTarget = true; handTraced = true; st.engineTarget |= 1 << h; }
+            else r = g_Range.load();
             for (int i = 0; i < 3; i++) end[i] = org[i] + fwd[i] * r;
         }
 
@@ -262,7 +270,7 @@ namespace
             const float raw = sqrtf(dl3[0] * dl3[0] + dl3[1] * dl3[1] + dl3[2] * dl3[2]);
             const float shown = raw > 1e-4f ? SteadyLen(h, raw) : raw;
             if (raw > 1e-4f && shown != raw) for (int i = 0; i < 3; i++) end[i] = org[i] + dl3[i] * (shown / raw);
-            NoteRing(h, raw, shown, gun ? kSrcGun : pointer ? kSrcPointer : engineTarget ? kSrcPower : kSrcFixed, engineTarget);
+            NoteRing(h, raw, shown, gun ? kSrcGun : pointer ? kSrcPointer : handTraced ? kSrcHand : engineTarget ? kSrcPower : kSrcFixed, engineTarget);
         }
         // The ray, as a polyline. A straight world line does project to a straight screen line, but sampling it
         // lets the part that falls behind the eye drop out cleanly instead of taking the whole segment with it.

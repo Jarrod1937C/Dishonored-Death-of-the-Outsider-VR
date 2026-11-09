@@ -49,8 +49,16 @@ namespace GunRay
     //! world: props, characters) shortened it; the aim sensor's own last answer and its point; ages in ms.
     struct TraceDbg { bool valid = false, fromTrace = false, hit = false, sweepHit = false, sensorUsed = false, sensorHas = false;
                       float t = 0, sweepT = 0, sensorT = 0; float sensorPoint[3] = {}; unsigned traceAgeMs = 0, sensorAgeMs = 0;
-                      int sensorEnt = -1; };   //!< the entity the aim sensor hit (spawn id), -1 = none
+                      int sensorEnt = -1;      //!< the entity the aim sensor hit (spawn id), -1 = none
+                      float sensorOff = -1.f;      //!< how far the sensor's point lay off the gun ray (m), -1 = no hit
+                      bool person = false; float personT = -1.f; };   //!< the ray passes through a standing character (PersonOnRay) at personT
     TraceDbg LastTrace();
+    void SetSensorTolerance(float m);   //!< vr sensortol <m>: a sensor hit on a target (not the world) counts this far off the ray
+    //! DOTO: a hand with no gun pose (the wrist launcher, a grenade, a power): its controller ray traced against the
+    //! world's static collision once a frame (game thread). Distance to the hit (`hit`), else the trace's range; false
+    //! when no trace is recent.
+    bool HandHit(int hand, float& dist, bool& hit, bool* person = nullptr);
+    std::string HandTraceStatus();
 
     //! ComputeAimTarget integration (HandAimHook): what the fire should read while the engine computes the spawn.
     struct Shot

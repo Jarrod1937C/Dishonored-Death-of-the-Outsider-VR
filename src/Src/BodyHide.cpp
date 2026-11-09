@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "BodyHide.h"
+#include "PortCheck.h"
 #include "GameInfo.h"
 #include "Game.h"
 #include <set>
@@ -17,6 +18,24 @@ namespace
     std::atomic<void*> g_LeftArm{ nullptr }, g_RightArm{ nullptr }, g_LeftWeapon{ nullptr }, g_RightWeapon{ nullptr };
     std::atomic<void*> g_CarryEnt{ nullptr };     // PhysicalPickup: the item being carried (the aCarry anchor)
     std::atomic<uint32_t> g_ItemClass[2] = {};
+    std::atomic<bool> g_ItemPower[2] = {};             // the item's component class is an arkCpntPower* (RTTI)
+    //! The RTTI class name of a vtable (RVA), "" when unreadable (POD only here: __try, C2712)
+    void VtClassNameRaw(uint32_t vtRva, char (&buf)[96])
+    {
+        buf[0] = 0;
+        __try
+        {
+            const uintptr_t base = GameInfo::Base();
+            const uint8_t* col = *(const uint8_t* const*)(base + vtRva - 8);
+            if (*(const uint32_t*)col == 1)
+            {
+                const char* n = (const char*)(base + *(const uint32_t*)(col + 12) + 0x10);
+                for (int i = 0; i < 95 && n[i] >= 32 && n[i] < 127; i++) buf[i] = n[i];
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { buf[0] = 0; }
+    }
+    std::string VtClassName(uint32_t vtRva) { char buf[96] = {}; VtClassNameRaw(vtRva, buf); return std::string(buf); }
     std::atomic<void*> g_WeaponTset[2][2], g_ArmTset[2][2], g_WeaponModel[2][2];
     int g_Frame = 0;
     unsigned g_StaleModels = 0, g_PlayerChanges = 0;
@@ -38,6 +57,13 @@ namespace
     {
         return Readable(m, BodyHide::kMeshVisibilityMasks + 0x28)
             && *(const uintptr_t*)m == GameInfo::Base() + BodyHide::kSkinnedModelVtable;
+    }
+    //! the DOTO port: what a pointer field holds, with its class (PortCheck::Field), for the offsets not yet verified
+    std::string PtrField(const uint8_t* obj, uint32_t off)
+    {
+        if (!obj || !Readable(obj + off, 8)) return "unreadable";
+        void* p = *(void* const*)(obj + off);
+        return fmt::format("{} [{}]", p, PortCheck::ClassName(p));
     }
     uint8_t* ModelOf(uint8_t* entity, uint32_t off)
     {
@@ -116,6 +142,11 @@ namespace
         if (!player) return;
         Bind(g_Targets[0], ModelOf(player, BodyHide::kEntityModelA));
         Bind(g_Targets[1], ModelOf(player, BodyHide::kEntityModelB));
+        if (PortCheck::On())
+        {   // expected: arkSkinnedRenderModel at both (or empty), the equipment items' classes, item+8 an entity spawn id
+            PortCheck::Field("BodyHide player+0xF8 model A", PtrField(player, BodyHide::kEntityModelA));
+            PortCheck::Field("BodyHide player+0x378 model B (unverified)", PtrField(player, BodyHide::kEntityModelB));
+        }
         // equipment entities (weapons): follow the player's equipment component items
         {
             static void* lastL = nullptr; static void* lastR = nullptr;
@@ -124,6 +155,9 @@ namespace
             for (int a = 0; a < 2 && eq && Readable(eq + 0x78, 8); a++)
             {
                 uint8_t* item = *(uint8_t**)(eq + (a == 0 ? 0x70 : 0x68));
+                if (PortCheck::On())
+                    PortCheck::Field(a == 0 ? "BodyHide equipment+0x70 left item (unverified)" : "BodyHide equipment+0x68 right item (unverified)",
+                                     fmt::format("{} [{}] item+8 {}", (void*)item, PortCheck::ClassName(item), item && Readable(item + 8, 4) ? *(int*)(item + 8) : -1));
                 if (!item || !Readable(item + 8, 4)) continue;
                 if (Readable(item + BodyHide::kItemCpnt, 8))
                 {   // the item's own component says what it is (measured: the Heart's is arkCpntHeart)
@@ -148,12 +182,21 @@ namespace
             }
             g_LeftWeapon.store(w[0]); g_RightWeapon.store(w[1]);
             for (int a = 0; a < 2; a++)
-                if (g_ItemClass[a].exchange(cls[a]) != cls[a])
-                    LOGI("BodyHide: {} hand item component vtable exe+0x{:X} ({})", a ? "R" : "L", cls[a],
-                         cls[a] == BodyHide::kHeartCpntVtable ? "the Heart" : cls[a] == BodyHide::kTimeShiftCpntVtable ? "the Timepiece" : cls[a] == BodyHide::kThrowableCpntVtable ? "a throwable" : cls[a] == BodyHide::kPlaceableCpntVtable ? "a placeable (mine / razor)" : cls[a] ? "other" : "none");
+                if (g_ItemClass[a].load() != cls[a])
+                {
+                    const std::string cn = cls[a] ? VtClassName(cls[a]) : std::string();
+                    const bool power = cn.rfind(".?AVarkCpntPower", 0) == 0;
+                    g_ItemPower[a] = power;          // (before the class: readers check the class first)
+                    g_ItemClass[a] = cls[a];
+                    LOGI("BodyHide: {} hand item component vtable exe+0x{:X} {} ({})", a ? "R" : "L", cls[a], cn,
+                         cls[a] == BodyHide::kHeartCpntVtable ? "the Heart" : cls[a] == BodyHide::kTimeShiftCpntVtable ? "the Timepiece" : cls[a] == BodyHide::kThrowableCpntVtable ? "a throwable" : cls[a] == BodyHide::kPlaceableCpntVtable ? "a placeable (mine / razor)" : cls[a] == BodyHide::kHookMineCpntVtable ? "the hook mine (a gadget)" : cls[a] == BodyHide::kGaussGunCpntVtable ? "the wrist launcher (GaussGun)" : power ? "a power" : cls[a] ? "other" : "none");
+                }
             for (int a = 0; a < 2; a++) for (int k = 0; k < 2; k++)
             {
                 uint8_t* m = w[a] ? ModelOf((uint8_t*)w[a], k == 0 ? BodyHide::kEntityModelA : BodyHide::kWeaponModelB) : nullptr;
+                if (k == 1 && w[a] && PortCheck::On())
+                    PortCheck::Field(a ? "BodyHide right weapon+0x480 model B (unverified)" : "BodyHide left weapon+0x480 model B (unverified)",
+                                     fmt::format("weapon {} [{}]: {}", w[a], PortCheck::ClassName(w[a]), PtrField((const uint8_t*)w[a], BodyHide::kWeaponModelB)));
                 Bind(g_WTargets[a][k], m);
                 void* ts = (m && Readable(m + BodyHide::kModelTransformSet, 8)) ? *(void**)(m + BodyHide::kModelTransformSet) : nullptr;
                 g_WeaponTset[a][k].store(ts);
@@ -254,7 +297,9 @@ void* BodyHide::LeftWeaponEntity() { return g_LeftWeapon.load(); }
 uint32_t BodyHide::HeldItemClass(int side) { return g_ItemClass[side & 1].load(); }
 // The Timepiece is held like the Heart: in the palm as the equip animation puts it (aimed like a pistol, along the
 // controller, it came out at a sharp angle: its model's forward is not a barrel's)
-bool BodyHide::HoldsGadget(int side) { const uint32_t c = g_ItemClass[side & 1].load(); return c == kHeartCpntVtable || c == kThrowableCpntVtable || c == kPlaceableCpntVtable || c == kTimeShiftCpntVtable; }
+bool BodyHide::HoldsGadget(int side) { const uint32_t c = g_ItemClass[side & 1].load(); return c == kHeartCpntVtable || c == kThrowableCpntVtable || c == kPlaceableCpntVtable || c == kTimeShiftCpntVtable || c == kHookMineCpntVtable; }
+bool BodyHide::HoldsPower(int side) { return g_ItemPower[side & 1].load(); }
+bool BodyHide::HoldsWristDevice(int side) { return g_ItemClass[side & 1].load() == kGaussGunCpntVtable; }
 bool BodyHide::HoldsGun(int side) { const uint32_t c = g_ItemClass[side & 1].load(); return c == kGunCpntVtable || c == kCrossbowCpntVtable; }
 void* BodyHide::RightWeaponEntity() { return g_RightWeapon.load(); }
 BodyHide::Stats BodyHide::GetStats() { std::lock_guard lk(g_M); return g_Stats; }

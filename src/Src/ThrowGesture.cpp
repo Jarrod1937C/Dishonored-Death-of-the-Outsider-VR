@@ -12,17 +12,19 @@
 
 namespace
 {
-    // TODO(DOTO): unverified -- DOTO's Throw (exe+0x687BA0) posts messages and makes no direct call to the velocity setter
-    // exe+0x8E9C20 (Dishonored 2: exe+0x63333C); the site below is still Dishonored 2's, so the byte check fails and the
-    // throw-by-hand velocity is not installed until the new site is found.
-    constexpr uint32_t kSite = 0x63333C;            // call exe+0x8E9C20 (entity+0x34C = *rdx) inside Throw
+    // DOTO (found 2026-11-07 with PortCheck's throw probe: an arkGrenade's velocity set from exe+0x69166D, 17.2 m/s):
+    // DOTO's Throw (exe+0x687BA0) has the projectile made, aimed and launched by a helper, exe+0x691320(this, speed,
+    // angle, decl, flag), and the velocity setter exe+0x8E9C20 is called there, at exe+0x691668 (Dishonored 2: inside
+    // Throw, exe+0x63333C). rcx = the new projectile (rsi, from exe+0x6906E0), rdx = the velocity, the helper's local at
+    // rsp+0x78 (lea rdx at exe+0x6915DD); the spawn point is ComputeAimTarget's output at rsp+0x68 -- 0x10 BELOW the
+    // velocity (D2: 0x20 above) -- which the launch exe+0x68E970 then takes as its position (r8, exe+0x691746).
+    constexpr uint32_t kSite = 0x691668;            // call exe+0x8E9C20 (entity+0x34C = *rdx) in exe+0x691320 (D2 0x63333C in Throw)
     constexpr uint32_t kSetVelocity = 0x8E9C20;
-    // `lea rdx, [rsp+0x50] ; mov rcx, r14` just before it: the velocity is Throw's local at rsp+0x50, and the spawn
-    // point (ComputeAimTarget's output, then the launch's position argument) is the one at rsp+0x70 -- 0x20 further.
-    const uint8_t kSiteBytes[] = { 0x48, 0x8D, 0x54, 0x24, 0x50, 0x49, 0x8B, 0xCE, 0xE8 };
-    constexpr uint32_t kSpawnFromVel = 0x20;
+    // `movss [rsp+0x78], xmm3` (the velocity's x, the last of its three stores) just before the call
+    const uint8_t kSiteBytes[] = { 0xF3, 0x0F, 0x11, 0x5C, 0x24, 0x78, 0xE8 };
+    constexpr int32_t kSpawnFromVel = -0x10;        // (D2 +0x20)
     constexpr uint32_t kGrenadeCpntTypeInfo = 0x3A99FC0;   // arkCpntGrenade (Throw itself asks for it after the launch)
-    constexpr uint32_t kMineCpntTypeInfo = 0x39BFBA0;      // arkCpntMine  TODO(DOTO): unverified (D2 value; no aligned reference found)
+    constexpr uint32_t kMineCpntTypeInfo = 0;              // arkCpntMine: not found in DOTO (D2 0x39BFBA0 has no counterpart) -- only the log's label
     constexpr uint32_t kEntityVelocity = 0x34C;   // (D2 0x33C)
     constexpr uint32_t kEntityOrigin = 0x310;     // (D2 0x300)
 
@@ -145,19 +147,22 @@ namespace
     //! ...over the `peakWin` before `tEnd`
     bool ReleaseVelocity(const History& h, double tEnd, float out[3], float& speed) { return PeakVelocity(h, tEnd - C.peakWin, tEnd, out, speed); }
 
-    // Called from the thunk at exe+0x63333C (game thread), before the real setter runs with the same arguments.
+    // Called from the thunk at exe+0x691668 (game thread), before the real setter runs with the same arguments.
     void OnSetVelocity(void* ent, float* vel)
     {
         g_Calls++;
-        float* spawn = (float*)((uint8_t*)vel + kSpawnFromVel);
+        float* spawn = (float*)((uint8_t*)vel + kSpawnFromVel);   // (signed: below the velocity in DOTO)
         const float game[3] = { vel[0], vel[1], vel[2] };
         memcpy(g_LastGame, game, 12);
         const bool grenade = GetComponent(ent, kGrenadeCpntTypeInfo) != nullptr;
-        const bool mine = !grenade && GetComponent(ent, kMineCpntTypeInfo) != nullptr;
+        const bool mine = !grenade && kMineCpntTypeInfo && GetComponent(ent, kMineCpntTypeInfo) != nullptr;
+        // DOTO: the hook mine is thrown like a grenade (an arkGrenade entity from the same launch, 17.2 m/s, without an
+        // arkCpntGrenade; asked 2026-11-08 to throw it by hand too): known by what the left hand holds
+        const bool hookMine = !grenade && BodyHide::HeldItemClass(0) == BodyHide::kHookMineCpntVtable;
         float hand[3] = {};
         const bool haveHand = [&] { float o[3], a[9]; if (!HandAimHook::ControllerPose(0, o, a)) return false; memcpy(hand, o, 12); return true; }();
         LOGI("Throw: the game throws a {} (entity {}): v ({:.2f},{:.2f},{:.2f}) |v| {:.2f} m/s, {:.0f} deg up; spawn ({:.2f},{:.2f},{:.2f}), {:.2f} m from the left controller",
-             grenade ? "GRENADE" : mine ? "MINE" : "projectile", ent, game[0], game[1], game[2], Len(game),
+             grenade ? "GRENADE" : hookMine ? "HOOK MINE" : mine ? "MINE" : "projectile", ent, game[0], game[1], game[2], Len(game),
              asinf(fmaxf(-1.f, fminf(1.f, game[2] / fmaxf(1e-4f, Len(game))))) * 57.29578f, spawn[0], spawn[1], spawn[2],
              haveHand ? sqrtf((spawn[0] - hand[0]) * (spawn[0] - hand[0]) + (spawn[1] - hand[1]) * (spawn[1] - hand[1]) + (spawn[2] - hand[2]) * (spawn[2] - hand[2])) : -1.f);
         auto track = [&](const float* sp, const float* v)
@@ -165,7 +170,7 @@ namespace
             if (g_TrackArm.load() > 0.f) { memcpy(g_TrackSpawn, sp, 12); memcpy(g_TrackV, v, 12); g_TrackStart = 0; g_TrackEnt.store(ent); }
         };
         if (!g_On.load() || HandAimHook::Mode() < 2) { track(spawn, game); return; }
-        if (!grenade) { g_NotGrenade++; track(spawn, game); return; }   // mines and razors: the game's placement
+        if (!grenade && !hookMine) { g_NotGrenade++; track(spawn, game); return; }   // mines and razors: the game's placement
         Pending p;
         { std::lock_guard lk(g_M); p = g_Pending; g_Pending.valid = false; }
         const double now = QpcSec();
@@ -319,7 +324,7 @@ namespace
 
     // ---- the throw cycle cut short (C.cut; see Cfg) ----
     constexpr uint32_t kThrowState = 0x8B3740, kThrowStateVtable = 0x1D04AE8, kStateStopAnim = 0x8BD300;
-    const uint8_t kThrowStateBytes[] = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x56, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC, 0x38 };
+    const uint8_t kThrowStateBytes[] = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x56, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC, 0x58 };   // DOTO: a 0x58 frame (D2 0x38); the phase still at +0x4C, the animation at +0x24 (checked 2026-11-07)
     using FnState = uintptr_t (*)(void*);
     FnState g_RealThrowState = nullptr;
     void* g_PhaseState = nullptr; double g_Phase3At = -10, g_Phase4At = -10;   // game thread
@@ -440,9 +445,9 @@ bool ThrowGesture::Install()
     LOGI("ThrowGesture: the throw's velocity (exe+0x{:X}) redirected: grenades leave with the hand's velocity", kSite);
     {   // the real throw (C.instant): Throw hooked, to drop the animation's launch after the mod's own at the release
         const uint8_t* t = (const uint8_t*)(base + kThrow);
-        // TODO(DOTO): unverified -- Dishonored 2's prologue; DOTO's Throw (exe+0x687BA0) starts 40 53 48 83 EC 70 and is
-        // restructured (launch by message), so this hook stays off until it is re-measured.
-        static const uint8_t kThrowBytes[] = { 0x40, 0x55, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x68 };
+        // DOTO's Throw (exe+0x687BA0): the same checks as Dishonored 2's ([this+0x180]+0x38 & 8, then a virtual), its
+        // launch moved into exe+0x691320; its prologue: push rbx; sub rsp, 0x70; mov rax, [rcx+0x180]
+        static const uint8_t kThrowBytes[] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x70, 0x48, 0x8B };
         static const uint8_t kPostBytes[] = { 0x48, 0x83, 0xEC, 0x28, 0x45, 0x8B, 0xC8, 0x48 };
         if ((t[0] != 0xE9 && memcmp(t, kThrowBytes, sizeof kThrowBytes)) || memcmp((const void*)(base + kMsgPostEmpty), kPostBytes, sizeof kPostBytes))
             LOGI("ThrowGesture: arkCpntWeaponThrowable::Throw / the message post are not what they were measured to be: grenades keep the game's throw timing");

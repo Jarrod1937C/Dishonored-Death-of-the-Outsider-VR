@@ -60,6 +60,7 @@ set(MOD_SOURCES
     Src/Main.cpp
     Src/Log.cpp        Src/Log.h
     Src/GameInfo.cpp   Src/GameInfo.h
+    Src/PortCheck.cpp  Src/PortCheck.h  Src/PortCheckTable.inc
     Src/CrashLog.cpp   Src/CrashLog.h
     Src/Watchdog.cpp   Src/Watchdog.h
     Src/CVars.cpp      Src/CVars.h
@@ -69,6 +70,8 @@ set(MOD_SOURCES
     Src/WristHud.cpp   Src/WristHud.h
     Src/StereoTaa.cpp  Src/StereoTaa.h
     Src/TaaSharpen.cpp Src/TaaSharpen.h
+    Src/StereoFeedback.cpp Src/StereoFeedback.h
+    Src/AoGtao.cpp     Src/AoGtao.h
     Src/StereoSync.cpp Src/StereoSync.h
     Src/MetaAsw.cpp Src/MetaAsw.h
     Src/ScreenMode.cpp Src/ScreenMode.h

@@ -84,6 +84,37 @@ namespace
         return -1;
     }
     bool IsEquipment(void* ent) { return ent && (ent == BodyHide::LeftWeaponEntity() || ent == BodyHide::RightWeaponEntity()); }
+    // DOTO, 2026-11-08 (the launcher off the arm with a grenade / mine / power in the hand, its ammunition cartridge 25 cm
+    // beside it with the launcher held): MOVED TWICE. HandFx moved these entities onto the drawn forearm through their
+    // bind -- the launcher's entity, bound to forearm joint 65 and no longer "equipment" once something else is in the
+    // hand ("bind other ... joint 65 ... corrected 1695 of 2810, moved 0.23 m"), and the cartridge, bound to a joint of
+    // the launcher's model ("wrist launcher joint asked in a bind -> moved 0.26 m") -- and then GpuTrace moved their
+    // DRAWS from the forearm onto the drawn forearm again. Whether HandFx found an arm frame (it did 6 times in 10) decided
+    // where each frame put them. Entities whose draws GpuTrace moves keep the animated pose here: the launcher entity
+    // (remembered while it is held; or an unequipped equipment-class entity bound on the forearm) and whatever hangs off
+    // the launcher's model. Effects that ask the launcher's joints directly (its lightning) are still corrected.
+    constexpr uintptr_t kEquipEntVt = 0x1D0DD88;   // the class of the player's equipment entities (the launcher's)
+    std::atomic<void*> g_LauncherEnt[2] = {};
+    std::atomic<unsigned long long> g_WristBindSkipped{ 0 }, g_ArmLauncherSkipped{ 0 }, g_WristDirect{ 0 }, g_WristDirectNone{ 0 };
+    std::atomic<int> g_SkipLogLeft{ 24 };
+    thread_local unsigned t_WristFixes = 0;
+    void NoteLauncher()
+    {
+        for (int s = 0; s < 2; s++)
+            if (BodyHide::HoldsWristDevice(s))
+            {
+                void* e = s ? BodyHide::RightWeaponEntity() : BodyHide::LeftWeaponEntity();
+                if (e && g_LauncherEnt[s].exchange(e) != e) LOGI("HandFx: the wrist launcher's entity (side {}) is {}: its binds keep the animated pose (GpuTrace moves its draws)", s, e);
+            }
+    }
+    //! The bound entity is the worn launcher (its draws are moved by GpuTrace). seg = the arm segment the joint is on.
+    bool IsWornLauncher(void* ent, int seg)
+    {
+        if (!ent) return false;
+        if (ent == g_LauncherEnt[0].load() || ent == g_LauncherEnt[1].load()) return true;
+        if (seg != 2 /*forearm*/ || IsEquipment(ent) || !Readable(ent, 8)) return false;
+        return *(uintptr_t*)ent - GameInfo::Base() == kEquipEntVt;
+    }
     // 3x4 rows (r0 t0)(r1 t1)(r2 t2): p' = R p + t
     void RtFromJoint(const float pos[3], const float axis[9], float o[12])
     {   // engine axis rows are the joint's basis vectors in model space -> they are the COLUMNS of R
@@ -177,9 +208,57 @@ namespace
         void* model = *(void**)((uint8_t*)obj + HandFx::kObjModel);
         if (!model) return -1;
         for (int s = 0; s < 2; s++)
-            if (BodyHide::HeldItemClass(s) == BodyHide::kTimeShiftCpntVtable)
+            if (BodyHide::HeldItemClass(s) == BodyHide::kTimeShiftCpntVtable || BodyHide::HoldsWristDevice(s))
                 for (int k = 0; k < 2; k++) if (model == BodyHide::WeaponModel(s, k)) return s;
         return -1;
+    }
+    //! DOTO: a joint of Billie's wrist launcher (and what hangs off it: the shock attachment's lightning, reported
+    //! 2026-11-08 off to the left of the view and following the head -- where the flat game's arm holds the launcher).
+    //! The GPU draws the launcher on the drawn forearm (GpuTrace's forearm delta at its position); the joint gets the same
+    //! delta: p' = M^-1 * D * M * p, M the model's transform now.
+    bool CorrectWristItem(void* obj, int side, float* outPos, float* outAxis)
+    {
+        g_ItemCalls++;
+        if (g_Mode.load() < 2 || (t_InBind && IsEquipment(t_BindEnt))) return false;
+        if (t_InBind)
+        {   // an entity hung off the launcher (its ammunition): its draws are moved with the launcher's on the GPU
+            g_WristBindSkipped++;
+            if (g_SkipLogLeft.load() > 0 && g_SkipLogLeft.fetch_sub(1) > 0)
+                LOGI("HandFx: wrist launcher (side {}) joint asked in the bind of entity {} (vt exe+0x{:X}): left as animated -- its draws go with the launcher's",
+                     side, t_BindEnt, t_BindEnt && Readable(t_BindEnt, 8) ? *(uintptr_t*)t_BindEnt - GameInfo::Base() : 0);
+            return false;
+        }
+        uint8_t* model = *(uint8_t**)((uint8_t*)obj + HandFx::kObjModel);
+        if (!Readable(model + HandFx::kModelOrigin, 48)) return false;
+        const float* mo = (const float*)(model + HandFx::kModelOrigin); const float* ma = (const float*)(model + HandFx::kModelAxis);
+        float w[3];
+        for (int i = 0; i < 3; i++) w[i] = mo[i] + outPos[0] * ma[0 * 3 + i] + outPos[1] * ma[1 * 3 + i] + outPos[2] * ma[2 * 3 + i];
+        float R[9], T[3];
+        // the very pose the launcher's draws got (one rigid piece: its lightning stays on it), else the forearm here
+        if (!GpuTrace::WristDeviceDelta(side, R, T) && !GpuTrace::ForearmDelta(side, w, R, T)) { g_WristDirectNone++; return false; }
+        g_WristDirect++;
+        float w2[3];
+        for (int i = 0; i < 3; i++) w2[i] = R[i * 3] * w[0] + R[i * 3 + 1] * w[1] + R[i * 3 + 2] * w[2] + T[i];
+        const float d[3] = { w2[0] - mo[0], w2[1] - mo[1], w2[2] - mo[2] };
+        float p[3], r[9];
+        for (int k = 0; k < 3; k++) p[k] = ma[k * 3] * d[0] + ma[k * 3 + 1] * d[1] + ma[k * 3 + 2] * d[2];
+        for (int i = 0; i < 3; i++)
+        {   // the joint's axis row i: model -> world (by ma), turned by R, back into the model (by ma)
+            float rw[3], rr[3];
+            for (int c = 0; c < 3; c++) rw[c] = outAxis[i * 3] * ma[c] + outAxis[i * 3 + 1] * ma[3 + c] + outAxis[i * 3 + 2] * ma[6 + c];
+            for (int c = 0; c < 3; c++) rr[c] = R[c * 3] * rw[0] + R[c * 3 + 1] * rw[1] + R[c * 3 + 2] * rw[2];
+            for (int k = 0; k < 3; k++) r[i * 3 + k] = rr[0] * ma[k * 3] + rr[1] * ma[k * 3 + 1] + rr[2] * ma[k * 3 + 2];
+        }
+        for (float v : p) if (!std::isfinite(v)) return false;
+        const float moved = sqrtf((w2[0] - w[0]) * (w2[0] - w[0]) + (w2[1] - w[1]) * (w2[1] - w[1]) + (w2[2] - w[2]) * (w2[2] - w[2]));
+        static std::atomic<int> logged{ 0 };
+        if (logged.fetch_add(1) < 12)
+            LOGI("HandFx: wrist launcher (side {}) joint asked {} -> moved {:.3f} m onto the drawn forearm (bound entity {} vt exe+0x{:X})", side,
+                 t_InBind ? "in a bind" : "directly", moved, t_InBind ? t_BindEnt : nullptr,
+                 t_InBind && t_BindEnt && Readable(t_BindEnt, 8) ? *(uintptr_t*)t_BindEnt - GameInfo::Base() : 0);
+        memcpy(outPos, p, 12); memcpy(outAxis, r, 36);
+        g_ItemCorrected++; t_WristFixes++;
+        return true;
     }
     //! A joint of a held item's model, asked for by something hung off it (an effect, a light): the GPU draws the item at
     //! the hand (GpuTrace::WeaponTargetPose) while the engine keeps it where the animation holds it, so whatever the
@@ -226,7 +305,7 @@ namespace
         g_Calls++;
         const int mode = g_Mode.load();
         if (!mode || !outPos || !outAxis) return false;
-        if (const int is = ItemSide(obj); is >= 0) return CorrectItem(obj, is, outPos, outAxis);
+        if (const int is = ItemSide(obj); is >= 0) return BodyHide::HoldsWristDevice(is) ? CorrectWristItem(obj, is, outPos, outAxis) : CorrectItem(obj, is, outPos, outAxis);
         const int side = ArmSide(obj);
         if (side < 0) return false;
         g_ArmCalls++;
@@ -237,7 +316,16 @@ namespace
         if (!have) g_NoFrame++;
         // Mode 2 leaves the player's equipment entities where the animation hangs them: GpuTrace identifies a
         // weapon's draws by that entity's real position (moving it took a pistol from 26 draws to 5).
-        const bool apply = have && (mode >= 3 || (mode == 2 && !(t_InBind && IsEquipment(t_BindEnt))));
+        NoteLauncher();
+        const bool launcherBind = have && t_InBind && IsWornLauncher(t_BindEnt, seg);
+        if (launcherBind)
+        {
+            g_ArmLauncherSkipped++;
+            if (g_SkipLogLeft.load() > 0 && g_SkipLogLeft.fetch_sub(1) > 0)
+                LOGI("HandFx: arm side {} joint {} (segment {}) asked in the bind of the worn launcher {}: left as animated (it would have moved {:.3f} m) -- its draws are moved by GpuTrace",
+                     side, joint, seg, t_BindEnt, sqrtf((pos[0] - outPos[0]) * (pos[0] - outPos[0]) + (pos[1] - outPos[1]) * (pos[1] - outPos[1]) + (pos[2] - outPos[2]) * (pos[2] - outPos[2])));
+        }
+        const bool apply = have && !launcherBind && (mode >= 3 || (mode == 2 && !(t_InBind && IsEquipment(t_BindEnt))));
         if (apply) g_Corrected++;
         if (g_Research.load()) Research(fn, side, joint, obj, outPos, outAxis, pos, apply, have ? seg : 0);
         if (apply) { memcpy(outPos, pos, 12); memcpy(outAxis, axis, 36); }
@@ -327,9 +415,12 @@ void HandFx::LogReport()
     g_Seen.clear(); g_Check[0] = Check(); g_Check[1] = Check();
 }
 void* HandFx::BoundEntity() { return t_InBind ? t_BindEnt : nullptr; }
+void* HandFx::WristLauncherEntity(int side) { return g_LauncherEnt[side & 1].load(); }
+unsigned HandFx::WristFixesOnThread() { return t_WristFixes; }
 void HandFx::ProbeEntity(void* entity, int n) { g_ProbeLeft = n; g_ProbeEnt = entity; LOGI("HandFx: probing {} binds of entity {}", n, entity); }
 std::string HandFx::Stats()
 {
-    return fmt::format("mode {} calls {} arm {} corrected {} noframe {} item {} itemcorrected {}", g_Mode.load(), g_Calls.load(), g_ArmCalls.load(), g_Corrected.load(), g_NoFrame.load(),
-                       g_ItemCalls.load(), g_ItemCorrected.load());
+    return fmt::format("mode {} calls {} arm {} corrected {} noframe {} item {} itemcorrected {} | wrist launcher: binds on it left animated {}, its own bind on the forearm left animated {}, direct joint queries corrected {} (no pose {}), entity L {} R {}",
+                       g_Mode.load(), g_Calls.load(), g_ArmCalls.load(), g_Corrected.load(), g_NoFrame.load(),
+                       g_ItemCalls.load(), g_ItemCorrected.load(), g_WristBindSkipped.load(), g_ArmLauncherSkipped.load(), g_WristDirect.load(), g_WristDirectNone.load(), g_LauncherEnt[0].load(), g_LauncherEnt[1].load());
 }

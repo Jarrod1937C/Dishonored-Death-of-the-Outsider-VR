@@ -86,6 +86,9 @@ namespace
     std::atomic<bool> g_SneakFx{ false };
     thread_local bool t_PostFx = false;
     thread_local bool t_SsaoTask = false;          // in an eye's SSAO task with SkipDisabledEffects on (GpuTrace: the DWAO skip)
+    thread_local bool t_SsaoAny = false;           // in an eye's SSAO task, whatever is on (AoGtao: the AO draw replaced)
+    thread_local bool t_PostAny = false;           // in an eye's POSTPROC task (StereoFeedback)
+    std::atomic<bool> g_PostWatch{ false };        // StereoFeedback: the POSTPROC tasks instrumented
     thread_local unsigned long long t_DepthSerial = 0;   // which depth task (GpuTrace's copy tracking starts over with each)
     std::atomic<unsigned long long> g_DepthSerial{ 0 };
     int g_RowDepth = -1;                          // DEPTHPASS
@@ -953,9 +956,11 @@ namespace
         const bool foveated = fovRow && Foveation::Begin(c, view, kind == kRight ? 1 : 0);
         // SkipEmptyOutlines / StereoExposureReuse (PostShare): GpuTrace's draw / dispatch hooks act inside these tasks
         const bool shared = c && mainView && ((row == g_RowEmissive && PostShare::OutlinesOn()) || (row == g_RowPost && PostShare::ExposureOn()));
-        const bool savedPostFx = t_PostFx, savedSsao = t_SsaoTask;
+        const bool savedPostFx = t_PostFx, savedSsao = t_SsaoTask, savedSsaoAny = t_SsaoAny, savedPostAny = t_PostAny;
+        t_PostAny = c && mainView && row == g_RowPost;
         t_PostFx = c && mainView && row == g_RowPost && g_SneakFx.load(std::memory_order_relaxed);
         t_SsaoTask = c && mainView && row == g_RowSsao && g_SkipEffects.load(std::memory_order_relaxed);
+        t_SsaoAny = c && mainView && row == g_RowSsao;
         if (shared) PostShare::Enter(c, row == g_RowEmissive ? 1 : 2, eye);
         const Acc saved = t_Acc;
         t_Acc = Acc{}; t_Acc.on = prof;
@@ -999,7 +1004,7 @@ namespace
         t_SssCtx = savedSss; t_SssView = savedSssView; t_SssEye = savedSssEye;
         t_CharTask = savedCharTask; t_CharEye = savedCharEye;
         t_DepthOnly = savedDepthOnly; t_DepthCopies = savedDepthCopies; t_DepthSerial = savedDepthSerial;
-        t_PostFx = savedPostFx; t_SsaoTask = savedSsao;
+        t_PostFx = savedPostFx; t_SsaoTask = savedSsao; t_SsaoAny = savedSsaoAny; t_PostAny = savedPostAny;
         if (c && mainView && row == g_RowScreenShadows && g_SssHook.load(std::memory_order_relaxed)) ScreenShadows::AfterMask(c, view, eye);
         if (slot >= 0)
         {
@@ -1028,7 +1033,7 @@ namespace
         const bool fog = g_FogHook.load(std::memory_order_relaxed), fov = Foveation::Wanted(), eff = g_SkipEffects.load(std::memory_order_relaxed);
         const bool mask = g_MaskHook.load(std::memory_order_relaxed) || g_DepthOnly.load(std::memory_order_relaxed) || g_DepthCopies.load(std::memory_order_relaxed);
         const bool sss = g_SssHook.load(std::memory_order_relaxed), chars = g_CharHook.load(std::memory_order_relaxed);
-        const bool share = PostShare::OutlinesOn() || PostShare::ExposureOn() || g_SneakFx.load(std::memory_order_relaxed);
+        const bool share = PostShare::OutlinesOn() || PostShare::ExposureOn() || g_SneakFx.load(std::memory_order_relaxed) || g_PostWatch.load(std::memory_order_relaxed);
         if (!task) return real(task);
         uintptr_t* slot = (uintptr_t*)((uint8_t*)task + 0xD8);
         const uintptr_t fn = (uintptr_t)ReadPtr(slot);
@@ -1408,6 +1413,10 @@ namespace
             // research (2026-11-03): what the SSAO and POSTPROC passes' shaders do -- whether their leftover work in VR
             // (AO off, camera motion blur off) can be skipped, and what the game's AO costs against a cheaper one
             if (o.row == g_RowSsao || o.row == g_RowPost) GpuTrace::LogShaderCode(o.dispatch ? o.cs : o.psPtr);
+            if (o.row == g_RowSsao)      // DOTO (2026-11-08, "slight halos, several layers" with AmbientOcclusion = 1): where the AO goes
+                LOGI("PassProfile:     SSAO #{} reads {} ({}x{} {}); writes target {} (read by: {}; drawn into by: {}); depth {} ({}x{} {}; read by: {}; tested into by: {})",
+                     o.idx, o.srcRes, o.srcW, o.srcH, Fmt(o.srcFmt), o.rtvRes, o.rtvRes ? ReadersOf(o.rtvRes) : std::string("-"), o.rtvRes ? ReadersOf(o.rtvRes, true) : std::string("-"),
+                     o.dsvRes, o.dsW, o.dsH, Fmt(o.dsFmt), o.dsvRes ? ReadersOf(o.dsvRes) : std::string("-"), o.dsvRes ? ReadersOf(o.dsvRes, true) : std::string("-"));
             if (o.row == g_RowFogPass)   // where the game's fog goes: which passes read what the FOG pass wrote
                 LOGI("PassProfile:     FOG #{} reads {} ({}x{} {}); writes target {} (read by: {}; drawn into by: {}); depth {} ({}x{} {}; read by: {}; tested into by: {})",
                      o.idx, o.srcRes, o.srcW, o.srcH, Fmt(o.srcFmt), o.rtvRes, o.rtvRes ? ReadersOf(o.rtvRes) : std::string("-"), o.rtvRes ? ReadersOf(o.rtvRes, true) : std::string("-"),
@@ -1553,6 +1562,12 @@ void PassProfile::SetSkipEffects(int mode)
                         mode >= 2 ? "the SSAO and DOF passes'" : "the SSAO pass's", mode >= 2 ? "those effects are" : "it is");
 }
 
+void PassProfile::DrawByDrawSoon(int ms)
+{   // (main thread, like OnPresent) the next draw-by-draw frame in `ms` at the latest
+    const ULONGLONG at = GetTickCount64() + (ULONGLONG)ms;
+    if (!g_NextDescAt || g_NextDescAt > at) g_NextDescAt = at;
+    LOGI("PassProfile: a draw-by-draw frame in {:.0f} s", ms / 1000.0);
+}
 bool PassProfile::On() { return g_On.load(std::memory_order_relaxed); }
 int PassProfile::TaskClass() { return t_Class; }
 
@@ -1573,6 +1588,9 @@ void PassProfile::SetSkipSneakOverlay(bool on)
 }
 bool PassProfile::SneakOverlayNow() { return t_PostFx; }
 bool PassProfile::SsaoTaskNow() { return t_SsaoTask; }
+bool PassProfile::SsaoAnyNow() { return t_SsaoAny; }
+bool PassProfile::PostTaskNow() { return t_PostAny; }
+void PassProfile::SetPostWatch(bool on) { g_PostWatch = on; }
 
 void PassProfile::SetDepthOnly(bool on)
 {
@@ -1580,6 +1598,7 @@ void PassProfile::SetDepthOnly(bool on)
     if (on) LOGI("PassProfile: DepthPassDepthOnly (experimental): the eyes' depth pass draws its main shader (48f2037fd43d86c8) depth-only: no pixel shader, no RG16F target -- except while the game's TAA runs, which reads that target as its motion vectors");
 }
 int PassProfile::CharEye() { return t_CharEye; }
+const char* PassProfile::PassNow() { return t_Pass >= 0 && t_Pass < kRows ? RowName(t_Pass) : ""; }
 
 void PassProfile::NoteDraw(ID3D11DeviceContext* c, unsigned elements, unsigned instances, bool indirect, unsigned start, int base)
 {

@@ -218,6 +218,13 @@ namespace GpuTrace
     //! and not a second, independently computed one, or the flash drifts off the barrel the moment the grip is
     //! trimmed with gputrim/gpugrip.
     bool WeaponTargetPose(int hand, float org[3], float axis[9]);
+    //! DOTO: the world delta the drawn forearm of `side` has at world point `w` now (what its wrist launcher's draws get):
+    //! x -> r * x + t, r row-major. False when the arm is not being drawn. For effects hung off the launcher (HandFx).
+    bool ForearmDelta(int side, const float w[3], float r[9], float t[3]);
+    //! DOTO: the one rigid world delta the wrist launcher's draws got in the latest view, carried with the body to now
+    //! (for its effects, HandFx). False under vr wristrig 0 or before any.
+    bool WristDeviceDelta(int side, float r[9], float t[3]);
+    void SetWristRig(int on);   //!< vr wristrig 1|0: the wrist launcher as one rigid piece per view (default) | each draw at its own origin
     //! WeaponTargetPose before Collision pushed the hand out of what it touches: where the real controller holds it
     //! (SwordContact strikes with this blade, so a blade stopped at a body still strikes it).
     bool WeaponTargetPoseRaw(int hand, float org[3], float axis[9]);
@@ -314,6 +321,7 @@ namespace GpuTrace
     //! (cb_modeldepthhack 5) so they always win against the world; 1 = undone on the player's own draws (the hands
     //! sort by their real distance), 0 = the game's.
     void SetHandDepth(bool real);
+    void SetWeaponShadows(bool on);   //!< vr weaponshadows / [Display.Picture] WeaponShadows: the held weapon drawn into the shadow maps
     std::string HandRestStats();
     std::string SixDofStats();
 

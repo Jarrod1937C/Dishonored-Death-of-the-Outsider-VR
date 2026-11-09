@@ -20,6 +20,7 @@
 #include "TestAids.h"
 #include "WeaponPose.h"
 #include "GunRay.h"
+#include "PlayerState.h"
 #include <detours/detours.h>
 #include <cmath>
 
@@ -177,6 +178,16 @@ namespace
     //! and a held object hung off that camera jumped 1.2 m a step. Two swaps on two threads also saved each other's
     //! hand pose as "the real camera". Recursive: a hooked call may run inside another on the same thread.
     std::recursive_mutex g_SwapMx;
+    // DOTO, 2026-11-08 (Foresight drawn double, "every other frame pair flips between two positions"): the flight
+    // trace showed the left eye's view origin alternating, one simulated frame in two, between two points 0.39 m apart
+    // with the forward unchanged -- the second 0.24 m forward, 0.12 m left and 0.28 m down of the first: where the LEFT
+    // CONTROLLER is (Foresight is held in the left hand). The throw-preview and placement sensors' swaps (mask 2 and 64,
+    // every frame, on the job threads) put the controller pose into the camera's eye and the player's view origin while
+    // they run; the flight's own camera, which is not drawn through the shake / renderView hooks that wait for a swap,
+    // read the camera mid-swap and flew from the hand every other frame. In the flight nothing is aimed from the hand:
+    // no swap while Foresight's `Flying` runs (`vr flightcamswap 1` = swap as before, for an A/B).
+    std::atomic<bool> g_SwapInFlight{ false };
+    std::atomic<unsigned long long> g_FlightSwapsSkipped{ 0 }, g_FlightOverrideSkipped{ 0 };
     struct CamSwap
     {
         uint8_t* cam = nullptr; uint8_t* pl = nullptr; uint8_t* ac = nullptr;
@@ -189,6 +200,11 @@ namespace
         void Apply(int hand, const float* o, const float* a)
         {
             lk.lock();
+            if (!g_SwapInFlight.load() && PlayerState::Running("Flying"))
+            {
+                if (g_FlightSwapsSkipped.fetch_add(1) == 0) LOGI("HandAimHook: Foresight's flight: the sensors' camera swaps to the hand are skipped while it runs");
+                return;
+            }
             cam = (uint8_t*)g_Cam.load(); ac = (uint8_t*)g_AimCpnt.load(); pl = (uint8_t*)Game::LocalPlayer();
             if (!Readable(cam + HandAimHook::kCamAxis, 36)) cam = nullptr;
             if (ac && !Readable(ac + HandAimHook::kAimCpntPos, 12)) ac = nullptr;
@@ -234,12 +250,36 @@ namespace
     {
         void* r = g_RealUpdateAim(self, b, c, d);
         g_Cam.store(self);
+        // DOTO, 2026-11-08 (Foresight still double with the camera swaps skipped; the user: moving the LEFT controller
+        // moves the second image): the other place the left hand's pose goes into the camera every frame is this
+        // override of m_aimOrigin / m_aimAxis -- the flight's camera reads them. No override while `Flying` runs
+        // (`vr flightcamswap 1` brings both back for an A/B), and the first 120 ticks of each flight log the camera's
+        // eye and aim as the game wrote them and what the override would have written.
+        const bool flying = !g_SwapInFlight.load() && PlayerState::Running("Flying");
+        {
+            static bool wasFlying = false; static int left = 0;
+            if (flying && !wasFlying) left = 120;
+            wasFlying = flying;
+            if (flying && left > 0)
+            {
+                left--;
+                uint8_t* o = (uint8_t*)self; float org[3] = {}, axis[9] = {};
+                const bool have = ActivePoseFor(g_PowerHand.load(), org, axis);
+                if (Readable(o + HandAimHook::kAimAxis, 36) && Readable(o + HandAimHook::kCamAxis, 36))
+                {
+                    const float* e = (const float*)(o + HandAimHook::kCamOrigin); const float* ao = (const float*)(o + HandAimHook::kAimOrigin);
+                    LOGI("HandAimHook: flight tick {}: camera eye ({:.3f},{:.3f},{:.3f}) aim origin ({:.3f},{:.3f},{:.3f}) | the hand's pose the override would write ({:.3f},{:.3f},{:.3f}){} -- skipped",
+                         g_FlightOverrideSkipped.load(), e[0], e[1], e[2], ao[0], ao[1], ao[2], org[0], org[1], org[2], have ? "" : " (none)");
+                }
+            }
+            if (flying) g_FlightOverrideSkipped++;
+        }
         // Powers aim with the camera's m_aimOrigin/m_aimAxis, which UpdateAim has just written from the view
         // angles. Thirty call sites in the exe read them (every player sensor, the power components, the
         // throwables' aim), and none of them is a weapon or the renderer -- so rewriting them here, once per
         // frame, makes every power target where the controller points without hooking each one. Measured first
         // on Far Reach: the sensor copies exactly these two fields into its ray (exe+0x3F5738..0x3F5809).
-        if (g_AimOverride.load() && g_Mode.load() >= 2)
+        if (g_AimOverride.load() && g_Mode.load() >= 2 && !flying)
         {
             uint8_t* o = (uint8_t*)self; float org[3], axis[9];
             if (Readable(o + HandAimHook::kAimAxis, 36) && ActivePoseFor(g_PowerHand.load(), org, axis))
@@ -410,9 +450,12 @@ namespace
         return r;
     }
 
-    // ComputeAimTarget(this, out spawnPos, viewAxis, aimPoint, flags, flags2): while it runs, the camera eye/axis, the
+    // ComputeAimTarget(this, out spawnPos, viewAxis, aimPoint, flags, flags2, bool* out): while it runs, the camera eye/axis, the
     // player's first-person origin/axis (muzzle placement) and the aim component read the controller pose.
-    using FnTarget = bool (*)(void*, float*, const float*, const float*, uint64_t, uint64_t);
+    // DOTO: SEVEN arguments -- the 7th a bool* the function sets (exe+0x68E151: mov byte [rax],1; the caller exe+0x3C20C0
+    // passes [rsp+0x30]). With Dishonored 2's six the hook handed the original stack garbage there: a crash on a shot
+    // (2026-11-07, writing to 0xFFFFFFFFFFFFFFFF).
+    using FnTarget = bool (*)(void*, float*, const float*, const float*, uint64_t, uint64_t, bool*);
     FnTarget g_RealTarget = nullptr;
     //! For one engine call, an entity's world transform (+0x310 origin / +0x31C axis; D2 +0x300 / +0x30C) reads as another pose.
     struct EntSwap
@@ -426,7 +469,7 @@ namespace
         }
         ~EntSwap() { if (e) { memcpy(e + 0x310, sOrg, 12); memcpy(e + 0x31C, sAxis, 36); } }
     };
-    bool ComputeAimTargetHook(void* self, float* out, const float* viewAxis, const float* aimPoint, uint64_t e, uint64_t f)
+    bool ComputeAimTargetHook(void* self, float* out, const float* viewAxis, const float* aimPoint, uint64_t e, uint64_t f, bool* g)
     {
         { std::lock_guard lk(g_M); g_Stats.targetCalls++; }
         const int hand = g_GunHand.load();
@@ -443,7 +486,7 @@ namespace
                     CamSwap s(shot.eye, shot.axis);
                     EntSwap es(shot.ent, shot.entOrg, shot.entAxis);
                     if (shot.aimSet) memcpy(const_cast<float*>(aimPoint), shot.aim, 12);
-                    r = g_RealTarget(self, out, shot.axis, aimPoint, e, f);
+                    r = g_RealTarget(self, out, shot.axis, aimPoint, e, f, g);
                     GunRay::FixSpawn(shot, out);
                     if (s.applied) { std::lock_guard lk(g_M); g_Stats.targetApplied++; }
                 }
@@ -452,8 +495,8 @@ namespace
             }
         }
         CamSwap s(hand);
-        if (!s.applied) { bool r0 = g_RealTarget(self, out, viewAxis, aimPoint, e, f); GunRay::Report(self, hand, nullptr, out, aimPoint, nullptr, nullptr); return r0; }
-        bool r = g_RealTarget(self, out, s.axis, aimPoint, e, f);
+        if (!s.applied) { bool r0 = g_RealTarget(self, out, viewAxis, aimPoint, e, f, g); GunRay::Report(self, hand, nullptr, out, aimPoint, nullptr, nullptr); return r0; }
+        bool r = g_RealTarget(self, out, s.axis, aimPoint, e, f, g);
         { std::lock_guard lk(g_M); g_Stats.targetApplied++; }
         GunRay::Report(self, hand, nullptr, out, aimPoint, s.org, s.axis);
         LOGI("FireRay: hand {} org=({:.2f},{:.2f},{:.2f}) fwd=({:.3f},{:.3f},{:.3f}) spawn=({:.2f},{:.2f},{:.2f}) aimPoint=({:.2f},{:.2f},{:.2f}) view fwd=({:.3f},{:.3f},{:.3f})",
@@ -751,6 +794,9 @@ void HandAimHook::SetPowerAimMask(int m) { g_PowerAimMask = m; }
 void HandAimHook::SetAimOverride(int m) { g_AimOverride = m; }
 int HandAimHook::AimOverride() { return g_AimOverride; }
 int HandAimHook::PowerAimMask() { return g_PowerAimMask; }
+void HandAimHook::SetFlightCamSwap(bool on) { g_SwapInFlight = on; LOGI("HandAimHook: camera swaps in Foresight's flight {} ({} skipped so far)", on ? "ON (as before)" : "off", g_FlightSwapsSkipped.load()); }
+unsigned long long HandAimHook::FlightSwapsSkipped() { return g_FlightSwapsSkipped.load(); }
+unsigned long long HandAimHook::FlightOverrideSkipped() { return g_FlightOverrideSkipped.load(); }
 int HandAimHook::PowerHand() { return g_PowerHand; }
 bool HandAimHook::ControllerPose(int hand, float org[3], float axis[9])
 {

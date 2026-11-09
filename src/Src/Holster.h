@@ -3,7 +3,9 @@
 #include <string>
 
 //! Holsters ([Gameplay] HolsterWeapons). The LEFT hand, with its grip: the pistol at the right hip (a cross draw), the
-//! crossbow behind the back, the last power it held on the chest. The RIGHT hand, with its grip: the sword at the left
+//! crossbow behind the back, the last power it held on the chest. DOTO has neither pistol nor crossbow: the right hip
+//! draws Billie's wrist launcher (arkCpntWeaponGaussGun, kind kPistol), with the ammunition [Gameplay.Interaction]
+//! LauncherHolster names (lethal: Voltaic Shots; shock: Electrical Bursts) when it has some. The RIGHT hand, with its grip: the sword at the left
 //! hip. Each is a toggle: what is already in that hand is put away by the same move, leaving the hand empty (a power out
 //! and the right hand free, say). KbmInject tells the zones and swallows that squeeze (no power wheel, no block).
 //!
@@ -40,4 +42,6 @@ namespace Holster
     //! Game thread, once a frame (HandAimHook, next to Collision::Tick).
     void Tick();
     std::string Stats();
+    //! The last item the game asked into that hand (0 right, 1 left; its decl name, "(no item)" when emptied), for the logs
+    std::string LastItem(int hand);
 }

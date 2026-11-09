@@ -115,11 +115,12 @@ Support the development: patreon.com/CosmicTangerine  -  ko-fi.com/cosmictangeri
    Right fist at your left shoulder,
      blade up (or the right grip) .... block
    Hit the back of a guard's head .... from behind, when the blue marker shows: knock him out
-   Left trigger held, swing, let go .. throw a grenade (mines and springrazors are placed where
-                                       your left hand points, as in the game)
-   A grip at a holster ............... draw / put away: left hand at the right hip = pistol,
-                                       behind your back = crossbow, chest = last power;
-                                       right hand at the left hip = sword
+   Left trigger held, swing, let go .. throw a grenade or a hook mine (mines and springrazors are
+                                       placed where your left hand points, as in the game)
+   Left trigger, short press ......... with a hook mine: switch it lethal / non-lethal
+   A grip at a holster ............... draw / put away: left hand at the right hip = wrist
+                                       launcher (lethal or shock: VR Gameplay > LauncherHolster),
+                                       chest = last power; right hand at the left hip = sword
    Right grip on an item, then reach
      over your shoulder .............. into your backpack (inventory), with a firm buzz
    Hand to your mouth, squeeze grip .. eat what it holds, or drink an elixir: left hand health,
@@ -143,7 +144,7 @@ Support the development: patreon.com/CosmicTangerine  -  ko-fi.com/cosmictangeri
    Right stick ....................... turn (snap by default)   click: the sword's own attack
                                        button (hold: power attack)
    Right trigger ..................... interact: use / open / take what your right hand points at
-   Left trigger ...................... power or left-hand weapon (pistol, crossbow)
+   Left trigger ...................... power or left-hand weapon (the wrist launcher, a gadget)
    Right grip ........................ your hand: take, hold, grab, pull; with the sword out: block
    Left grip, held ................... power wheel (pick with the stick, let go to equip);
                                        with the wheel open: B / A drink a health / mana elixir,
@@ -277,12 +278,11 @@ Support the development: patreon.com/CosmicTangerine  -  ko-fi.com/cosmictangeri
    Undetected ........ guards and other hostile people never treat you as an enemy: walk among
                        them in the open without being attacked or hunted. Everyone else sees you
                        and reacts as usual
-   UnlockEverything .. the Outsider's mark, every upgrade, bone charm crafting, every black market
-                       upgrade and weapon (or each on its own: UnlockOutsidersMark,
-                       UnlockPowerUpgrades, UnlockBlackMarketUpgrades, UnlockWeapons,
-                       FillAmmoAndGadgets, FillElixirs)
-   [Cheats.Powers] ... the powers one by one: Blink, Far Reach, Dark Vision, Possession, Devouring
-                       Swarm, Bend Time, Windblast, Domino, Doppelganger, Mesmerize, Shadow Walk
+   UnlockEverything .. every upgrade, bone charm crafting, every black market upgrade and weapon
+                       (or each on its own: UnlockPowerUpgrades, UnlockBlackMarketUpgrades,
+                       UnlockWeapons, FillAmmoAndGadgets, FillElixirs)
+   [Cheats.Powers] ... the powers one by one: Displace, Foresight, Semblance, and Original Game
+                       Plus's Blink, Dark Vision and Domino
 
  The cheats change your game for real: once the game saves, the save keeps them. Use saves you
  do not mind changing.

@@ -24,7 +24,14 @@ namespace
     using GotoFn = void (*)(void* bink, uint32_t frame, int32_t flags);
     GotoFn g_Goto = nullptr;
     std::atomic<bool> g_SkipIntros{ false };
-    bool IsIntro(const char* n) { return !_stricmp(n, "legal.bk2") || !_stricmp(n, "warning.bk2") || !_stricmp(n, "arkbeth.bk2") || !_stricmp(n, "void.bk2"); }
+    // DOTO hands Bink names cut to 8 characters ("legal.bk", "warning.", "arkbeth." -- only "void.bk2" fits whole; the
+    // three were played in full, 2026-11-07), so an intro is matched by its stem, the name up to the first dot.
+    bool IsIntro(const char* n)
+    {
+        char stem[32] = {}; size_t i = 0;
+        for (; i < sizeof(stem) - 1 && n[i] && n[i] != '.'; i++) stem[i] = n[i];
+        return !_stricmp(stem, "legal") || !_stricmp(stem, "warning") || !_stricmp(stem, "arkbeth") || !_stricmp(stem, "void");
+    }
     uint32_t FrameCount(void* h) { __try { return *(const uint32_t*)((const uint8_t*)h + 8); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
     constexpr int kMax = 8;
     std::mutex g_M;

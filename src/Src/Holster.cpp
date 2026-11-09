@@ -5,9 +5,12 @@
 #include "BodyHide.h"
 #include "PlayerState.h"
 #include "GrabHand.h"
+#include "Settings.h"
 #include <cmath>
 #include <unordered_map>
 #include <intrin.h>
+#include <mutex>
+#include <string>
 #include <detours/detours.h>
 
 namespace
@@ -113,6 +116,8 @@ namespace
         for (; n < sizeof buf - 1; n++) { char c = 0; if (!SafeRead(&c, s + n, 1) || !c) break; buf[n] = c; }
         return std::string(buf, n);
     }
+    std::mutex g_LastItemM;
+    std::string g_LastItem[2] = { "?", "?" };   // under g_LastItemM: the last item asked into each hand (0 right, 1 left)
     std::string DeclName(const void* decl)
     {
         const char* p = nullptr;
@@ -125,7 +130,17 @@ namespace
         __try { return entity ? ((Fn)(base + BodyHide::kGetComponent))(entity, (void*)(base + tiRva), 2) : nullptr; }
         __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
     }
-    const char* KindName(int k) { return k == Holster::kPistol ? "pistol" : k == Holster::kCrossbow ? "crossbow" : k == Holster::kMagic ? "power" : "sword"; }
+    const char* KindName(int k) { return k == Holster::kPistol ? "wrist launcher" : k == Holster::kCrossbow ? "crossbow" : k == Holster::kMagic ? "power" : "sword"; }
+    //! DOTO: the wrist launcher's ammunition by its item: 1 = lethal (Voltaic Shot: bullets, regular bolts, makeshift
+    //! shots), 2 = shock (Electrical Burst, pellet_electrified), 0 = neither (the launcher's own item, incendiary bolts,
+    //! hagpearls)
+    int AmmoKind(const void* decl)
+    {
+        const std::string n = DeclName(decl);
+        if (n.find("pellet_electrified") != std::string::npos) return 2;
+        if (n.find("/ammo/bullet.inventoryitem") != std::string::npos || n.find("bolt_regular") != std::string::npos || n.find("makeshift") != std::string::npos) return 1;
+        return 0;
+    }
     //! A power: its item is models/powers/<name>/... (the Heart, a story item held the same way, is not).
     std::unordered_map<const void*, bool> g_IsPower;     // game thread: decls live as long as the game
     bool IsPower(const void* decl)
@@ -184,7 +199,9 @@ namespace
             if (IsPower(decl)) { s.w.push_back({ e, decl, Holster::kMagic, count, -1, -1 }); continue; }
             if (!cpnt || !BodyHide::EntityById(id)) continue;   // the component is only valid while its entity is
             uintptr_t vt = 0; if (!SafeRead(&vt, cpnt, 8)) continue;
-            const int kind = vt == base + BodyHide::kGunCpntVtable ? Holster::kPistol : vt == base + BodyHide::kCrossbowCpntVtable ? Holster::kCrossbow : -1;
+            // DOTO: no pistol or crossbow -- the right hip's holster draws Billie's wrist launcher (arkCpntWeaponGaussGun)
+            const int kind = vt == base + BodyHide::kGunCpntVtable || vt == base + BodyHide::kGaussGunCpntVtable ? Holster::kPistol
+                           : vt == base + BodyHide::kCrossbowCpntVtable ? Holster::kCrossbow : -1;
             if (kind < 0) continue;
             int32_t hand = -1, type = -1;
             if (info) { SafeRead(&hand, info + kInfoHand, 4); SafeRead(&type, info + kInfoType, 4); }
@@ -274,6 +291,11 @@ namespace
             }
         }
         const int f = FilterEquip(state, par, copy, &entry, &flags);
+        if (state == kStateEquipRight || state == kStateEquipLeft)
+        {   // the last item asked into each hand, for the logs (PowerWatch, the wrist watch)
+            const void* decl = nullptr; if (entry) SafeRead(&decl, entry + kEntryDecl, 8);
+            std::lock_guard lk(g_LastItemM); g_LastItem[state == kStateEquipLeft ? 1 : 0] = entry ? DeclName(decl) : std::string("(no item)");
+        }
         if (g_On.load() && (state == kStateEquipRight || state == kStateEquipLeft))
         {   // every hand change, for the log (the first 400): which way the game came to put something in a hand
             static std::atomic<int> logged{ 0 };
@@ -306,8 +328,8 @@ void Holster::Install()
 void Holster::SetEnabled(bool on)
 {
     g_On = on;
-    LOGI("Holster: {}", on ? "on (left grip: pistol at the right hip, crossbow behind the back, last power on the chest; right grip: sword at the left hip; "
-                             "the same again puts it away)" : "off");
+    LOGI("Holster: {}", on ? fmt::format("on (left grip: the wrist launcher at the right hip, loaded {}; the last power on the chest; right grip: the sword "
+                                         "at the left hip; the same again puts it away)", Settings::LauncherHolsterShock() ? "shock" : "lethal") : std::string("off"));
 }
 bool Holster::Enabled() { return g_On.load(); }
 bool Holster::Owns(int k) { return k >= 0 && k < kKinds && g_Owns[k].load(); }
@@ -425,12 +447,19 @@ void Holster::Tick()
     // Which one: the one last held, else the first with a quantity, else any (a weapon: one entry per ammunition)
     const void* pick = nullptr;
     std::string all;
+    // DOTO, the wrist launcher: the ammunition the player chose for this holster (LauncherHolster), the last one held of
+    // that kind first; else, below, what it has
+    const int wantAmmo = req == kPistol ? (Settings::LauncherHolsterShock() ? 2 : 1) : 0;
+    const void* pickAmmo = nullptr;
     for (const Entry& x : s.w)
     {
         if (x.kind != req) continue;
         all += fmt::format(" [{} x{} hand {} type {}]", DeclName(x.decl), x.count, x.hand, x.type);
         if (x.decl == g_LastDecl[req] && x.count > 0) pick = x.decl;
+        if (wantAmmo && x.count > 0 && AmmoKind(x.decl) == wantAmmo && (!pickAmmo || x.decl == g_LastDecl[req])) pickAmmo = x.decl;
     }
+    if (pickAmmo) pick = pickAmmo;
+    else if (wantAmmo) LOGI("Holster: no {} ammunition for the wrist launcher with a quantity: it comes with what it has", wantAmmo == 2 ? "shock" : "lethal");
     // the last power held, even when the equipment list does not have it, as long as it is still owned
     if (!pick && req == kMagic && g_LastDecl[req] && Quantity(inv, g_LastDecl[req]) > 0) pick = g_LastDecl[req];
     if (!pick) for (const Entry& x : s.w) if (x.kind == req && x.count > 0) { pick = x.decl; break; }
@@ -444,6 +473,7 @@ void Holster::Tick()
          pick == g_LastDecl[req] ? " (the last one held)" : " (none held yet this session: the first one had)", all);
 }
 
+std::string Holster::LastItem(int hand) { std::lock_guard lk(g_LastItemM); return hand == 0 || hand == 1 ? g_LastItem[hand] : std::string("?"); }
 std::string Holster::Stats()
 {
     return fmt::format("on {} owns pistol {} crossbow {} power {} sword {} left {} right {} requests {} posted {} done {} notdone {} missing {} | kept empty right {} left {} dropped {} stripped {} allowed {}",

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Collision.h"
+#include "PortCheck.h"
 #include "Probes.h"
 #include "DoorHold.h"
 #include "SoftBody.h"
@@ -620,6 +621,9 @@ namespace
             if (type == (int)kTypeConsumable && cap <= 0) food++; else kept++;
         }
         const int r = !known ? 0 : food && !kept ? 2 : 1;
+        // the DOTO port: loot +0x28 / decl +0x68 lists, decl type +0x60, inventory table +0x38 are Dishonored 2's offsets:
+        // plausible types (0..13) and rooms (-1 or a small capacity) on items in the world confirm them
+        if (PortCheck::On() && n) PortCheck::Field("Collision loot/item decl/inventory (unverified offsets)", fmt::format("{} decl candidates, {} item decls:{} -> {}", n, known, what, r == 2 ? "food" : r == 1 ? "kept" : "unknown"));
         LOGI("Collision: item gives{}: {}", what.empty() ? " (nothing readable)" : what, r == 2 ? "FOOD (eaten, never stored: only at the mouth)" : r == 1 ? "kept (stored behind the back, or at the mouth)" : "cannot tell (either place takes it)");
         return r;
     }
@@ -694,7 +698,7 @@ namespace
         buf[0] = 0;
         __try
         {
-            const char* s = *(const char* const*)((const uint8_t*)ent + 0x20);
+            const char* s = *(const char* const*)((const uint8_t*)ent + 0x28);   // DOTO: the name idStr's text at +0x28 (D2 +0x20): idEntity's ctor exe+0x8E23F0 (D2 exe+0x874CA5); a new pointer sits at +0x20
             if (!s) return;
             for (int i = 0; i < 127; i++) { const char c = s[i]; buf[i] = 0; if (!c) break; if (c < 32 || c > 126) { buf[0] = 0; break; } buf[i] = c; buf[i + 1] = 0; }
         }
@@ -1608,8 +1612,10 @@ void Collision::Tick()
         Pub& P = g_Pub[h]; P.n = nc; P.at = now;
         for (int i = 0; i < nc; i++) P.c[i] = cs[i];
     }
-    // ClimbByHand: both hands on a top edge at chest height or above, then both pulled down 10 cm relative to the eyes
-    if (g_Climb.load())
+    // ClimbByHand: both hands on a top edge at chest height or above, then both pulled down 10 cm relative to the eyes.
+    // Not in Foresight's flight (DOTO, the Flying state: the view is away from the body; 2026-11-08 it read a ledge
+    // pushed down 50 cm and pressed jump every 10 ms for as long as the hands stayed there)
+    if (g_Climb.load() && !PlayerState::Running("Flying"))
     {
         float hp[2][3]; bool ok = true;
         for (int h = 0; h < 2 && ok; h++) { float r[9]; ok = GpuTrace::RawHandPose(h, hp[h], r); }

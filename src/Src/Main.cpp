@@ -65,12 +65,15 @@
 #include "Seeds.h"
 #include "SysInfo.h"
 #include "Version.h"
+#include "PortCheck.h"
+#include "StereoFeedback.h"
 
 static void OnPresent(IDXGISwapChain* sc)
 {
     PassProfile::BeginSection(0); // [Advanced] ProfileRenderPasses: the mod's own GPU / CPU work at Present
     Watchdog::OnPresent(sc);      // the heartbeat its thread watches (and vr stall's test hitch)
     SimStep::OnPresent();         // the game's simulation step follows the headset's refresh
+    PortCheck::OnPresent();       // [System.Troubleshooting] PortCheck: the DOTO port's periodic checks
     WristHud::BeginPresent(sc);   // the game's interface for this frame is complete (and the mod's own draws start)
     static bool first = true;
     if (first)
@@ -116,6 +119,7 @@ static void OnPresent(IDXGISwapChain* sc)
     PassProfile::BeginSection(PassProfile::kSecOverlay);
     Overlay::OnPresent(sc);       // draws onto the backbuffer first...
     PassProfile::EndSection(PassProfile::kSecOverlay);
+    StereoFeedback::OnPresent(sc);   // Foresight's distortion image kept per eye (before the submit: this image's eye)
     VRRuntime::OnPresent(sc);     // ...so the flat VR frame includes the overlay (debug aid)
     PassProfile::EndSection(2);
     PassProfile::BeginSection(PassProfile::kSecAfter);
@@ -167,7 +171,7 @@ static void ApplySettings(const std::vector<std::string>& changed)
     };
     bool fog = false; for (const std::string& c : changed) if (c.rfind("cheapfog", 0) == 0) fog = true;
     if (has({ "vrgraphicstweaks" })) VrTweaks::SetEnabled(Settings::VrGraphicsTweaks());
-    if (has({ "ambientocclusion" })) VrTweaks::SetAmbientOcclusion(Settings::AmbientOcclusion());
+    if (has({ "ambientocclusion", "ambientocclusionquality" })) { VrTweaks::SetAmbientOcclusion(Settings::AmbientOcclusion()); if (PassProfile::On()) PassProfile::DrawByDrawSoon(10000); }
     if (has({ "fog" })) VrTweaks::SetFog(Settings::Fog());
     if (has({ "staticlodzoom" })) VrTweaks::SetLodZoom(Settings::StaticLodZoom());
     if (has({ "disableheadbob" })) VrTweaks::SetHeadBobOff(Settings::DisableHeadBob());
@@ -206,18 +210,18 @@ static void ApplySettings(const std::vector<std::string>& changed)
     if (has({ "physicalpickup" })) Collision::SetItems(Settings::PhysicalPickup());
     if (has({ "swipedials" })) Collision::SetDials(Settings::SwipeDials());
     if (has({ "slidewindows" })) Collision::SetWindows(Settings::SlideWindows());
-    if (has({ "holsterweapons" })) Holster::SetEnabled(Settings::HolsterWeapons());
+    if (has({ "holsterweapons", "launcherholster" })) Holster::SetEnabled(Settings::HolsterWeapons());
     if (has({ "mouthpotions" })) KbmInject::SetMouthPotions(Settings::MouthPotions());
     if (has({ "templezoom" })) KbmInject::SetTempleZoom(Settings::TempleZoom());
     if (has({ "debuglogging" })) { PassProfile::SetEnabled(Settings::ProfileRenderPasses()); CpuProfile::SetEnabled(Settings::ProfileRenderPasses()); }
     if (has({ "debuglogging", "profilerenderpasses", "skipframesyncflush" })) PaceLog::SetFrameSync(Settings::ProfileRenderPasses(), Settings::SkipFrameSyncFlush());   // (the log file: above, every time)
     if (has({ "farreachvrcomfortoption" })) HandAimHook::SetFarReachBlink(Settings::FarReachVRComfortOption());
-    if (has({ "unlockeverything", "unlockoutsidersmark", "unlockpowers", "unlockpowerupgrades", "unlockblackmarketupgrades", "unlockweapons",
+    if (has({ "unlockeverything", "unlockpowers", "unlockpowerupgrades", "unlockblackmarketupgrades", "unlockweapons",
               "fillammoandgadgets", "fillelixirs" }))
         TestAids::SetAutoUnlock(Settings::Unlocks());   // the current player gets the new ones in a few seconds
     {
         bool power = false;
-        for (const char* k : { "unlockblink", "unlockfarreach", "unlockdarkvision", "unlockpossession", "unlockdevouringswarm", "unlockbendtime", "unlockwindblast", "unlockdomino", "unlockdoppelganger", "unlockmesmerize", "unlockshadowwalk" }) if (has({ k })) power = true;
+        for (const char* k : { "unlockdisplace", "unlockforesight", "unlocksemblance", "unlockblink", "unlockdarkvision", "unlockdomino" }) if (has({ k })) power = true;
         if (power) { const std::string p = Settings::PowerUnlocks(); TestAids::SetAutoPowers(p.empty() ? "off" : p); }
     }
     if (has({ "huddistance", "hudscale" })) ScreenMode::SetHud(Settings::StereoHud(), Settings::HudDistance(), Settings::HudScale(), Settings::HudMarkerSize());
@@ -239,6 +243,7 @@ static void ApplySettings(const std::vector<std::string>& changed)
     if (has({ "shadowlampkeepcache" })) ScreenShadows::SetLampKeepCache(Settings::ShadowLampKeepCache());
     if (has({ "taaskymotion" })) SkyMotion::SetEnabled(Settings::TaaSkyMotion());
     if (has({ "handdepth" })) GpuTrace::SetHandDepth(Settings::HandDepth());
+    if (has({ "weaponshadows" })) GpuTrace::SetWeaponShadows(Settings::WeaponShadows());
     if (has({ "simstepatrefresh" })) SimStep::SetEnabled(Settings::SimStepAtRefresh());
     Commands::SettingsChanged();   // turning, layout, menu screen, cutscenes, gestures, reticle, wrist HUD, cheats ...
 }
@@ -254,11 +259,15 @@ static DWORD WINAPI InitThread(LPVOID)
         LOGI("init: unsupported game build -- the mod stays inactive (no hooks, no VR)");
         CrashLog::SetPhase("inactive (unsupported build)");
         Log::SetFileEnabled(true);   // the ini is not read on an unsupported build: the log says why nothing happens
+        PortCheck::Configure(true);  // (reads only) which of the mod's code addresses still match this exe
+        PortCheck::Startup();
         if (HANDLE h = CreateThread(nullptr, 0, UnsupportedBox, nullptr, 0, nullptr)) CloseHandle(h);
         return 0;
     }
     Settings::Load();
     Log::SetFileEnabled(Settings::WriteLog());   // [Logging.Files] WriteLog = 0: no DOTOVR.log at all
+    PortCheck::Configure(Settings::PortCheck());  // [System.Troubleshooting] PortCheck: the DOTO port's checks in the log
+    PortCheck::Startup();            // before any hook: the mod's code addresses against the running exe
     ControllerBindings::Load();      // VRControllerBindings\*.json: the controller's settings over the ini's
     ControllerBindings::SetApply(ApplySettings);
     {
@@ -317,7 +326,7 @@ static DWORD WINAPI InitThread(LPVOID)
     KbmInject::SetTempleZoom(Settings::TempleZoom());
     HandAimHook::SetFarReachBlink(Settings::FarReachVRComfortOption());
     TestAids::SetAutoUnlock(Settings::Unlocks());   // [Cheats]: given to every save loaded, ~3 s into play
-    if (const std::string p = Settings::PowerUnlocks(); !p.empty()) TestAids::SetAutoPowers(p);   // [Cheats.Powers]: the mark and those
+    if (const std::string p = Settings::PowerUnlocks(); !p.empty()) TestAids::SetAutoPowers(p);   // [Cheats.Powers]: those (DOTO: without the mark)
     ViewMatrixHook::SetPitchFix(Settings::CameraPitchFix());
     ScreenMode::SetHud(Settings::StereoHud(), Settings::HudDistance(), Settings::HudScale(), Settings::HudMarkerSize());
     ScreenMode::SetHudResolution(Settings::HudResolution());
@@ -348,7 +357,9 @@ static DWORD WINAPI InitThread(LPVOID)
     ScreenShadows::SetLampKeepCache(Settings::ShadowLampKeepCache());
     SkyMotion::SetEnabled(Settings::TaaSkyMotion());
     GpuTrace::SetHandDepth(Settings::HandDepth());
+    GpuTrace::SetWeaponShadows(Settings::WeaponShadows());
     SimStep::SetEnabled(Settings::SimStepAtRefresh());   // (points the game clock's step rate at the mod's own float)
+    StereoFeedback::SetEnabled(true);   // Foresight's distortion image kept per eye (instruments the eyes' POSTPROC tasks)
     ScreenShadows::SetLampCacheSlices(Settings::ShadowLampCacheSlices());
     Watchdog::Install();          // a render thread that stops presenting is reported with where it is
     Seeds::Install();
@@ -411,6 +422,7 @@ static DWORD WINAPI InitThread(LPVOID)
     // vertex shaders before GpuTrace could see them (4 captured instead of hundreds): no arm or weapon was ever
     // recognised, fpdraws stayed 0, the controls stayed in "menu" mode and nothing moved with the controllers.
     XRProbe::Run();
+    PortCheck::AfterHooks("init done");   // which of the mod's addresses are patched now
     CrashLog::SetPhase("running");
     LOGI("init done");
     return 0;

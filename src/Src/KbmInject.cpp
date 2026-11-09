@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "KbmInject.h"
 #include "VRRuntime.h"
+#include "Settings.h"
 #include "XRSession.h"
 #include "Game.h"
 #include "HandAimHook.h"
@@ -1570,11 +1571,36 @@ void KbmInject::Tick()
     // its menu button as well, 2026-11-03.)
     if (indexPads) raw = (raw & ~(in.padForce[0] > 0.05f ? kXRBtnMenu : 0u)) | PadBits(in);
     {
-        static bool chord = false;
+        static bool chord = false, shot = false;
+        static int shots = 0;
         constexpr unsigned kBoth = kXRBtnThumbL | kXRBtnThumbR;
-        if ((raw & kBoth) == kBoth) { if (!chord) { chord = true; g_SprintLatch = false; LOGI("KbmInject: both stick clicks = menu button"); } }
+        if ((raw & kBoth) == kBoth)
+        {
+            if (!chord)
+            {
+                chord = true; g_SprintLatch = false;
+                // StickClickScreenshot (hidden, 2026-11-08: "click both thumbsticks to take a screenshot of the left and
+                // right eyes ... showing you will be the only way"): both eyes' last images, as submitted, to PNGs
+                shot = Settings::StickClickScreenshot();
+                if (shot)
+                {
+                    SYSTEMTIME st; GetLocalTime(&st);
+                    const std::string tag = fmt::format("shot{}_{:02}{:02}{:02}", ++shots, st.wHour, st.wMinute, st.wSecond);
+                    VRRuntime::RequestCapture(tag);
+                    LOGI("KbmInject: both stick clicks = screenshot: DVR_{}_eye0.png (left) / _eye1.png (right) / _frame.png in the game folder", tag);
+                    // in Foresight's flight (2026-11-08: "the double image disappears in a screenshot"): also 8 CONSECUTIVE
+                    // frames -- left, right, left, right ... as the game drew them -- DVR_<tag>_b00.png ... b07.png
+                    if (PlayerState::Running("Flying"))
+                    {
+                        VRRuntime::RequestBurst(8, tag);
+                        LOGI("KbmInject: in the flight: 8 consecutive frames too, DVR_{}_b00.png ... _b07.png (alternate eyes)", tag);
+                    }
+                }
+                else LOGI("KbmInject: both stick clicks = menu button");
+            }
+        }
         else if (!(raw & kBoth)) chord = false;
-        if (chord) raw = (raw & ~kBoth) | kXRBtnMenu;
+        if (chord) raw = shot ? (raw & ~kBoth) : (raw & ~kBoth) | kXRBtnMenu;
     }
     // Analog inputs as buttons, so the latch covers them too.
     const unsigned btn = raw | (in.triggerL > 0.5f ? kVTrigL : 0) | (in.triggerR > 0.5f ? kVTrigR : 0)
@@ -2295,7 +2321,7 @@ void KbmInject::Tick()
         const int hz = usable ? HolsterZone(in, 0, rel) : 0;
         const int kind = hz == 1 ? Holster::kPistol : hz == 2 ? Holster::kCrossbow : Holster::kMagic;
         const char* where = hz == 1 ? "right hip" : hz == 2 ? "back" : "chest";
-        const char* what = hz == 1 ? "pistol" : hz == 2 ? "crossbow" : hz == 3 ? "power" : "?";
+        const char* what = hz == 1 ? "wrist launcher" : hz == 2 ? "crossbow" : hz == 3 ? "power" : "?";   // (DOTO: the right hip's is the launcher)
         const bool out = hz && Holster::InHand(kind);
         const bool can = hz && (out || Holster::Owns(kind));
         if (hz != g_HolsterZoneWas)
@@ -2359,7 +2385,36 @@ void KbmInject::Tick()
     }
     // L trigger: power / weapon (left hand) -- not while the left hand holds an object.
     const bool trigLGame = ThrowGesture::GateTrigger((live & kVTrigL) != 0);   // (a grenade: not before the next is ready)
-    Hold(kRMB, trigLGame && !(holding && grabHand == 0) && !letsL);
+    bool rmb = trigLGame && !(holding && grabHand == 0) && !letsL;
+    {   // DOTO's hook mine (asked 2026-11-08): the game's own button throws it on a TAP and switches it between lethal and
+        // non-lethal on a HOLD (+ChangeWeaponState from the press; measured: released after 0.17 s it was thrown, after 0.37
+        // and 0.61 s it switched) -- the wrong way round for a throw made with the arm, where the trigger is held through
+        // the swing. With the hook mine in the left hand the trigger is read here instead: nothing reaches the game while it
+        // is held; let go within kMineLong it is a SWITCH (the button held kMineSwitch for the game), held longer it is a
+        // THROW (a tap of kMineTap at the release; ThrowGesture gives the mine the hand's velocity at that release, as a
+        // grenade's). A short buzz in the left hand when a held trigger becomes a throw.
+        constexpr double kMineLong = 0.35, kMineSwitch = 0.6, kMineTap = 0.1;
+        static bool down = false, armed = false; static double at = 0, until = -1;
+        const bool mine = BodyHide::HeldItemClass(0) == BodyHide::kHookMineCpntVtable && g_Mode == kModePlay;
+        const bool phys = (live & kVTrigL) != 0 && !(holding && grabHand == 0) && !letsL;
+        if (mine || until >= 0 || down)
+        {
+            if (phys && !down && until < 0) { down = true; armed = false; at = g_Now; }
+            if (down && phys && !armed && g_Now - at >= kMineLong) { armed = true; VRRuntime::Vibrate(0, 0.35f, 0.04f); }
+            if (down && !phys)
+            {
+                down = false;
+                const double held = g_Now - at;
+                const bool thr = held >= kMineLong;
+                until = g_Now + (thr ? kMineTap : kMineSwitch);
+                LOGI("KbmInject: hook mine: trigger held {:.2f} s: {}", held, thr ? "THROW (a tap to the game)" : "switch lethal / non-lethal (the button held for the game)");
+            }
+            rmb = until >= 0 && g_Now < until;
+            if (until >= 0 && g_Now >= until) until = -1;
+            if (!mine && !down && until < 0) armed = false;
+        }
+    }
+    Hold(kRMB, rmb);
     ThrowGesture::Tick(in, (live & kVTrigL) != 0);        // ...and a grenade leaves with the hand's velocity when it opens
     MenuButton(live, quick);
     // Right stick up / down: health / mana potion. Only a clearly vertical push, and once per push.

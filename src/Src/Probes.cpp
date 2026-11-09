@@ -45,6 +45,7 @@ namespace
         if (n < 2) return;
         strncpy_s(out, cap, tmp, _TRUNCATE);
     }
+    constexpr size_t kEntName = 0x28;   // DOTO: the entity's name text (D2 0x20; idEntity ctor exe+0x8E23F0)
     std::string NameAt(const void* p, size_t off) { char b[96]; Str(Ptr(p, off), b, sizeof b); return b; }
     //! the nonzero dwords of [p, p+n), as "+off=hex(float)" (at most `max`)
     std::string Dump(const void* p, size_t from, size_t n, int max = 64)
@@ -117,12 +118,12 @@ namespace
         const void* rfAnim = Ptr(rf, 0x400);
         const void* vars = Ptr(playerObj, 0);
         int slotOff = -1; Rd(&slotOff, (const uint8_t*)slot0 + 4, 4);
-        t.name = NameAt(ent, 0x20);
+        t.name = NameAt(ent, kEntName);
         t.anim = (void*)anim;
         t.regs = { { "state", state, 0, 0x40, {} }, { "ent", ent, 0x2F0, 0x70, {} }, { "anim", anim, 0x330, 0x90, {} },
                    { "rf", rf, 0x3C0, 0x60, {} }, { "parent", rfParent, 0x2F0, 0x70, {} }, { "vars", vars, 0, 0x200, {} } };
         LOGI("Probes: door #{} '{}': reference frame {} (vtable {}): parent {} '{}' (vtable {}), its animation {} ({}), the door's animation's variables {} (slot 0's at +0x{:X});{}",
-             g_DoorSessions, NameAt(ent, 0x20), rf, Rva(Ptr(rf, 0)), rfParent, NameAt(rfParent, 0x20), Rva(Ptr(rfParent, 0)), rfAnim,
+             g_DoorSessions, NameAt(ent, kEntName), rf, Rva(Ptr(rf, 0)), rfParent, NameAt(rfParent, kEntName), Rva(Ptr(rfParent, 0)), rfAnim,
              rfAnim == anim ? "the door's own" : rfAnim ? "another" : "none", vars, slotOff, Dump(rf, 0x3C0, 0x60, 24));
         LOGI("Probes: door #{} '{}' animating: state {} (vtable {}) comp {} (vtable {}) entity {} anim {} player {} slot0 {} physics {} (vtable {})",
              g_DoorSessions, t.name, state, Rva(Ptr(state, 0)), comp, Rva(Ptr(comp, 0)), ent, anim, playerObj, slot0, phys, Rva(Ptr(phys, 0)));
@@ -208,7 +209,7 @@ namespace
             const void* rec = Ptr(msg, 8);
             const void* decl = Ptr(rec, 0);
             const void* ent = Ptr(comp, 0x10);
-            LOGI("Probes: hit #{}: NPC '{}' (comp {} vtable {}) handles a damage, from {}; msg{}", g_HitLogged.load(), NameAt(ent, 0x20), comp, Rva(Ptr(comp, 0)),
+            LOGI("Probes: hit #{}: NPC '{}' (comp {} vtable {}) handles a damage, from {}; msg{}", g_HitLogged.load(), NameAt(ent, kEntName), comp, Rva(Ptr(comp, 0)),
                  Rva(_ReturnAddress()), Dump(msg, 0, 0x20, 8));
             LOGI("Probes: hit #{}:   record {} (decl {} '{}' / '{}'):{}", g_HitLogged.load(), rec, decl, NameAt(decl, 8), NameAt(decl, 0x10), Dump(rec, 0, 0xC0, 48));
             bool first = false; { std::lock_guard lk(g_DM); first = decl && g_DeclsDumped.insert(decl).second && g_DeclsDumped.size() < 24; }
@@ -224,7 +225,7 @@ namespace
     {
         g_HitPlays++;
         if (PassProfile::On() && g_HitLogged.load() <= 40)
-            LOGI("Probes: hit react PLAYED on '{}' from {}: info{}", NameAt(Ptr(comp, 0x10), 0x20), Rva(_ReturnAddress()), Dump(info, 0, 0x40, 16));
+            LOGI("Probes: hit react PLAYED on '{}' from {}: info{}", NameAt(Ptr(comp, 0x10), kEntName), Rva(_ReturnAddress()), Dump(info, 0, 0x40, 16));
         return g_RealPlayHit(comp, info);
     }
 
@@ -247,7 +248,7 @@ namespace
         std::lock_guard lk(g_DM);
         for (RagWatch& w : g_Rag) if (w.comp == comp) { w.t0 = Now(); return; }
         if (g_Rag.size() >= 6) return;
-        RagWatch w; w.comp = comp; w.ent = ent; w.t0 = w.last = Now(); w.name = NameAt(ent, 0x20);
+        RagWatch w; w.comp = comp; w.ent = ent; w.t0 = w.last = Now(); w.name = NameAt(ent, kEntName);
         Rd(w.pos, (const uint8_t*)ent + 0x310, 12);   // entity origin (D2 +0x300)
         g_Rag.push_back(w);
         LOGI("Probes: character '{}' ({}): its body followed for 8 s (physics comp {} vtable {})", w.name, why, comp, Rva(Ptr(comp, 0)));
@@ -260,7 +261,7 @@ namespace
             g_RagLogged++;
             int cur = -9; Rd(&cur, (const uint8_t*)comp + 0x238, 4);   // TODO(DOTO): unverified (D2 layout)
             const void* ent = Ptr(comp, 0x10);
-            LOGI("Probes: body mode {} asked for '{}' (now {}) from {}", mode, NameAt(ent, 0x20), cur, Rva(_ReturnAddress()));
+            LOGI("Probes: body mode {} asked for '{}' (now {}) from {}", mode, NameAt(ent, kEntName), cur, Rva(_ReturnAddress()));
             WatchRag(comp, ent, "a body mode asked for");
         }
         return g_RealSetMode(comp, mode);
@@ -272,7 +273,7 @@ namespace
         if (PassProfile::On() && g_RagLogged.load() < 120 && asked != -1)
         {
             g_RagLogged++;
-            LOGI("Probes: body mode for '{}': asked {} -> {} (from {})", NameAt(ent, 0x20), asked, r, Rva(_ReturnAddress()));
+            LOGI("Probes: body mode for '{}': asked {} -> {} (from {})", NameAt(ent, kEntName), asked, r, Rva(_ReturnAddress()));
         }
         return r;
     }
@@ -285,7 +286,7 @@ namespace
         {
             g_RagLogged++;
             const void* decl = Ptr(comp, 0x2C8);
-            LOGI("Probes: active ragdoll for '{}': {} (decl {} '{}' / '{}'); comp +0x220..+0x2E0:{}", NameAt(Ptr(comp, 0x10), 0x20), r ? "STARTED" : "not started",
+            LOGI("Probes: active ragdoll for '{}': {} (decl {} '{}' / '{}'); comp +0x220..+0x2E0:{}", NameAt(Ptr(comp, 0x10), kEntName), r ? "STARTED" : "not started",
                  decl, NameAt(decl, 8), NameAt(decl, 0x10), Dump(comp, 0x220, 0xC0, 40));
             if (r && decl) LOGI("Probes:   its decl (vtable {}):{}", Rva(Ptr(decl, 0)), Dump(decl, 0, 0x100, 64));
         }
@@ -403,7 +404,7 @@ void Probes::GameTick()
     }
     const int entry = k == 0 ? idx3 : (int)cnt - (int)J + r.joint;
     LOGI("Probes: research {}/2: the {} hand touched character '{}' at joint {} of {}: skeleton object {} (vtable {}), pose array {} x{} entries; remaps per space (ptr, count -> this joint's entry):{}",
-         k + 1, r.hand ? "right" : "left", NameAt(e, 0x20), r.joint, J, obj, Rva(Ptr(obj, 0)), pose, cnt, spaces);
+         k + 1, r.hand ? "right" : "left", NameAt(e, kEntName), r.joint, J, obj, Rva(Ptr(obj, 0)), pose, cnt, spaces);
     LOGI("Probes:   skeleton object +0x2C0..+0x370:{}", Dump(obj, 0x2C0, 0xB0, 40));
     if (pose && entry >= 0 && (uint32_t)entry < cnt)
     {
@@ -427,7 +428,7 @@ bool Probes::DoorImpulseTest(void* door, const float point[3], const float norma
     const float imp = kImp[g_ImpulseTests++];
     const float v[3] = { -normal[0] * imp, -normal[1] * imp, -normal[2] * imp };
     Collision::Push(door, v, point);
-    g_Watch.ent = door; g_Watch.t0 = g_Watch.last = Now(); g_Watch.name = NameAt(door, 0x20); g_Watch.imp = imp; g_WatchOn = true;
+    g_Watch.ent = door; g_Watch.t0 = g_Watch.last = Now(); g_Watch.name = NameAt(door, kEntName); g_Watch.imp = imp; g_WatchOn = true;
     LOGI("Probes: research: the {} hand's push on door '{}' sent as a physics impulse of {:g} at ({:.2f}, {:.2f}, {:.2f}) instead of the game's door push (test {} of 3)",
          hand ? "right" : "left", g_Watch.name, imp, point[0], point[1], point[2], g_ImpulseTests);
     return true;

@@ -3,19 +3,19 @@
 The source was ported from the Dishonored 2 VR mod (`Dishonored2.exe` 1.77.9.0) to Death of the
 Outsider (`Dishonored_DO.exe` 1.145.0.0, Steam, 42,192,424 bytes, link stamp `0x67AB7505`) on
 2026-11-05, by matching the code of the two executables (method and tools: `tools/port/README.md`).
-Every changed constant keeps its Dishonored 2 value next to it as `(D2 0x...)`. **Nothing has been
-compiled or run in the game yet.**
+Every changed constant keeps its Dishonored 2 value next to it as `(D2 0x...)`. Built and run in the
+headset since 2026-11-07 (see the session sections below).
 
 ## Priority systems
 
 | System | State |
 |---|---|
-| Synchronised stereo (StereoSync: RunFrame hold, Draw-only frames, input-read skips, right-eye pass reuse, sun-shadow sharing) | ported; the hooked functions are the same code (renderer side byte-identical); gameLocal fields +0x146C0 |
+| Synchronised stereo (StereoSync: RunFrame hold, Draw-only frames, input-read skips, right-eye pass reuse, sun-shadow sharing) | ported and working; the hooked functions are the same code (renderer side byte-identical); gameLocal fields +0x146C0 |
 | Frame uncapping (`com_disableFrameSpinning`) | works as in Dishonored 2: DOTO's frame function (exe+0x360100) skips its spin when the cvar's int (exe+0x267CEE8) is set |
 | Swapchain / V-Sync handling (D3D11Hook) | ported (no addresses in code) |
 | Physics step at the headset refresh (SimStep) | ported; clock (exe+0x5A790), rate instruction (exe+0x5AC0D), 120.0 (exe+0x1BCFAF8), step (exe+0x2341A94) checked byte for byte |
 | SkipFrameSyncFlush (PaceLog) | **not needed**: DOTO makes no end-of-frame Flush (D2's exe+0x3591FC has no counterpart; DOTO has 3 Flush calls, the other 3 of D2's 4) |
-| View / head pose (ViewMatrixHook, CameraHook), render size (RenderRes) | ported; renderView_t fields from the fov on are 0x10 lower; RenderRes hooks GetWindowRect too (DOTO's window procedure uses it) |
+| View / head pose (ViewMatrixHook, CameraHook), render size (RenderRes) | ported; renderView_t fields from the fov on are 0x10 lower; RenderRes sets DOTO's display size (see the second session) |
 
 ## Layout differences found (selection)
 
@@ -24,7 +24,8 @@ compiled or run in the game yet.**
 - idEntity: id 0xB0, flags 0xD8/0xD9, model 0xF8, origin 0x310, axis 0x31C, scale 0x340, velocity 0x34C, angular 0x358, skeleton 0x370.
 - arkSkinnedRenderModel: skeleton 0x1FD8, masks 0x20F0, numVisible 0x1F30, transformSet 0x1F38.
 - ARK_MSG ids renumbered (equip 0xA2, unequip 0xA3, fire 0xCE, impulse 0x100, door push 0x13E, has-choked 0x144, ragdoll 0xBE); message queue +0xCFF0; entity table game+0x327770.
-- idRenderSystemLocal: 5 more virtuals (slot 0x200 -> 0x228). Player melee vtable: one extra slot at 34.
+- idRenderSystemLocal: 5 more virtuals (slot 0x200 -> 0x228; 0x220 = set display size, exe+0x34E5A0). Player melee vtable: one extra slot at 34.
+- Render size: DOTO renders at its display size (exe+0x33C6BAC/BB0), not at the window's client size (see the second session).
 - PlayerState: 102 states (DOTO's 11 new ones added), resolved by RTTI name. Render passes: 52 + UPDATE_CLOTH.
 - GrabHand: DOTO throws a held object from two sites (both patched).
 - Config file: `Saved Games\Arkane Studios\Dishonored_DO\base\dishonored_DOConfig.cfg`.
@@ -35,14 +36,532 @@ Features whose byte checks fail stay OFF (logged), they do not patch the wrong c
 
 | Where | What |
 |---|---|
-| ThrowGesture.cpp:15, :25, :443, ThrowGesture.h:14 | grenade throw by hand: DOTO's Throw (exe+0x687BA0) launches through messages; the velocity hook needs new RE. Mine typeinfo unmapped. **Off.** |
-| Undetected.cpp:11 | the "undetected" cheat: DOTO's relationship code is restructured. **Off.** |
 | MeleeAim.cpp:1301 | finisher store patched as `EB 14` (DOTO's code differs): check in game |
-| GpuTrace.cpp:144, 4115, 4215, 4241, 4262, 5177; PostShare.cpp:12-13; WristHud.cpp:311 | shader hashes measured on Dishonored 2; check with the `gpudump` / `hudprobe` logs |
 | SeedsData.inc | learned hand grips, keyed by D2 vtables and Corvo/Emily hand meshes: regenerate with `tools/make_seeds.py` after a DOTO session |
-| Collision.cpp:521 | loot / item decl / inventory offsets and item type numbers |
-| BodyHide.h:24, :62, :64 | entity model B 0x378 (inferred), weapon model B 0x480, equipment +0x68/+0x70 |
-| GunRay.cpp:369, :381; Probes.cpp:261, :358; ObjectiveWatch.cpp:17; TestAids.cpp:447, TestAids.h:26/37/40 | research / cheat offsets |
+| Collision.cpp:522 | loot / item decl / inventory offsets and item type numbers (arkCpntLoot's virtuals show no field moves, the decls are not checkable statically) |
+| BodyHide.h:24, :66 | entity model B 0x378 (inferred; reads null on the player), weapon model B 0x480 (reads a float on the sword: wrong, harmless since the class is checked) |
+| GunRay.cpp:369, :381; Probes.cpp:261, :358; ObjectiveWatch.cpp:17; TestAids.h:26 | research offsets; power upgrades (not used by the shipped ini) |
+
+## Verification logging (first sessions)
+
+The shipped `package/DOTOVR.ini` has `DebugLogging = 1`, `PortCheck = 1`, `WriteStatusFile = 1` and
+`LogMenuData = 1` for the first DOTO sessions (set them back to 0 for normal play). `PortCheck`
+(`src/Src/PortCheck.h`) writes lines starting with `PortCheck` to `DOTOVR.log`:
+
+| Line | What it settles |
+|---|---|
+| `hook table: ... N match, M MISMATCH` (startup, before any hook) | every named code address of the mod (`PortCheckTable.inc`, generated by `tools/port/gen_portcheck.py`) against the running exe; a mismatch = another game build or a wrong port. Also written when the build check fails |
+| `hook table (init done / a minute after the first Present)` | per module, which addresses the mod patched and which it left: a hook that should be in and shows as untouched failed or is off |
+| `shader census` (30 s in, then every 2 min) | each Dishonored 2 shader hash the mod relies on, SEEN or NOT SEEN, and at each place one is compared the hashes actually met there, by count: a missing hash's DOTO counterpart is among them |
+| `fields (in play)` | gameLocal / player classes (RTTI), the player's view origin and axis (+0x310/+0x31C), the camera eye against it, the render view's fov, com_disableFrameSpinning |
+| `field ...` | values modules report for unverified offsets: BodyHide (model B +0x378 / weapon +0x480, equipment +0x68/+0x70), Collision (loot / item decl / inventory) |
+| `throw probe` | each new caller of the entity velocity setter (exe+0x8E9C20) with the entity's class and speed: a grenade throw shows DOTO's launch site for ThrowGesture |
+
+What to do in that session: load a level and play a few minutes -- sneak (crouch), swing the sword, throw a
+grenade, open the inventory and the Options screen (the VR tabs), watch a cutscene -- then send `DOTOVR.log`
+and `DVR_heartbeat.txt`.
+
+## First sessions (2026-11-07) and what they changed
+
+From the logs of two sessions in the headset (SteamVR, Pimax, RTX 5090): all 166 code addresses match the exe;
+15 of 16 shader hashes hold; the player's view, the render view's fov and the classes (idGameLocal, arkPlayer,
+arkSkinnedRenderModel) read as expected. Fixed from them:
+
+- **Stereo never reached the headset** (always mono, 4 fallbacks): DOTO presents an image BEFORE it builds the next
+  frame's view (Dishonored 2 built view N+1 first), so the left image's right view never existed yet and no left image
+  was staged (`leftalone`). VRRuntime now also stages it when StereoSync says the next frame is held for its right
+  eye (`PendingRight`). Confirmed working in the second session.
+- **No VR tabs in the Options screen**: VrMenu's prologue check still had two Dishonored 2 byte patterns
+  (pause menu Back handler `40 53` = push rbx; the object constructor's RIP displacement).
+- The right hand and the render size: see the second session (the first attempts at both did not hold).
+
+## Second session (2026-11-07) and what it changed
+
+Reported: stereo works and the picture is sharper; the right hand 180 degrees round (the sword points down), the left
+arm mangled, the hand reticles and most of the interface squeezed from the sides, the intro videos still playing.
+
+- **Render size / squeezed interface**: DOTO renders at its display size (exe+0x33C6BAC/BB0), which the main
+  swapchain's target (exe+0x3716E0) reads every frame and resizes the swapchain to (exe+0x379550, ResizeBuffers on the
+  engine's render thread); the interface lays itself out in it. The window procedure's WM_WINDOWPOSCHANGED only sets
+  r_windowWidth/Height (the window's outer size; the window placement exe+0x34B500 fits the window to the monitor from
+  the display size) and WM_SIZE does nothing, so Dishonored 2's trigger (a spoofed client size) left the engine at
+  the monitor's 16:9 (3456x1944) while each eye is near square (3492x3607): the 16:9 picture stretched into the eye.
+  RenderRes now writes the display size (re-asserted each frame while a target is in effect; the window placement and
+  config writes see the real window's size) and no longer spoofs GetWindowRect. Log lines: `RenderRes: the engine's
+  display size ... -> ...` and `after the resize request ...` (engine and swapchain should equal the target).
+- **Intro videos**: DOTO hands Bink names cut to 8 characters (`legal.bk`, `warning.`, `arkbeth.`; only `void.bk2`
+  fits whole and was the one skipped), so `SkipIntroVideos` matches by stem.
+- **Hands**: Billie's right arm comes as two meshes on one 69-bone skeleton (3281 and 7031 vertices). The 7031 one,
+  the one drawn, has most vertices on forearm bones (bone 3: 2103), so its palm was taken on the forearm and its palm
+  normal came out reversed (the hand drawn 180 degrees round). The first sessions' fix (the palm within 15 cm of the
+  hand end) moved the left palm from bone 64 to 40, a finger, and mangled the left arm: removed. A per-arm memory of
+  the first mesh's palm (this build) did not hold: in the third session the 7031-vertex skin was the right arm's
+  first and only mesh.
+- **CAS**: TaaSharpen (contrast-adaptive sharpening of the TAA result) is ported and on: `TaaSharpening = 0.85`
+  (`display.taasharpening`), sharpening the full render size; it acts only with the game's TAA.
+- Open: the view "slightly off-centre" (to check again now that stereo works).
+
+## Third session (2026-11-07)
+
+Reported: the interface no longer squeezed (engine and swapchain at 3492x3607), the sword the right way, the left arm
+whole; the right hand still 180 degrees round, and both game hands a forearm's length beyond the real ones.
+
+- **Both hands too far**: the left skin's palm was bone 64 (340 vertices, 41 cm from the fingertips): a forearm bone,
+  posed at the controller, so the hand sat ~25 cm beyond it. Billie's 68-bone skins and the body rig have the hand at
+  bone 4. On arm skeletons (60+ bones) a palm farther than 24 cm from the fingertip bone is replaced by the bone with
+  the most vertices within 24 cm of it (bone 4 on both arms). Log: `palm bone ... from the fingertip bone ...: bone 4`.
+- **Right hand round**: in the bind pose (T pose: x along the arm, y up, z forward) her palms face down; the arms
+  drawn right have normal (+-0.13, -0.96, -0.23), the reversed one (0.00, +0.96, 0.29). On arm skeletons the palm
+  normal is taken downwards (log: `palm normal turned round: it pointed up`).
+- **Right trigger did not interact**: no `VRControllerBindings` folder in the game folder, so the default layout (right
+  trigger = sword, grip = interact) instead of the Index one. Copy `package\VRControllerBindings` there (or run
+  `scripts\deploy.ps1`).
+- **Undetected cheat ported** (static RE, not from the logs): DOTO's relationships are a faction matrix (2 bits per
+  pair; each entity's faction a word at +0x2C0 / +0x2C2), with no per-entity entries and no setter. The lookups
+  exe+0x3A4AD0 (manager, entity A, entity B) -- under the id version exe+0x3A4BA0 and the game's wrapper exe+0x917370
+  (77 callers) -- and exe+0x3A4C10 (the +0x2C2 variant) are hooked: ENEMY from anyone regarding the player reads
+  NEUTRAL. The entity id is at +0xB0 (the D2 offset read 0x80000000). `Undetected = 1` in the shipped ini for testing.
+  Log: `Undetected: the relationship lookup exe+0x3A4AD0 hooked`, `the player's entity id ...`, and every 30 s the
+  count of enemy reads turned neutral. Confirmed in the fourth session (146,877 enemy reads turned neutral).
+
+## Fourth session (2026-11-07)
+
+Reported: hands much better but the fingertips still past the real ones; the left wrist launcher flickering / turned,
+the left hand bending when it is equipped, the launcher following the sword when that is out, the shock attachment's
+lightning off to the side, the sword flickering, the slash trail visible; a crash.
+
+- **Crash** (exe+0x68E151, writing to 0xFFFFFFFFFFFFFFFF, on a shot): DOTO's `ComputeAimTarget` (exe+0x68DB40) takes
+  SEVEN arguments, the 7th a `bool*` it sets (its caller exe+0x3C20C0 passes [rsp+0x30]); HandAimHook's hook had
+  Dishonored 2's six and handed it stack garbage. Fixed. An audit of every function the mod hooks or calls (the most
+  stack arguments its callers pass, D2 against DOTO) found no other change.
+- **Wrist launcher** (`arkCpntWeaponGaussGun`, vtable exe+0x1C45768, worn on Billie's left forearm, its entity ~15 cm
+  from the palm): treated as a weapon, its draws were pinned to the controller and the hand was posed from it (a hold
+  learned 15.5 cm off). It is now a gadget (`BodyHide::HoldsWristDevice`): the hand stays an empty hand and the
+  launcher rides with it where the game's animation has it (learned up to 30 cm from the palm).
+- **Launcher following the sword**: it is drawn on the left arm whether equipped or not, and with the sword out its
+  draws were claimed by the sword (the nearest weapon entity). A draw claimed by one hand's weapon but nearer the other
+  hand's palm (as the game poses it) now rides the other hand (`g_PalmLive`, `g_OtherHandDraws`).
+- **Fingertips past the real hand**: bone 4's centroid is the heel of the hand; the point put on the controller's grip
+  is now 30% of the way from it to the fingertip bone (~6 cm on). Log: `the hand's grip point is ... cm from bone 4`.
+  Hand data learned with the old point (`DVR_hands.txt`, `DVR_grips.txt`) is a few cm off until relearned.
+- **Slash trail**: none of Dishonored 2's three trail shaders draws in DOTO's slashes. With PortCheck on, every vertex
+  shader is now counted in slash windows and in control frames outside them; every 60 s `GpuTrace: sword trail search`
+  ranks them (draws per frame in slashes / outside, `ONLY-IN-SLASHES`). The trail's hashes then go into kTrailHashes.
+- **Judder in lateral motion at 90 fps**: SimStep's patch was in (exe+0x5AC0D), but the step went 90 -> 120 -> 90
+  every second or two for 0.25-0.5 s (29 changes in 10 minutes): the runtime's predicted display period left 11.1 ms
+  now and then (or the session read as not running), and the step fell back to the game's 120. It now follows the
+  headset's REFRESH -- the shortest period seen in the last 5 s -- and a longer period changes nothing (logged as
+  `SimStep: the runtime's display period is ... now`).
+- **Sword watch** (logging for the sword's flicker, "odd shading / lighting"): every moved draw of the held sword is
+  summed per kind -- render pass (`PassProfile::PassNow`), task class, eye, instance-buffer size, what the shader reads
+  (model rows, previous rows, joint palette, depth hack), VS / PS hash -- with how often its lighting rows are more than
+  3 deg off the drawn pose, mirrored or absent; written every 30 s as `GpuTrace: sword watch` / `GpuTrace:   sword |`.
+  Each time the sword is drawn (at most every 2 min) the next 150 weapon draws are logged one by one (`gunparts`),
+  including the draws by the weapon that were NOT moved (`UNCLAIMED`).
+- Open: the sword's flicker (no cause in the log: its draws are moved in every pass; the 160-byte instance buffer has
+  no model rows by design) and the shock attachment's lightning (HandFx): both to be looked at again with the launcher
+  fix in.
+
+## Fifth session (2026-11-07)
+
+Reported: the sword's odd shading again, the launcher still flickering and swinging with the hand (it is worn on the
+forearm), the slash effect seen, the right hand stretched after a cutscene for the rest of the session.
+
+- **Physics step held**: one switch to 90 at the start and none after; SteamVR's period went to 22.2 / 33.3 ms now and
+  then (logged), the step stayed at the refresh.
+- **Slash trail found**: the trail search ranked three vertex shaders drawn only in slash windows (10,626 slash frames,
+  14,005 control frames): 736585999b64ee73 (0.56 draws a frame), 32486d6743f5d606 (0.28), b05cac55dfc3c1bc (0.24). Added
+  to kTrailHashes (hidden in the slash window).
+- **Sword watch result**: 2 moved draws per eye (DEPTHPASS cb160 with motion rows, FORWARD_DYNAMIC cb416 with model
+  rows), skinned, the lighting rows within 0.1 deg of the drawn pose in every pass, nothing unclaimed; the sword is
+  also drawn (moved) into the lamps' shadow maps (SHADOWS_DYNAMIC lamps). The transforms are right; the shadow is the
+  suspect. New A/B: `WeaponShadows` ([Display.Picture], hidden; `vr weaponshadows 0|1`): 0 = the held weapon is not
+  drawn into SHADOWS_* passes. Shipped at 0 for the next session.
+- **Launcher on the forearm**: its draws now take the delta the arm's skin gets at their position
+  (`ForearmDeltaWorld`, ArmCorrectJoint's rule: the forearm's, its twist interpolated along it), both when equipped and
+  when drawn with the other hand's weapon out; the palm pose is the fallback, then the hand's delta -- never the weapon's
+  (which pinned it to the controller and made it flicker between two poses). Counted in the 30 s line `gpuhands: draws
+  posed with the forearm`.
+- **Launcher with a grenade in the hand** (real grenades, arkCpntWeaponThrowable, thrown 20:47-20:49; the 90 m/s
+  arkProjectiles at 20:46 were launcher shots): the launcher's draws were claimed by the grenade (the nearest weapon
+  entity) and posed with its palm hold. Any draw a hand's item claims that sits more than 5 cm from the item and on the
+  forearm (ArmCorrectJoint's segment) now takes the forearm's delta.
+- **ThrowGesture data**: the throw probe saw DOTO's grenade launch: exe+0x69166D sets an arkGrenade's velocity
+  (17.2 m/s); exe+0x67AE83 is the launcher's arkProjectile (90-250 m/s).
+- **Right hand stretched after the cutscene**: as the cutscene ended, the arm identification took the cutscene's own
+  hand models (2747 and 3633 vertices on a 245-bone skeleton) for the right arm, and their bones went into the right
+  arm's rig (69 bones -> 245). Cinematic now counts as "arms not the player's" (no identification or analysis until
+  135 frames after), and a mesh on a bigger skeleton than the arm skin's is left out of the rig.
+
+## Ported after the fifth session (static RE on the logs' leads)
+
+- **ThrowGesture on** (grenades leave with the hand's velocity, as in Dishonored 2): DOTO's Throw (exe+0x687BA0) hands the
+  launch to a helper (exe+0x691320) that sets the grenade's velocity at exe+0x691668 (the call the throw probe saw
+  return at exe+0x69166D) with the velocity at rsp+0x78 and the spawn point 0x10 below it (rsp+0x68, ComputeAimTarget's
+  output), which the launch (exe+0x68E970, r8 = rsp+0x68) reads after the velocity is set. The hook site, Throw, the
+  throw state (frame 0x58) and the message helpers are checked byte for byte (`kSite` added to PortCheckTable.inc,
+  169 entries). DOTO has no arkCpntMine (mines and razors are told apart only in the log). Log: `ThrowGesture: the
+  throw's velocity (exe+0x691668) redirected` and per throw `Throw: the game throws a GRENADE ...`.
+- **Entity names** (empty `''` everywhere in the logs): idEntity gained a pointer at +0x20, so the name's text is at
+  +0x28 (idEntity's constructor exe+0x8E23F0 against D2's exe+0x874CA5; the entity id 0xA8 -> 0xB0 is the same shift).
+  Fixed in Collision (readables, food at the mouth, windows, the shopkeeper), DoorHold and Probes.
+- **Infinite health** (`hp -1.0/-1.0` in the heartbeat): arkCpntHealthEvolved's maximum moved +8 to +0x11C (its init
+  exe+0x77C7D9 copies +0x20 there; D2 exe+0x71A5B4 to +0x114); the current health stays at +0x20 (exe+0x7A3FDB).
+- **Power cheats for Billie**: [Cheats.Powers] listed Dishonored 2's eleven powers. DOTO has six power items
+  (`generated/decls/inventoryitem/models/powers/...` in the game's index): `swapper`, `the_eye` and `mimic` (with the
+  new components arkCpntPowerSwapper / TheEye / Mimic: likely Displace, Foresight and Semblance) and `blink_billie`,
+  `darkvision_billie`, `phantasmal_link_billie` (the three the fifth session's player had equipped). The switches are
+  now those six (`UnlockSwapper`, `UnlockTheEye`, `UnlockMimic`, `UnlockBlinkBillie`, `UnlockDarkVisionBillie`,
+  `UnlockPhantasmalLinkBillie`), and the powers no longer bring the Outsider's mark (Billie has none; only
+  `UnlockOutsidersMark` / `vr givemark` give it). `UnlockPowers = 1` (hidden) or `vr givepower all` gives all six;
+  `vr givepower mimic` one. Which item is which in-game power: to confirm in game.
+- Verified, no change: the inventory's infinite-ammo counter +0x178 (arkKisculeNodeInfiniteAmmo inc exe+0x8064AF /
+  dec exe+0x80646F), mana +0x20/+0x2C (100/100 in game), the equipment's hand items +0x68/+0x70.
+
+## Logging added for the sixth session (PortCheck on)
+
+- **Wrist watch** (the launcher and its attachments: lighting, flicker, position): the 30 s sword watch now also sums
+  every draw of something worn on a forearm, by how it was posed (`forearm (worn)`, `forearm (claimed by the held
+  item)`, `palm (gadget)`, `hand delta (fallback)`, `other hand`), hand, pass, shaders and its lighting rows against
+  the drawn pose: `GpuTrace:   wrist  | <how> | hand ...`. Equipping the launcher (at most every minute) logs the next
+  150 weapon draws (`GpuTrace: wrist watch: ...`, then `gunparts`, UNCLAIMED included).
+- **HandFx research on** (the shock attachment's lightning off to the side; the powers' hand effects): every 60 s
+  `HandFx report` lists each joint query the engine made on the arms and on entities bound to them (caller addresses,
+  joint, the bound entity's vtable, EQUIP or other) and how far each lands from the drawn hand.
+- **Power watch**: while a power's player state runs (UsePower, Blinking, UsePhantasmalLink, DOTO's Swapper /
+  DespawnSwapper / Mimicking / UseMimic / VoidTear / UseHollow ...), every draw's VS, PS and render pass is counted;
+  every 60 s `PowerWatch: <state> ... VS / PS / pass by draws a frame in it / outside` ranks them (`ONLY-IN-POWER`).
+  Each window logs `PowerWatch: <state> begins: left hand <item> ...; states running: ...` and `ends after ... s; the
+  game camera went up to ... m` (Foresight's out-of-body camera). Holster::LastItem records each hand's item for it.
+
+## Sixth session (2026-11-08)
+
+Reported: the left hand turned 90 degrees counter-clockwise with Semblance and hook mines; the shock bolts' electric
+effect off to the left of the view, following the head; with grenades the wrist attachments seen twice, flickering,
+half transparent; in Foresight the world drawn double. All six power items given by the cheat.
+
+- **Powers identified** (PowerWatch): `the_eye` = Foresight (UsePower 0.7 s, then the `Flying` state for as long as the
+  flight lasts: 18 s here); `swapper` = Displace (UsePower, then `Swapper` with a 6-11 m jump); `mimic` = Semblance
+  (`UseMimic` with `Choke`, then `Mimicking`); `blink_billie` = a Blink that stops time while aiming (InBendTime, then
+  `Blinking`); `phantasmal_link_billie` (UsePhantasmalLink); `darkvision_billie` (UsePower 0.05 s). Item component classes:
+  arkCpntPowerTheEye 0x1C451A8, PowerSwapper 0x1C44A18, PowerMimic 0x1C44518, PowerPhantasmalLink 0x1C62B98,
+  PowerDarkVision 0x1C61918, PowerBlink 0x1CABF68.
+- **Left hand turned 90 deg** (Semblance, hook mine): both items' classes were unknown ("other"), so with three or more
+  draws claimed by their entity they were weapons -- pinned to the controller by their own axes, and at 13:21:27 a grip
+  and the hand's socket / hold were learned from Semblance's choke animation. A power (`BodyHide::HoldsPower`: the item
+  component's RTTI class starts `.?AVarkCpntPower`) is now never a weapon or gadget (the power hand's anatomical pose);
+  the hook mine (arkCpntHookMineEquipment 0x1C43928) is a gadget like the stun mine. `DVR_hands.txt` holds the bad
+  hold: delete it (rewritten from the defaults).
+- **Attachments seen twice**: the wrist watch showed the launcher's draws in the LEFT eye split about half and half
+  between the forearm and the palm (gadget) pose, the right eye's all on the forearm. The left eye's frame runs the
+  simulation, and a draw recorded before that frame's arm draw found the previous frame's arm snapshot, from which the
+  player had moved: the launcher's point fell off the arm, no forearm delta, the palm pose. The snapshot's model->world
+  is now carried along with the body frame (`F.bodyVr`), and a draw that still finds no forearm delta keeps the last
+  one, carried the same way (`WristLast`; `forearm (last delta kept)` in the watch).
+- **Electric effect off to the side, following the head**: HandFx corrected the arm joints but not the launcher's own
+  model, whose joints effects hang off; the launcher entity stays where the flat game's arm holds it (left of the
+  view, moving with the head). Joint queries on the equipped launcher's model now get the drawn forearm's delta
+  (`CorrectWristItem`, through `GpuTrace::ForearmDelta`; log `HandFx: wrist launcher (side 0) joint asked ...`). If the
+  effect is placed from the entity's origin rather than a joint, it stays; the log tells which.
+- **Foresight double**: not found yet. During the flight the DARKVISION pass draws (241 draws, 54 Mpixels per eye
+  against 0 normally) and DISTORTION goes full screen (22 Mpixels against 3); the suspect is a full-screen effect reading
+  a texture written in the previous frame (the other eye's picture in alternating stereo). `Flying` is now a power-watch
+  state, and 10 frames into the first two windows of each state the next 60 draws of DISTORTION / DARKVISION /
+  POSTPROC / POST_TONEMAP / EMISSIVE / ALPHA_LIT log the textures they read, with the pass that last wrote each and how
+  many frames ago (`PowerWatch: reads | ...`).
+- **Climbing by hand in Foresight**: the hands on a ledge during the flight read as pushed down 50 cm and pressed jump
+  every 10 ms; ClimbByHand is off while `Flying` runs.
+- **Ambient occlusion: "slight halos, several layers" round characters and objects** (AmbientOcclusion switched to 1
+  in the VR menu at 13:20:11, two minutes before the session ended; never validated in VR, in Dishonored 2 either).
+  With it on the SSAO pass is ONE full-resolution draw per eye (PS 7012fd32e80f486e, DWAO: a 4x4 per-pixel rotated
+  pattern of 2 depth taps, reading ro_ssao_zbuffer and the downsampled depth, AO in x and packed depth in z/w), no blur
+  of its own -- the dither is left to be smoothed later (by the TAA and whoever reads it). Suspects: TaaSharpening
+  (contrast-adaptive sharpening of the TAA result, on at 0.85) turning the AO's dark gradients at edges into rings; the
+  downsampled depth the AO reads; the reader's upsampling. No draw-by-draw frame was taken with AO on. Switching
+  AmbientOcclusion on now brings the next draw-by-draw frame within 10 s, and its SSAO draws log where their target
+  goes (`PassProfile:     SSAO #... writes target ... (read by: ...)`). A/B for the next session: AO on with
+  TaaSharpening = 0.
+- **Confirmed by the user: the sharpening outlined the halos.** Two changes:
+  - TaaSharpen v3: faint detail is not sharpened (the 3x3 neighbourhood's range under ~2% of its brightness, fading in
+    to ~6%: the AO dither's and the TAA's noise), and the step past the neighbours is limited to a quarter of their
+    range (the overshoot that draws a line beside an edge).
+  - **GTAO** (`AoGtao.cpp`, new; `[Display.Effects] AmbientOcclusionQuality = high`, @user, in the VR menu under
+    AmbientOcclusion; hidden `AmbientOcclusionRadius = 0.6` m, `AmbientOcclusionStrength = 1.0`): in each eye's SSAO
+    task the game's DWAO draw is replaced (GpuTrace::DwaoSkip, now also outside SkipDisabledEffects through
+    `PassProfile::SsaoAnyNow`) by a pixel shader drawn with everything the game bound -- t0 full-resolution depth, t1
+    half-resolution linear depth (z), cb1's inverse projection (rows c38..c41, the game's linear depth
+    -c41.z / (c40.w d + c41.w)) -- writing the same layout: visibility in x, 1 in y, the linear depth packed in z / w
+    exactly as DWAO packs it, so the game's bilateral blur (SCREENSHADOWS) and the lighting read it unchanged. GTAO
+    after XeGTAO: 2 slices x 4 steps each way of the half-resolution depth, the normal from the nearer neighbours, the
+    horizon angles integrated against the projected normal with a distance falloff (60% of the radius); the slice
+    angle and step offsets on a 4x4 pattern for the game's 4x4-aware blur. Status in the heartbeat's vrtweaks line
+    (`gtao active ... draws ...`), log `AoGtao: ...`. To measure: its cost per eye (SSAO in PassProfile; DWAO was
+    0.04 ms).
+
+## Seventh session (2026-11-08, afternoon)
+
+Reported: the new SSAO good but not dark enough at strength 1; severe judder moving side to side in the last 30 s
+although the game showed 90 fps; the wrist attachment still relocating and flashing, purely in the left eye; Foresight
+still double, the same way in each eye; hook mines can be thrown -- control them like grenades.
+
+- **Judder at 90 fps** (SimStep frame lock): the log's pacing was perfect (every pair shown one refresh after the last,
+  submits 10-12 ms apart, GPU 15 ms early), so the judder was in the simulation. The game clock (exe+0x5A790, called once
+  per simulated frame from RunFrame, never on a held frame) takes n = floor(lag * rate + 0.5) steps; with the step at the
+  refresh the leftover keeps whatever value it had, and the clock is read where RunFrame happens to start -- 1.8 to 6.4 ms
+  after the submit (PaceLog) -- so with the leftover near a half step the count flips 0, 2, 0, 2: frames 11 ms apart
+  showing 0 and 22 ms of motion. The clock is now hooked and fed whole steps of time: a frame whose real lag is 0.15 -
+  1.85 steps gets exactly one (a dropped frame still catches up; a slow drift corrects once by one step at 0.85). Only
+  while the ticks come one per refresh. Every 30 s `SimStep: 30 s: steps per simulated frame 0:a 1:b 2:c 3+:d | frame
+  lock ...`; the heartbeat's VrTweaks line carries SimStep::Status.
+- **Wrist attachment, left eye** (WristRel): the watch showed the left eye's launcher draws a third to three quarters
+  "forearm (last delta kept)", the right eye's a few per cent. The render tasks record in parallel; a launcher draw
+  recorded before the frame's first arm draw finds the previous frame's arm -- the same game tick in the right (held)
+  eye, the tick before in the left, with the controller moved since. Such a draw now takes the launcher where the
+  controller is now, at the pose relative to it of the last up-to-date draw (K = hand^-1 * Dw * entity). Watch label
+  `controller now (arm not yet drawn)`; the gpuhands line counts them.
+- **Foresight double** (StereoFeedback, new file): the power watch's reads showed the POSTPROC draw PS 6b05662764a19199
+  reading at t0 a half-size RGBA16F image the DISTORTION pass wrote one frame before, in the other eye's frame (every
+  sample, every power window); the distortion goes full screen in the flight. At each Present that texture is kept for
+  the finished frame's eye and the other eye's copy put back for the next frame (only while the draw was seen in the
+  last second; the POSTPROC tasks are instrumented for it). Heartbeat: `stereofeedback ... reads L R saved restored`.
+  Unconfirmed: if the doubling stays, the next suspect is the DARKVISION pass (150-220 draws, 4x overdraw) in the flight.
+- **SSAO darker**: AmbientOcclusionStrength default 2.0 (was 1.0), range 0.5 - 6, now in the VR menu under the quality.
+- **Hook mine thrown like a grenade** (ThrowGesture): it leaves as an arkGrenade entity from exe+0x69166D at 17.2 m/s
+  without an arkCpntGrenade; with the hook mine's equipment held it now gets the grenade's throw.
+- **Cheats: no Outsider's mark, powers by their game names** (asked): `UnlockOutsidersMark` is gone (Billie has her
+  powers without it; UnlockEverything no longer gives it either; the console's `vr givemark` stays for testing). The
+  power switches are named as players know them: `UnlockDisplace` (swapper), `UnlockForesight` (the_eye),
+  `UnlockSemblance` (mimic), and Original Game Plus's `UnlockBlink` (blink_billie), `UnlockDarkVision`
+  (darkvision_billie), `UnlockDomino` (phantasmal_link_billie) -- the game's OG+ replaces Billie's three with Corvo's
+  Blink and Dark Vision and Emily's Domino. An ini with the old key names keeps them unread: those switches start off.
+
+## Eighth session (2026-11-08, evening)
+
+Reported: frame pacing much better; the wrist attachments still broken (asked: a screenshot of both eyes on demand);
+the stronger the new SSAO, the more a moire pattern; the arms / hands / weapons darkening the scenery behind them; the
+left hand's reticle at a fixed depth with the weapons.
+
+- **Frame lock confirmed**: `steps 0:9 1:47469 2:313 3+:34` over the session (locked 47631, 289 corrected by a step).
+- **StickClickScreenshot** (`[System.Troubleshooting]`, hidden, default 1): both thumbstick clicks together save
+  `DVR_shot<n>_<hhmmss>_eye0.png` (left), `_eye1.png` (right) and `_frame.png` (the game's own image) in the game folder
+  (VRRuntime::RequestCapture: the eyes' last submitted images). While on, the chord no longer stands for the menu button
+  (it did, KbmInject; the Index has its menu on the left trackpad). Log: `KbmInject: both stick clicks = screenshot`.
+- **GTAO v2**: the horizon taps read the full-resolution depth at the exact pixel (the half-resolution buffer is a 2x2
+  reduction, not the block centre's depth: a 2-pixel grid of false occlusion on slanted planes, multiplied into moire
+  by the strength; nor need its content match this eye's depth where the moved arms are); 3 slices instead of 2.
+- **Left reticle depth / the launcher as the crossbow** (asked: "it needs to behave like the crossbow did in DH2"):
+  Billie's ranged weapon is the wrist launcher (arkCpntWeaponGaussGun, vtable exe+0x1C45768, an arkCpntWeaponRanged:
+  its init exe+0x3C2530 calls the ranged base's exe+0x68EEE0), not a gun or crossbow, so GunRay ignored it: no gun ray,
+  the ring at the fixed 8 m (`gunray ... aimed 0 ... nopose 143142`), the shot along the controller (CamSwap). It is now
+  one of GunRay's guns: the aim sensor traces its ray (people, props), the sweep the world, the ring sits on the hit, and
+  the shot goes along it (Prepare / FixSpawn, as the crossbow's). The ray leaves from its muzzle where it is DRAWN on
+  the forearm (the game's muzzle carried by the forearm's delta, `LauncherMuzzle`; the hand's muzzle when the arm's
+  delta is missing or more than 50 cm off), along the controller. A gun hand with no gun pose at all (a grenade, a
+  power not being cast) has its controller ray traced against the world (exe+0x68D5D0, static collision) for the ring
+  (GunRay::HandHit). Status: `handtrace N hits M | launcher muzzle on the forearm A not B`.
+- **The right hip's holster draws the wrist launcher** (asked: DOTO has no pistol or crossbow): Holster counts the
+  equipment entries whose item component is arkCpntWeaponGaussGun as the "pistol" kind. New `[Gameplay.Interaction]
+  LauncherHolster = lethal | shock` (@user, VR menu Gameplay > Interaction): the entry drawn is the lethal ammunition's
+  (bullet / bolt_regular / makeshift: Voltaic Shot) or the shock one's (pellet_electrified: Electrical Burst), the last
+  held of that kind first; none with a quantity: what it has (logged). DOTO's ammunition items:
+  components/equipment/ammo/bullet, bolt_regular, bolt_incendiary, bolt_flashbang, bullet_explosive;
+  components/equipment/dlc01/ammo/makeshift, pellet_electrified, gum_bullet (hagpearl). Whether the equipment list has
+  an entry per ammunition (as Dishonored 2's pistol had) is to be seen: the draw logs `the inventory has: [...]`.
+- **Hook mine: a short trigger switches it, a long one throws it** (asked). The game's button throws it on a TAP and
+  switches lethal / non-lethal on a HOLD (+ChangeWeaponState from the press; measured 17:05: released after 0.17 s it
+  was thrown, after 0.37 / 0.61 s it switched). With the hook mine in the left hand the trigger goes to the game only
+  at its release: within 0.35 s the button is held 0.6 s for the game (switch), longer a 0.1 s tap (throw, with the
+  hand's velocity at the release through ThrowGesture). A short buzz when a held trigger becomes a throw. Log:
+  `KbmInject: hook mine: trigger held ... s: THROW / switch`.
+
+## Ninth session (2026-11-08, night): the launcher on the forearm, SSAO behind the arms
+
+From the stick-click screenshots (both eyes) and the wrist watch:
+- **The wrist launcher and its parts jumped between the forearm and other places.** The watch: about 6 in 10 of its
+  draws, in BOTH eyes, were recorded before that view's first arm draw (the render tasks record in parallel), and
+  took "the controller now" -- an offset to the controller learned from the 1 in 20 draws that were up to date,
+  wrong as soon as the wrist bends; the rest took the arm. Two poses per frame, blended by the TAA: the
+  half-transparent launcher. Its parts (bolts, balls, cylinders: separate draws) did the same independently.
+  Now (`WristDelta`): one arm frame PER VIEW, kept in a small ring by view serial. The first launcher draw of a view
+  picks the view's own arm frame if that arm was drawn already, else the newest one before it; every other draw of
+  that view takes the same pick. A pick from the view before is carried to this view by the controller's move since
+  (the drawn forearm rides the controller) with the game's own move of the arm taken out (the launcher's entity
+  when it is the held item, else the arm entity: then * now^-1, so the draw's matrix -- this view's game tick -- is
+  taken back to the arm frame's tick). The "controller now" path (WristRel) is gone.
+- **The launcher drawn where the flat game has it (low on the left, off the arm).** A draw with a pose of its own
+  (useOwnDv) still had to pass the "hand anchored" gate of a held weapon, which a hand with no equipment entity (a
+  power, nothing) or one re-anchoring after a swap (a grenade, a mine) never passes: those draws were left unmoved.
+  Now such a draw is kept (counted: `kept although the hand was not anchored`).
+- **Parts no item claims** (the launcher's shadow-map draws; its parts with a grenade / power in the hand): the index
+  counts of draws found worn on a forearm are remembered (`gpuhands: draws of N indices are worn on a forearm`), and
+  such a draw that nothing claims but that sits on a game forearm goes with it (`claimed by no item`). A draw a
+  grenade claims goes with the forearm when it is on it or is a known worn draw.
+- Log: `gpuhands: draws posed with the forearm ...: with the arm of their own view L R, of the view before, carried
+  L R (the game's move taken out by an entity L R), claimed by no item L R ...`; the watch's labels "forearm of the
+  view before, carried" (7) and "forearm (claimed by no item)" (8).
+- **SSAO: the arms still darkened the floor behind them** (strength 6). GTAO v3: thin-occluder compensation -- a tap
+  IN FRONT of the pixel counts its depth gap 4 times in the falloff, so the arms (and any silhouette) 0.15 m or more
+  in front of a surface at the default 0.6 m radius no longer occlude it; creases still do.
+
+- **Left reticle: several dots, and the ring behind people.** Not the projection (Dishonored 2's fixes -- arm-draw
+  projections only from the main views, the same eye's view when the presented one has none -- are in): the depth
+  log showed the gun trace flipping frame by frame between two depths (sweep 3.3 / 10.9 m, 11.0 / 3.6 m ...), and the
+  "jumps with the ray still" were those flips seen with parallax from the eye. The launcher's muzzle (GunRay's
+  LauncherMuzzle) came from the render's forearm delta read on the game thread: missing or off for 6 calls in 10
+  (`launcher muzzle on the forearm 53606 not 85589`), when the ray left from the hand's muzzle 15 cm away. And the aim
+  sensor's hit on a person (2.9 m, the wall behind at 5.6) was dropped as off the current ray. Now the drawn muzzle is
+  learned in the weapon's frame (controller and grip) from the calls that find the forearm (smoothed; a lasting
+  change taken over after 45 calls) and the ray always leaves from it; the sensor's hit counts within 3 cm or 1.5% of
+  the ray (was 2 cm / 1%). Status: `launcher muzzle on the forearm A not B, from the learned muzzle C`.
+
+- **Foresight double: not fixed yet, instrumented** (reported: the double image disappears in a screenshot; it looks like
+  every other frame pair flips between two positions). The session's log has nothing that alternates: the physics step
+  was 1 per frame through the flight (frame lock), the right eye's view is the left one's camera with the other eye's
+  offset (g_Pair), StereoFeedback saved / restored every Present. Added: (1) `vr stereofeedback 0|1` (A/B: 0 = the
+  game's, each eye reads the other eye's distortion image); (2) a flight trace -- the first 150 Presents of each of the
+  first four flights, one line each: the image's eye and view serial, the view's origin and forward, the headset pose,
+  the distortion image's reads per eye in that frame, what StereoFeedback did (`StereoFeedback: flight #n present ...`);
+  (3) the stick-click screenshot in the flight also saves 8 consecutive frames (`DVR_<tag>_b00..b07.png`, alternate
+  eyes, copied on the GPU without a stall and written after): two interleaved positions in one eye show there.
+
+- **Loaded into the level and the game never started (black, audio only, controls dead).** The 30 s line: `steps 0:2700
+  1:0 | frame lock: locked 2700 (of them not one step: 2700)` -- the frame lock fed the game clock NO time on every
+  frame from 2 s into the level on, so nothing simulated: KbmInject's "is the game simulating" (the player's aim update)
+  read false, the mode went to "menu" and ScreenMode put the (black) picture on the menu screen. How the lag came to
+  read under 0.15 steps every frame is not known yet. Safety net: 6 frames in a row with no step from the lock and it
+  lets go for 3 s without putting its offset back (time flows on from where it stands), logging the numbers (`SimStep:
+  the frame lock gave 6 frames in a row no step ...`); the heartbeat's SimStep status counts `let go`.
+
+## Tenth session (2026-11-08, late): the wrist launcher as one rigid piece per view
+
+The second pass (WristDelta, the gate exception, WristKey) did not fix it. Session log 7bc18a99 and the code showed why:
+
+1. **Each draw posed at its own origin.** The body (43260 indices) sits on the launcher entity; the drum (12042, unskinned) sits 7.5 cm off it. The forearm delta is not one rigid move: the twist is interpolated along the forearm, and past the wrist the hand's delta applies. So two parts of one rigid object got different moves, and a part near the wrist flipped between the forearm and hand segments. This is the drum floating off the launcher.
+2. **Fallback cascade.** A draw whose own point found no arm delta fell through to the GADGET palm pose. That was 2453 of ~37000 launcher draws in one 30 s window, mostly the drum. Other fallbacks were the hand delta, and WristRecall, which only remembered exact frames (how 1), and those happen about once a minute.
+3. **Something else in the hand (grenade, mine, power).**
+   - The launcher's draws were claimed by that item's anchor and posed as a gadget in the palm. This is the launcher floating by the grenade.
+   - Otherwise they were left at the flat game's position (bare forearm).
+   - The anchoring gate (`!g_RestModelValid[hand]`) dropped them while the hand had a power or nothing, and during every re-anchoring. The exception for own-pose draws never applied because `ai` is passed for every draw (always non-null).
+4. **Lightning (HandFx) placed with a different, per-joint delta** (ForearmDeltaWorld at the joint's own point).
+
+Also noted: arm frames of the view's own arm were used for 4 views in 25 min. The launcher sorts before the arm in each view, so the "view before, carried" path is the normal path, not a fallback.
+
+**Fix (`vr wristrig 1`, default; `0` = the old per-draw rule for A/B):**
+
+- **Identification first, before every other rule.**
+  - A draw is the launcher's when the held launcher entity claims it, or when its mesh is a known key.
+  - Key = (index count, VB0, side). It is learned from the held launcher's draws within 20 cm of its entity. Meshes of 1000+ indices are also stored with any VB.
+  - 43260 and 12042 are seeded for side 0.
+  - The key check needs the draw to be within 1 m of that side's arm anchor.
+  - Keyed draws never reach the gadget, other-hand or claimed paths.
+- **WristRigDelta(side, view, ...)**
+  - Makes ONE rigid world delta per view: the first draw of the view computes it, and it is cached in `g_WristView[side][view % 8]` (first stored wins).
+  - The delta is the forearm delta at a reference point on the forearm bone line, at `g_WristRefK` (elbow 0 → wrist 1, clamped 0.2..0.97).
+  - That reference is learned (EMA) from where the held launcher entity projects onto the forearm.
+  - With no frame: the last pose, body-carried (WristRemember is now called on every computed view). With no last pose: unmoved, which is right in takedowns.
+- **Gate fixed:** a wrist draw with its own pose (`t_WristDraw != 0`, not an arm draw) is drawn even while the hand is not anchored.
+- **Claimed path cleanups:**
+  - A claimed part on the forearm uses the rigid pose.
+  - The WristRecall fallback for `claimedNoArm` is off under wristrig, because it would carry a grenade's own parts off with the forearm.
+- **HandFx `CorrectWristItem`** uses `GpuTrace::WristDeviceDelta`: the same rigid pose, latest view, carried with the body. ForearmDelta remains as a fallback.
+
+**New 30 s log line: `gpuhands: wrist rig (vr wristrig N) | L: ...`**
+
+- Views posed from their own arm / the view before / kept / none.
+- Draws, and draws left unposed.
+- The reference k, the launcher origin's k range, how far it is off the bone line, and how far past the wrist.
+- View-to-view jump of the drawn reference in the controller frame, by arm-frame age (0, 1, 2, 3+): mean/max cm and degrees, and the count over 1 cm / 3°. A big carried-vs-own difference means the C/E compensation is wrong.
+- What the old per-draw rule would have done on sampled draws: segment counts (hand/forearm/upper/none), and the offset from the rigid pose at the part.
+
+Watch `how` values 9–11 = RIGID own / carried / kept.
+
+Files: GpuTrace.cpp/.h, HandFx.cpp, Commands.cpp.
+
+### Foresight double: found (same session)
+
+The flight trace showed the cause. The left eye's view origin alternated, one simulated frame in two, between two points with the same forward:
+- 0.39 m apart while hovering (flight #2);
+- 0.5-0.9 m apart while flying (flight #1), two parallel trajectories.
+
+The second point sits 0.24 m forward, 0.12 m left and 0.28 m down of the first, which is where the left controller is (Foresight is held in the left hand). The user's 13-frame burst shows the same two viewpoints alternating.
+
+Cause: the throw-preview and placement sensors' CamSwap (PowerAimMask 66, every frame, on job threads) writes the controller pose into the camera eye (cam+0xC8) and the player view origin (+0x310) while they run. The flight camera is not drawn through the shake / renderView hooks that wait on `g_SwapMx`, so it read the camera mid-swap and flew from the hand every other frame.
+
+Fix: CamSwap::Apply does nothing while `Flying` runs.
+- `vr flightcamswap 1` restores the old behaviour (A/B).
+- Log: `HandAimHook: Foresight's flight: the sensors' camera swaps to the hand are skipped ...`.
+- The heartbeat's poweraim line has `flightskips N`.
+- The StereoFeedback flight trace stays: the left-eye origin step `d` should now be the flight's own motion only.
+
+Files: HandAimHook.cpp/.h, Commands.cpp.
+
+## Eleventh session (2026-11-08, late): the wrist launcher moved TWICE
+
+Session 389e58ac, with the one-rigid-pose rig in: every launcher draw was identified and posed (watch: 100% "RIGID: the view before, carried"). The drawn reference stayed put relative to the controller (mean 0.05 cm view to view). Yet the screenshots show two things:
+- with the launcher held, its ammunition cartridge floats about 25 cm to the right;
+- with a grenade, mine or Foresight in the hand, the launcher floats off a bare forearm in some shots and sits on it in others.
+
+So the game itself had those pieces off the game's forearm. The HandFx report says why: HandFx moved them first.
+- The launcher's entity is bound to forearm joint 65. Once another item is in the hand it is no longer "equipment", so its bind was corrected onto the drawn forearm (`bind other vt 0x1D0DD88 joint 65 ... corrected 1695 of 2810, moved 0.23 m`).
+- The cartridge is bound to a joint of the launcher's model (`wrist launcher joint asked in a bind -> moved 0.26 m`).
+- GpuTrace then moved their draws onto the drawn forearm a second time.
+- Whether HandFx found an arm frame (6 times in 10) decided frame by frame which place they were drawn in.
+
+Fix (HandFx.cpp): binds of the worn launcher are left animated. The launcher is recognised by its entity, remembered while held, or as an unequipped equipment-class entity (vt 0x1D0DD88) bound on the forearm. Binds of anything hung off the launcher's model are also left animated. Direct joint queries on the launcher (effects) are still corrected.
+
+Logging:
+- `HandFx: ... left as animated` (first 24).
+- The 30 s line `gpuhands: HandFx ...` carries the counts.
+- Per piece (GpuTrace `WristPieceNote`), every 30 s per mesh (`wristpiece: n=... vb ...`):
+  - where the GAME has it on the game's forearm (k elbow->wrist, cm off the bone line, x-axis angle);
+  - OFF THE ARM count;
+  - distance from the held launcher's entity;
+  - view-to-view jumps;
+  - eyes and passes.
+- `wristpiece detail: ...` gives every off-arm, jumping or unposed draw with all its numbers (40 per 30 s, 600 total).
+
+### Foresight double, second pass (same session)
+
+The CamSwap skip did not fix it. The new log's flight trace still alternates every simulated frame, by 0.52 m, with the CamSwap skip logged as active. The user confirmed that moving the LEFT controller moves the second image.
+
+The remaining per-frame write of the hand's pose into the camera is UpdateAimHook's aim override, which writes m_aimOrigin and m_aimAxis from the power hand (Foresight is in the left hand). That override is now off while `Flying` runs. `vr flightcamswap 1` brings both writes back for an A/B test.
+
+Logging:
+- The first 120 ticks of each flight log `HandAimHook: flight tick ...`: the camera eye, the game's aim origin, and the hand's pose the override would have written.
+- The heartbeat's poweraim line has `flightaimskips N`.
+
+## Twelfth session (2026-11-08, night): the launcher's effects, people on the reticle's ray
+
+The user confirmed: the wrist attachments are much more stable now.
+
+### The electric effect beside the head
+
+Still drawn off to the side, following the head: the flat game's launcher position.
+
+Cause (log 57310700):
+- The launcher's own joints were asked for directly only in bursts at the equip (`direct joint queries corrected 306`, flat afterwards).
+- The cartridge's bind asked for them every frame (GunRay `bound-left 93108`).
+- So the effect is placed by the cartridge (or the launcher entity), both now left animated. Particles are not moved by the GPU pass.
+
+Fix (GunRay.cpp, "what hangs off the WRIST LAUNCHER"):
+- Entities bound to a launcher joint are learned from their binds (`GunRay: entity ... hangs off the left wrist launcher`).
+- Every world joint query (exe+0x58D380) on the launcher's entity or on such a piece is carried by `GpuTrace::WristDeviceDelta`, the launcher draws' own rigid pose. Skipped inside the bind of an entity with a model (its draws are GPU-moved) and when HandFx already moved the joint (`HandFx::WristFixesOnThread`).
+- FX bound to those entities without a joint (FxUpdateHook) and newly started FX (FxStartHook) get the same pose.
+- The launcher is no longer handed the hand's weapon pose (OntoDrawn) for these queries: that moved the equip bursts twice.
+- Heartbeat: `wrist fx: joints carried ... fx re-placed ... started ... pieces L ...`. First 24 carried queries logged with joint, caller and gap.
+
+### The left reticle ignores people
+
+Two holes:
+- With a power, grenade or mine in the left hand (most of the session), the ring came from the static-only ray test. People were never seen.
+- With the launcher, the aim sensor's point on a person was 46-75 cm off the ray (the target's body point), past the 35 cm reach.
+
+Fix (GunRay.cpp `PersonOnRay`): both rays (gun and hand) are tested against standing characters directly. The entity table is scanned every 0.3 s within 60 m (`Collision::IsCharacterEnt`, alive and standing). Each is an upright cylinder from the origin (feet) up 1.85 m, radius 0.30 m. The entry point is the ring's depth when it is nearer than the wall.
+
+Logging:
+- `GunRay: the {gun|hand's} ray meets ... at X m, Y m above his feet` (first 30): Y checks the feet assumption.
+- Heartbeat: `people: N standing near (scans N), the ring on one: gun ray N hand ray N`.
+- Reticle jump log: source `hand ray traced`, and `A PERSON` on samples on a person.
 
 ## Not yet DOTO-specific
 

@@ -14,6 +14,9 @@
 #include "Settings.h"
 #include "StereoSync.h"
 #include "Reticle.h"
+#include "SimStep.h"
+#include "StereoFeedback.h"
+#include "AoGtao.h"
 
 namespace
 {
@@ -411,5 +414,5 @@ std::string VrTweaks::Status()
 {
     return fmt::format("vrtweaks active {} dof {} ao {} fog {} (r_skipFog now {}) views flagged {} map '{}'{}", g_Active.load() ? 1 : 0,
                        g_Enabled.load() ? "off" : "game", g_Ao.load() ? "game" : "off", g_Fog.load() ? "game" : "off",
-                       CVars::GetInt("r_skipFog", -1), g_Views.load(), MapName(), g_MapFog ? " (fog kept: FogMaps)" : "");
+                       CVars::GetInt("r_skipFog", -1), g_Views.load(), MapName(), g_MapFog ? " (fog kept: FogMaps)" : "") + " | " + AoGtao::Stats() + " | " + SimStep::Status() + " | " + StereoFeedback::Status();
 }

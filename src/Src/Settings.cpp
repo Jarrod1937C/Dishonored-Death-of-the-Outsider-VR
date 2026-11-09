@@ -79,6 +79,8 @@ namespace
         { "gameplay.knockoutsoundvolume", Kind::Float, "0.8", 0, 1, nullptr },   // MeleeAim: the hit sound of a knockout blow (0 = none)
         { "advanced.skipintrovideos",   Kind::Bool,   "1", 0, 0, nullptr },   // BinkVideo: the start-up videos end at once
         { "system.debuglogging",        Kind::Bool,   "0", 0, 0, nullptr },   // [System.Troubleshooting]: WriteLog + ProfileRenderPasses in one
+        { "system.portcheck",           Kind::Bool,   "0", 0, 0, nullptr, true },   // [System.Troubleshooting] PortCheck: the DOTO port's checks in the log
+        { "system.stickclickscreenshot", Kind::Bool,  "1", 0, 0, nullptr, true },   // [System.Troubleshooting]: both stick clicks save both eyes' pictures (KbmInject)
         { "gameplay.finisheranimations", Kind::Bool,  "0", 0, 0, nullptr, true },   // MeleeAim: 0 = no finishing-move kill animations, no kill cam
         { "gameplay.pulltoopen",        Kind::Bool,   "1", 0, 0, nullptr, true },   // Collision + KbmInject: grab and pull drawers / cabinets open
         { "gameplay.physicalpickup",    Kind::Bool,   "1", 0, 0, nullptr, true },   // items taken by hand, stored behind the back
@@ -88,6 +90,7 @@ namespace
         { "gameplay.swipedials",        Kind::Bool,   "1", 0, 0, nullptr, true },   // Collision: slide a hand up / down a safe dial to turn it
         { "gameplay.slidewindows",      Kind::Bool,   "1", 0, 0, nullptr, true },   // Collision: slide a hand up / down a window to raise / lower it
         { "gameplay.holsterweapons",    Kind::Bool,   "1", 0, 0, nullptr, true },   // Holster: left trigger at the left hip = pistol, behind the back = crossbow
+        { "gameplay.launcherholster",   Kind::Choice, "lethal", 0, 0, "lethal|shock" },   // Holster (DOTO): the right hip's wrist launcher comes loaded with this
         { "gameplay.pushstrength",      Kind::Float,  "0.8", 0.1f, 10, nullptr, true },   // the hand's effective mass, kg
         { "gameplay.throwgestures",     Kind::Bool,   "1", 0, 0, nullptr, true },
         { "gameplay.grabobjects",       Kind::Bool,   "1", 0, 0, nullptr, true },
@@ -134,7 +137,8 @@ namespace
         { "display.renderscale",        Kind::Float,  "1", 0, 2, nullptr },
         { "display.taasharpening",      Kind::Float,  "0.85", 0, 1, nullptr },   // TaaSharpen: the TAA's result sharpened in the headset (0 = off)
         { "display.taaskymotion",       Kind::Bool,   "1", 0, 0, nullptr, true },   // hidden: SkyMotion: the sky given motion vectors for the TAA
-        { "display.handdepth",          Kind::Bool,   "1", 0, 0, nullptr, true },   // hidden: GpuTrace: the hands sort by their real distance (no first-person depth hack)
+        { "display.handdepth",          Kind::Bool,   "1", 0, 0, nullptr, true },
+        { "display.weaponshadows",      Kind::Bool,   "1", 0, 0, nullptr, true },   // hidden: GpuTrace: the held weapon drawn into the shadow maps (0 = not: the sword flicker A/B)   // hidden: GpuTrace: the hands sort by their real distance (no first-person depth hack)
         { "display.highresolution",     Kind::Bool,   "0", 0, 0, nullptr, true },   // 0.1.0's ini; replaced by RenderScale
         { "display.disablemotionblur",  Kind::Bool,   "1", 0, 0, nullptr, true },
         { "display.disableheadbob",     Kind::Bool,   "1", 0, 0, nullptr, true },   // VrTweaks: pm_noBob 1 while the headset shows the game
@@ -142,6 +146,9 @@ namespace
         { "display.vrgraphicstweaks",   Kind::Bool,   "1", 0, 0, nullptr, true },   // VrTweaks: no depth of field in VR
         { "display.skipsneakoverlay",   Kind::Bool,   "1", 0, 0, nullptr, true },   // PassProfile / GpuTrace: the sneak mode's screen overlay not drawn in the eyes
         { "display.ambientocclusion",   Kind::Bool,   "0", 0, 0, nullptr },   // VrTweaks: 0 = no ambient occlusion in VR
+        { "display.ambientocclusionquality", Kind::Choice, "high", 0, 0, "game|high" },   // AoGtao: high = GTAO in the game's AO draw's place
+        { "display.ambientocclusionradius", Kind::Float, "0.6", 0.1f, 3.f, nullptr, true },   // AoGtao: metres
+        { "display.ambientocclusionstrength", Kind::Float, "2.0", 0.5f, 6.f, nullptr },   // AoGtao: the power on the visibility (1.0 was too light: 2026-11-08)
         { "display.fog",                Kind::Bool,   "0", 0, 0, nullptr, true },   // VrTweaks: 0 = no game fog in VR (but in FogMaps); hidden, core VR
         { "display.fogmaps",            Kind::Text,   "void,dunwall_return_tower_p", 0, 0, nullptr, true },   // VrTweaks: ...except in maps named so
         { "display.fogmapsresolution",  Kind::Float,  "1", 0, 1, nullptr, true },      // VrTweaks: the game's fog buffers there (1 full, 0.5, 0.25, 0 = the game's)
@@ -178,25 +185,19 @@ namespace
         { "display.cutscenearms",       Kind::Bool,   "0", 0, 0, nullptr, true },
         { "cheats.unlockeverything",    Kind::Bool,   "0", 0, 0, nullptr },
         // the parts of it, each on its own (TestAids::Unlock)
-        { "cheats.unlockoutsidersmark", Kind::Bool,   "0", 0, 0, nullptr },
         { "cheats.unlockpowers",        Kind::Bool,   "0", 0, 0, nullptr, true },   // hidden (2026-11-01): the powers are chosen one by one ([Cheats.Powers])
         { "cheats.unlockpowerupgrades", Kind::Bool,   "0", 0, 0, nullptr },
         { "cheats.unlockblackmarketupgrades", Kind::Bool, "0", 0, 0, nullptr },
         { "cheats.unlockweapons",       Kind::Bool,   "0", 0, 0, nullptr },
         { "cheats.fillammoandgadgets",  Kind::Bool,   "0", 0, 0, nullptr },
         { "cheats.fillelixirs",         Kind::Bool,   "0", 0, 0, nullptr },
-        // each power on its own ([Cheats.Powers]; Settings::PowerUnlocks: the parts of their item names)
-        { "cheats.unlockblink",           Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockfarreach",        Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockdarkvision",      Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockpossession",      Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockdevouringswarm",  Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockbendtime",        Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockwindblast",       Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockdomino",          Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockdoppelganger",    Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockmesmerize",       Kind::Bool,   "0", 0, 0, nullptr },
-        { "cheats.unlockshadowwalk",      Kind::Bool,   "0", 0, 0, nullptr },
+        // each power on its own ([Cheats.Powers], named as the game names them; Settings::PowerUnlocks: their item names)
+        { "cheats.unlockdisplace", Kind::Bool, "0", 0, 0, nullptr },
+        { "cheats.unlockforesight", Kind::Bool, "0", 0, 0, nullptr },
+        { "cheats.unlocksemblance", Kind::Bool, "0", 0, 0, nullptr },
+        { "cheats.unlockblink", Kind::Bool, "0", 0, 0, nullptr },
+        { "cheats.unlockdarkvision", Kind::Bool, "0", 0, 0, nullptr },
+        { "cheats.unlockdomino", Kind::Bool, "0", 0, 0, nullptr },
         { "cheats.infinitemana",        Kind::Bool,   "0", 0, 0, nullptr },
         { "cheats.infiniteammo",        Kind::Bool,   "0", 0, 0, nullptr },
         { "cheats.infinitehealth",      Kind::Bool,   "0", 0, 0, nullptr },
@@ -382,6 +383,8 @@ std::vector<std::string> Settings::PackageCommands()
 }
 
 bool Settings::StatusFile() { return B("logging.writestatusfile"); }
+bool Settings::PortCheck() { return B("system.portcheck"); }
+bool Settings::StickClickScreenshot() { return B("system.stickclickscreenshot"); }
 bool Settings::WriteLog() { return B("logging.writelog") || B("system.debuglogging"); }
 bool Settings::LogInput() { return B("logging.logcontrollerinput"); }
 bool Settings::Haptics() { return B("controls.haptics"); }
@@ -389,6 +392,7 @@ float Settings::RenderScale() { return F("display.renderscale"); }
 float Settings::TaaSharpening() { return F("display.taasharpening"); }
 bool Settings::TaaSkyMotion() { return B("display.taaskymotion"); }
 bool Settings::HandDepth() { return B("display.handdepth"); }
+bool Settings::WeaponShadows() { return B("display.weaponshadows"); }
 float Settings::ControllerPitchOffset() { return F("controls.controllerpitchoffset"); }
 bool Settings::FingerTracking() { return B("controls.fingertracking") && V("controls.layout") == "index"; }
 bool Settings::SwordBladeDamage() { return B("gameplay.swordbladedamage"); }
@@ -442,18 +446,13 @@ bool Settings::FarReachVRComfortOption() { return B("gameplay.farreachvrcomforto
 std::string Settings::PowerUnlocks()
 {
     // the part of each power's inventory item name (models/powers/<x>/<x>.inventoryitem; ENGINE.md 10.1)
-    static const std::pair<const char*, const char*> kPowers[] = {
-        { "cheats.unlockblink", "blink" },
-        { "cheats.unlockfarreach", "grapple" },
-        { "cheats.unlockdarkvision", "darkvision" },
-        { "cheats.unlockpossession", "possession" },
-        { "cheats.unlockdevouringswarm", "devouring_swarm" },
-        { "cheats.unlockbendtime", "bendtime" },
-        { "cheats.unlockwindblast", "windblast" },
-        { "cheats.unlockdomino", "phantasmal_link" },
-        { "cheats.unlockdoppelganger", "doppelganger" },
-        { "cheats.unlockmesmerize", "mesmerize" },
-        { "cheats.unlockshadowwalk", "shadow_walk" },
+    static const std::pair<const char*, const char*> kPowers[] = {   // DOTO: its six power items (D2: Corvo's and Emily's eleven)
+        { "cheats.unlockdisplace", "swapper" },                 // Displace
+        { "cheats.unlockforesight", "the_eye" },                // Foresight
+        { "cheats.unlocksemblance", "mimic" },                  // Semblance
+        { "cheats.unlockblink", "blink_billie" },               // Blink (Original Game Plus)
+        { "cheats.unlockdarkvision", "darkvision_billie" },     // Dark Vision (Original Game Plus)
+        { "cheats.unlockdomino", "phantasmal_link_billie" },    // Domino (Original Game Plus)
     };
     std::string s;
     for (const auto& p : kPowers) if (B(p.first)) s += (s.empty() ? "" : ",") + std::string(p.second);
@@ -463,14 +462,16 @@ unsigned Settings::Unlocks()
 {
     // UnlockEverything: everything but the powers (2026-11-01: one switch for all powers next to a list of the single
     // powers was confusing -- the powers come from [Cheats.Powers] only; the hidden UnlockPowers still adds them all)
-    if (B("cheats.unlockeverything")) return (127u & ~2u) | (B("cheats.unlockpowers") ? 2u : 0u);
-    return (B("cheats.unlockoutsidersmark") ? 1u : 0u) | (B("cheats.unlockpowers") ? 2u : 0u) | (B("cheats.unlockpowerupgrades") ? 4u : 0u)
+    // DOTO: never the Outsider's mark (bit 1): Billie's powers do not need it, she has them from the start (2026-11-08)
+    if (B("cheats.unlockeverything")) return (127u & ~3u) | (B("cheats.unlockpowers") ? 2u : 0u);
+    return (B("cheats.unlockpowers") ? 2u : 0u) | (B("cheats.unlockpowerupgrades") ? 4u : 0u)
          | (B("cheats.unlockblackmarketupgrades") ? 8u : 0u) | (B("cheats.unlockweapons") ? 16u : 0u) | (B("cheats.fillammoandgadgets") ? 32u : 0u)
          | (B("cheats.fillelixirs") ? 64u : 0u);
 }
 bool Settings::SwipeDials() { return B("gameplay.swipedials"); }
 bool Settings::SlideWindows() { return B("gameplay.slidewindows"); }
 bool Settings::HolsterWeapons() { return B("gameplay.holsterweapons"); }
+bool Settings::LauncherHolsterShock() { return V("gameplay.launcherholster") == "shock"; }
 float Settings::SwordBodyDepth() { return F("gameplay.swordbodydepth") / 100.f; }
 float Settings::PushStrength() { return F("gameplay.pushstrength"); }
 float Settings::GripThreshold(int hand)
@@ -521,6 +522,9 @@ bool Settings::VrGraphicsTweaks() { return B("display.vrgraphicstweaks"); }
 bool Settings::DisableMotionBlur() { return B("display.disablemotionblur"); }
 bool Settings::DisableHeadBob() { return B("display.disableheadbob"); }
 bool Settings::AmbientOcclusion() { return B("display.ambientocclusion"); }
+bool Settings::AmbientOcclusionHigh() { return V("display.ambientocclusionquality") != "game"; }
+float Settings::AmbientOcclusionRadius() { return F("display.ambientocclusionradius"); }
+float Settings::AmbientOcclusionStrength() { return F("display.ambientocclusionstrength"); }
 bool Settings::Fog() { return B("display.fog"); }
 bool Settings::ProfileRenderPasses() { return B("logging.profilerenderpasses") || B("system.debuglogging"); }
 bool Settings::LogMenuData() { return B("logging.logmenudata"); }
@@ -641,12 +645,15 @@ namespace
         { "touchtouse", "1" },
         { "climbbyhand", "1" },
         { "swimstrokes", "1" },
+        { "launcherholster", "lethal" },
         { "sitholdtime", "0.8" },
         { "sitheight", "80" },
         { "renderscale", "1" },
         { "taasharpening", "0.85" },
         { "disablemetaasw", "1" },
         { "ambientocclusion", "0" },
+        { "ambientocclusionquality", "high" },
+        { "ambientocclusionstrength", "2.0" },
         { "reticleopacity", "0.4" },
         { "huddistance", "2" },
         { "hudscale", "0.8" },
@@ -671,23 +678,17 @@ namespace
         { "outofviewmask", "2" },
         { "fpscounter", "off" },
         { "unlockeverything", "0" },
-        { "unlockoutsidersmark", "0" },
         { "unlockpowerupgrades", "0" },
         { "unlockblackmarketupgrades", "0" },
         { "unlockweapons", "0" },
         { "fillammoandgadgets", "0" },
         { "fillelixirs", "0" },
+        { "unlockdisplace", "0" },
+        { "unlockforesight", "0" },
+        { "unlocksemblance", "0" },
         { "unlockblink", "0" },
-        { "unlockfarreach", "0" },
         { "unlockdarkvision", "0" },
-        { "unlockpossession", "0" },
-        { "unlockdevouringswarm", "0" },
-        { "unlockbendtime", "0" },
-        { "unlockwindblast", "0" },
         { "unlockdomino", "0" },
-        { "unlockdoppelganger", "0" },
-        { "unlockmesmerize", "0" },
-        { "unlockshadowwalk", "0" },
         { "infinitemana", "0" },
         { "infiniteammo", "0" },
         { "infinitehealth", "0" },

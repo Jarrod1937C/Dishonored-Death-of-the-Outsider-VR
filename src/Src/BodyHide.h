@@ -46,11 +46,22 @@ namespace BodyHide
     constexpr uint32_t kHeartCpntVtable   = 0x1CAA158;  //!< arkCpntHeart
     constexpr uint32_t kThrowableCpntVtable = 0x1CADE18; //!< arkCpntWeaponThrowable
     constexpr uint32_t kPlaceableCpntVtable = 0x1C64298; //!< arkCpntWeaponPlaceable (stun mine, spring razor)
+    //! DOTO: arkCpntHookMineEquipment -- the hook mine is not a placeable (reported 2026-11-08: as an unknown item its
+    //! draws made it a weapon, pinned to the controller by its own axes, and the hand came out turned 90 degrees)
+    constexpr uint32_t kHookMineCpntVtable = 0x1C43928;
     constexpr uint32_t kTimeShiftCpntVtable = 0x1C637F8; //!< arkCpntTimeShiftDevice: the Timepiece (A Crack in the Slab; the class still exists in DOTO)
     uint32_t HeldItemClass(int side);
     constexpr uint32_t kGunCpntVtable      = 0x1C63C58; //!< the pistol's gun component
     constexpr uint32_t kCrossbowCpntVtable = 0x1CAD088; //!< the crossbow's
     bool HoldsGadget(int side);
+    //! DOTO: arkCpntWeaponGaussGun -- the launcher Billie wears on her left forearm (its entity sits ~15 cm from the
+    //! palm, on the wrist). Not held: the hand stays an empty hand, and the launcher rides with it (GpuTrace).
+    constexpr uint32_t kGaussGunCpntVtable = 0x1C45768;
+    bool HoldsWristDevice(int side);
+    //! A power (the item component's class is an arkCpntPower*, by its RTTI name: DOTO's Mimic / TheEye / Swapper and the
+    //! Dishonored 2 ones Billie's items use). Never a weapon: some draw several meshes (Semblance's hand effect), which
+    //! made the hand a weapon's, learned a grip from the power's animation and turned the hand 90 degrees (2026-11-08).
+    bool HoldsPower(int side);
     //! A firearm (pistol, crossbow): aimed like a weapon all the time, the reload included -- its animation brings the
     //! gun into the palm with only a draw or two, which is what an unknown item in the palm looks like.
     bool HoldsGun(int side);
@@ -61,7 +72,7 @@ namespace BodyHide
     void* ArmTransformSet(int hand, int idx);      //!< arkTransformSet of the arm render models (entity+0xF8 / +0x378)
     constexpr uint32_t kWeaponModelB      = 0x480;      //!< TODO(DOTO): unverified (Dishonored 2's value)
     constexpr uint32_t kModelTransformSet = 0x1F38;     //!< (D2 0x1F48)
-    constexpr uint32_t kEquipCpntTypeInfo = 0x3AB8070;  //!< player equipment component: +0x68 right item, +0x70 left item; item+0x8 = entity spawn id. TODO(DOTO): those offsets are D2's, unverified
+    constexpr uint32_t kEquipCpntTypeInfo = 0x3AB8070;  //!< player equipment component: +0x68 right item, +0x70 left item; item+0x8 = entity spawn id. DOTO: same as D2 (the held items' classes resolve per hand in the logs, 2026-11-05)
     constexpr uint32_t kWeaponVtable      = 0x1D30F78;  //!< arkWeapon
     //! `staleModels` counts how often a bound render model stopped being one -- i.e. how often the entity behind a
     //! pointer we were about to WRITE through had been freed. It is the measurement behind the level-load crash:

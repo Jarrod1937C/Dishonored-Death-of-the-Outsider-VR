@@ -57,6 +57,12 @@ namespace
     std::atomic<bool> g_Reapply{ false };
     std::string g_Why = "starting";
     unsigned long long g_Applies = 0, g_Spoofed = 0, g_Buffers = 0, g_CfgGuards = 0, g_PlaceGuards = 0;
+    // DOTO diagnosis (2026-11-07: the engine stayed at the window's size): spoofs per call site, and a report of the engine's
+    // view of its size half a second after each resize request. DOTO's resize code snaps to a display mode while its
+    // exclusive-fullscreen byte is set (exe+0x33C6BC0; exe+0x33C6BC1 = borderless; exe+0x371AE9).
+    std::atomic<unsigned long long> g_SpoofWnd{ 0 }, g_SpoofHdc{ 0 };
+    unsigned long long g_ReportFrame = 0, g_Frames = 0; int g_Reports = 0;
+    constexpr uintptr_t kExclusiveFsFlag = 0x33C6BC0, kBorderlessFlag = 0x33C6BC1;
     int g_BufW = 0, g_BufH = 0;                     // the swapchain's buffers, last seen
     int g_RsSaved = -1;                             // rs_enable as the game had it before the mod held it off
     int g_TbSaved = -1;                             // r_swapChainTripleBufferEnable, likewise
@@ -123,7 +129,7 @@ namespace
         if (ok && r && tw > 0 && th > 0 && h == g_Hwnd)
         {
             const uintptr_t ra = (uintptr_t)_ReturnAddress() - g_Base;
-            if (ra == kRetWndProc || ra == kRetHdcSize) { r->left = r->top = 0; r->right = tw; r->bottom = th; g_Spoofed++; }
+            if (ra == kRetWndProc || ra == kRetHdcSize) { r->left = r->top = 0; r->right = tw; r->bottom = th; g_Spoofed++; (ra == kRetHdcSize ? g_SpoofHdc : g_SpoofWnd)++; }
         }
         return ok;
     }
@@ -132,8 +138,10 @@ namespace
     {
         const BOOL ok = g_RealGWR(h, r);
         const int tw = g_TW.load(), th = g_TH.load();
-        if (ok && r && tw > 0 && th > 0 && h == g_Hwnd && (uintptr_t)_ReturnAddress() - g_Base == kRetWndProc)
-        { r->left = r->top = 0; r->right = tw; r->bottom = th; g_Spoofed++; }
+        // Not spoofed any more (2026-11-07): DOTO's r_windowWidth/Height are only the window's outer size, which its window
+        // placement (exe+0x34B500) fits to the monitor; the render size is the engine's display size (kDisplaySize, see
+        // ApplyDisplaySize). The spoof set them to 3492x3607 and the engine stayed at 3456x1944.
+        (void)tw; (void)th;
         return ok;
     }
 
@@ -181,18 +189,25 @@ namespace
     //! While the target is in effect, the window-size cvars hold it (the engine put it there). For the length of `fn`
     //! they hold the real window instead -- unless they hold something else, i.e. the player just picked a window size
     //! in the options, which is theirs to keep.
+    std::atomic<bool> g_InRealWindow{ false };   // WithRealWindow's swap in progress: the display size is not re-asserted
     template <class F> bool WithRealWindow(F&& fn)
     {
         const int tw = g_TW.load(), th = g_TH.load();
         int rw = 0, rh = 0;
         CvarInt cw, ch; cw.Save("r_windowWidth"); ch.Save("r_windowHeight");
-        const bool swap = tw > 0 && cw.ok && ch.ok && cw.i == tw && ch.i == th && RenderRes::RealClient(rw, rh);
+        const bool real = tw > 0 && RenderRes::RealClient(rw, rh);
+        const bool swap = real && cw.ok && ch.ok && cw.i == tw && ch.i == th;
         int* ds = (int*)(g_Base + kDisplaySize);
         const int dw = ds[0], dh = ds[1];
-        if (swap) { cw.Put(rw); ch.Put(rh); ds[0] = rw; ds[1] = rh; }
+        // DOTO: the window placement sizes the window from the display size (and writes it back when the window would
+        // not fit the monitor): it sees the real window's, so the window stays as it is
+        const bool swapDs = real && dw == tw && dh == th;
+        if (swap) { cw.Put(rw); ch.Put(rh); }
+        if (swapDs) { g_InRealWindow = true; ds[0] = rw; ds[1] = rh; }
         fn();
-        if (swap) { cw.Restore(); ch.Restore(); ds[0] = dw; ds[1] = dh; }
-        return swap;
+        if (swap) { cw.Restore(); ch.Restore(); }
+        if (swapDs) { ds[0] = dw; ds[1] = dh; g_InRealWindow = false; }
+        return swap || swapDs;
     }
 
     void HkWriteConfig(void* common, const char* name, int a, int mask, bool b)
@@ -284,11 +299,27 @@ namespace
         return true;
     }
 
-    //! The engine re-reads its window size: SWP_FRAMECHANGED sends WM_WINDOWPOSCHANGED without moving the window.
-    void Trigger()
+    //! DOTO renders at its display size (kDisplaySize), not at the window's: each frame the main swapchain's target
+    //! (exe+0x3716E0) takes the display size and resizes the swapchain when it changed (exe+0x379550 -> ResizeBuffers, on
+    //! the engine's own render thread); the interface lays itself out in it too. Its window procedure only keeps
+    //! r_windowWidth/Height (the window's outer size) and its WM_SIZE does nothing, so the Dishonored 2 way -- a
+    //! WM_WINDOWPOSCHANGED with a spoofed client size -- changed nothing (2026-11-07: engine 3456x1944 under a
+    //! 3492x3607 target). The display size is set to the target, and put back to the window's client size when the
+    //! target goes. The engine writes it on a display mode change or a window mode switch (exe+0x34E910), so it is
+    //! re-asserted whenever it differs (ApplyDisplaySize, every frame).
+    unsigned long long g_DsWrites = 0;
+    void ApplyDisplaySize(bool log)
     {
-        SetWindowPos(g_Hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        int* ds = (int*)(g_Base + kDisplaySize);
+        const int tw = g_TW.load(), th = g_TH.load();
+        int w = tw, h = th;
+        if (w <= 0 || h <= 0) { if (!RenderRes::RealClient(w, h)) return; }
+        if (ds[0] == w && ds[1] == h) return;
+        if (log || g_DsWrites < 20)
+            LOGI("RenderRes: the engine's display size {}x{} -> {}x{} ({})", ds[0], ds[1], w, h, tw > 0 ? "the render target" : "the window's client size");
+        ds[0] = w; ds[1] = h; g_DsWrites++;
     }
+    void Trigger() { ApplyDisplaySize(true); }
 
     //! A game option held at 0 while the headset shows the game, and the player's value put back after. Only the live int
     //! is written (no modified flag, the string untouched): nothing of it reaches the config.
@@ -469,7 +500,20 @@ void RenderRes::OnPresent(IDXGISwapChain* sc)
             g_WindowedAt = t;
         }
     }
-    if (g_Reapply.exchange(false)) Trigger();
+    g_Frames++;
+    if (g_Reapply.exchange(false)) { Trigger(); g_ReportFrame = g_Frames + 45; }
+    else if (g_TW.load() > 0 && !g_InRealWindow.load()) ApplyDisplaySize(false);
+    if (g_ReportFrame && g_Frames >= g_ReportFrame && g_Reports < 40)
+    {   // what the engine made of the request (DOTO diagnosis)
+        g_ReportFrame = 0; g_Reports++;
+        const int* ds = (const int*)(g_Base + kDisplaySize);
+        int rw = 0, rh = 0; RealClient(rw, rh);
+        LOGI("RenderRes: after the resize request for {}x{}: r_windowWidth/Height {}x{}, engine {}x{}, swapchain {}x{}, real window {}x{}, "
+             "r_fullscreen {} (exclusive byte {}, borderless byte {}), spoofs: window procedure {} swapchain size {}, display size writes {}",
+             g_TW.load(), g_TH.load(), CVars::GetInt("r_windowWidth", -1), CVars::GetInt("r_windowHeight", -1), ds[0], ds[1], g_BufW, g_BufH, rw, rh,
+             CVars::GetInt("r_fullscreen", -1), *(const uint8_t*)(g_Base + kExclusiveFsFlag), *(const uint8_t*)(g_Base + kBorderlessFlag),
+             g_SpoofWnd.load(), g_SpoofHdc.load(), g_DsWrites);
+    }
 }
 
 std::string RenderRes::Status()

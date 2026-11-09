@@ -14,12 +14,15 @@ namespace Settings
     std::vector<std::string> StartupCommands();   //!< run at the first Present (input layout, turning)
     std::vector<std::string> PackageCommands();   //!< run when the VR package switches on in a game
     bool StatusFile();                            //!< write DVR_heartbeat.txt once a second (diagnostics)
+    bool PortCheck();                             //!< [System.Troubleshooting] PortCheck (hidden): the DOTO port's verification in the log (PortCheck.h)
+    bool StickClickScreenshot();                  //!< [System.Troubleshooting] StickClickScreenshot (hidden): both stick clicks = a screenshot of both eyes
     bool WriteLog();                              //!< [Logging] WriteLog (or [System.Troubleshooting] DebugLogging): DOTOVR.log written at all
     bool LogInput();                              //!< log every controller button change (diagnostics)
     bool Haptics();                               //!< controller vibration
     float RenderScale();                          //!< the game's render size relative to the headset's pixel density (0 = the window's)
     bool SimStepAtRefresh();                      //!< [Performance.FrameRate] SimStepAtRefresh (hidden): the game's simulation step at the headset's refresh (SimStep)
     bool TaaSkyMotion();                          //!< [Display.Picture] TaaSkyMotion (hidden): the sky's motion vectors for the game's TAA (SkyMotion)
+    bool WeaponShadows();                         //!< [Display.Picture] WeaponShadows (hidden): the held weapon casts shadows (GpuTrace)
     bool HandDepth();                             //!< [Display.Picture] HandDepth (hidden): the hands sort by their real distance, not drawn over the world (GpuTrace)
     float TaaSharpening();                        //!< [Display.Picture] TaaSharpening: the game's TAA result sharpened in the headset, 0..1 (0 = off)
     float ControllerPitchOffset();                //!< degrees the controllers' pointing is tilted (+ = up)
@@ -100,6 +103,7 @@ namespace Settings
     bool SwipeDials();                            //!< [Gameplay] SwipeDials: slide a hand up / down a safe dial to turn it
     bool SlideWindows();                          //!< [Gameplay] SlideWindows: slide a hand up / down a window to raise / lower it
     bool HolsterWeapons();                        //!< [Gameplay] HolsterWeapons: left trigger at the left hip draws the pistol, behind the back the crossbow
+    bool LauncherHolsterShock();                  //!< [Gameplay.Interaction] LauncherHolster = shock: the right hip's wrist launcher with Electrical Bursts (else lethal)
     float SwordBodyDepth();                       //!< [Gameplay] SwordBodyDepth: m (the ini says cm) the blade sinks into a body
     float PushStrength();                         //!< [Gameplay] PushStrength: the hand's effective mass, kg
     //! [Controls] GripThresholdLeft / GripThresholdRight (hand 0 / 1): how far that grip is pressed to count (KbmInject).
@@ -119,6 +123,9 @@ namespace Settings
     bool DisableMotionBlur();                     //!< [Display] DisableMotionBlur: the game's camera motion blur off
     bool DisableHeadBob();                        //!< [Display.Effects] DisableHeadBob: the game's view bob (walking, breathing) off in VR
     bool AmbientOcclusion();                      //!< [Display] AmbientOcclusion: 0 = none in VR (VrTweaks)
+    bool AmbientOcclusionHigh();                  //!< [Display.Effects] AmbientOcclusionQuality: high = GTAO (AoGtao) instead of the game's DWAO
+    float AmbientOcclusionRadius();               //!< its radius (m), hidden
+    float AmbientOcclusionStrength();             //!< the power on its visibility, hidden
     bool Fog();                                   //!< [Display] Fog: 0 = no fog in VR (VrTweaks)
     int SkipDisabledEffects();                    //!< [Advanced] SkipDisabledEffects (experimental): 0 off, 1 SSAO, 2 SSAO + DOF
     Foveation::Params Foveated();                 //!< [Display] FoveatedRendering / FoveatedInner / FoveatedOuter

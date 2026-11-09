@@ -10,6 +10,7 @@
 #include "StereoTaa.h"
 #include "ScreenMode.h"
 #include "Settings.h"
+#include "PortCheck.h"
 #include <detours/detours.h>
 #include <map>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include <array>
 #include <bitset>
 #include <algorithm>
+#include <tuple>
 #include <d3dcommon.h>
 #include <d3d11shader.h>
 #include <cmath>
@@ -33,6 +35,10 @@
 #include "VrTweaks.h"
 #include "ScreenShadows.h"
 #include "PostShare.h"
+#include "Holster.h"
+#include "HandFx.h"
+#include "AoGtao.h"
+#include "StereoFeedback.h"
 
 namespace
 {
@@ -141,8 +147,12 @@ namespace
     // shaders removes the trail and nothing else in the frame (A/B/A capture, 2026-09-30). The hashes are the DXBC
     // header checksums, stable across runs. Other trails in the game may share these shaders, so they are hidden
     // only while the player's Slash runs and for kTrailTail after it (the trail fades out after the swing).
-    constexpr uint64_t kTrailHashes[] = { 0x364e76313eb849ecull, 0x3fea51d57d8fff32ull, 0x412fe65bec01fc06ull };   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
-    std::atomic<void*> g_TrailVsPtr[16];
+    // Dishonored 2's three (measured there; created in DOTO but never drawn in its slashes), then DOTO's: the vertex shaders
+    // drawn in the slash windows and never outside them (the trail search, 2026-11-07: 10,626 slash frames against 14,005
+    // control frames -- 736585999b64ee73 0.56 draws a frame, 32486d6743f5d606 0.28, b05cac55dfc3c1bc 0.24, all 0 outside)
+    constexpr uint64_t kTrailHashes[] = { 0x364e76313eb849ecull, 0x3fea51d57d8fff32ull, 0x412fe65bec01fc06ull,
+                                          0x736585999b64ee73ull, 0x32486d6743f5d606ull, 0xb05cac55dfc3c1bcull };
+    std::atomic<void*> g_TrailVsPtr[32];
     std::atomic<bool> g_NoTrail{ true }, g_TrailWindow{ false };
     std::atomic<unsigned long long> g_TrailHits{ 0 };
     bool IsTrailHash(uint64_t h) { for (uint64_t t : kTrailHashes) if (t == h) return true; return false; }
@@ -150,15 +160,118 @@ namespace
     {
         for (auto& p : g_TrailVsPtr) { void* e = nullptr; if (p.load() == vs) return; if (p.compare_exchange_strong(e, vs)) return; }
     }
+    // DOTO: the sword trail's vertex shaders. Dishonored 2's three are not drawn during DOTO's slashes (2026-11-07: the
+    // first two created but never met in a Slash, the trail visible). A shader the trail uses is drawn in slashes and
+    // (nearly) never otherwise, so with PortCheck on each VS is counted in the slash windows and, as a control, in every
+    // 8th frame outside them; the report ranks them by how much more often they draw in slashes.
+    struct TrailLearn { std::atomic<uint64_t> h{ 0 }; std::atomic<unsigned> in{ 0 }, out{ 0 }; };
+    constexpr int kTrailLearnN = 256;
+    TrailLearn g_TrailLearn[kTrailLearnN];
+    std::atomic<bool> g_TrailCtl{ false };
+    std::atomic<unsigned> g_TrailInFrames{ 0 }, g_TrailOutFrames{ 0 };
+    double g_TrailLearnAt = 0;
+    void TrailLearnCount(uint64_t h, bool in)
+    {
+        if (!h) return;
+        for (auto& t : g_TrailLearn)
+        {
+            uint64_t v = t.h.load(std::memory_order_relaxed);
+            if (v == 0 && t.h.compare_exchange_strong(v, h)) v = h;   // (on failure v holds the slot's hash)
+            if (v != h) continue;
+            (in ? t.in : t.out).fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    //! Present: the control frames, the frame counts, and every 60 s the report
+    void TrailLearnTick(unsigned long long frame)
+    {
+        if (!PortCheck::On()) { g_TrailCtl = false; return; }
+        const bool win = g_TrailWindow.load();
+        if (win) g_TrailInFrames++;
+        const bool ctl = !win && (frame % 8) == 0;
+        if (ctl) g_TrailOutFrames++;
+        g_TrailCtl = ctl;
+        LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+        const double now = (double)c.QuadPart / (double)f.QuadPart;
+        if (now - g_TrailLearnAt < 60.0) return;
+        g_TrailLearnAt = now;
+        const unsigned fi = g_TrailInFrames.load(), fo = g_TrailOutFrames.load();
+        if (fi < 10 || fo < 10) return;
+        struct R { uint64_t h; double ri, ro; unsigned in, out; };
+        std::vector<R> r;
+        for (auto& t : g_TrailLearn)
+        {
+            const uint64_t h = t.h.load(); if (!h) continue;
+            const unsigned i = t.in.load(), o = t.out.load();
+            if (i == 0) continue;
+            r.push_back({ h, (double)i / fi, (double)o / fo, i, o });
+        }
+        std::sort(r.begin(), r.end(), [](const R& a, const R& b) { return a.ri / (a.ro + 0.05) > b.ri / (b.ro + 0.05); });
+        std::string m;
+        for (size_t k = 0; k < r.size() && k < 12; k++)
+            m += fmt::format(" {:016x} {:.2f}/{:.2f}{}", r[k].h, r[k].ri, r[k].ro, r[k].out == 0 ? " ONLY-IN-SLASHES" : "");
+        LOGI("GpuTrace: sword trail search ({} slash frames, {} control frames; draws per frame in slashes / outside): {}", fi, fo, m.empty() ? " nothing" : m);
+    }
+    // Power watch (DOTO, PortCheck on; asked 2026-11-08: "code and shader hints for how the powers are handled"). While a
+    // power's player state runs (UsePower, Blinking, DOTO's Swapper / Mimicking / VoidTear...), every draw's vertex
+    // shader, pixel shader and render pass is counted under that state; every 8th frame outside them, the same as a
+    // control. PowerTick reports every 60 s what each power draws that ordinary play does not (ONLY-IN-POWER), and logs
+    // each power window's start (the left hand's item, the states running) and end (how long, how far the camera went).
+    static const char* const kPowerStates[] = { "UsePower", "Blinking", "UsePhantasmalLink", "Swapper", "DespawnSwapper", "Mimicking",
+        "CancelMimicking", "UseMimic", "VoidTear", "UseHollow", "CancelVoidStrike", "DephasedSword", "RatWhispers", "UseHeart",
+        "LockHeartTarget", "InBendTime", "ShadowWalk", "StoneShroud", "DoppelgangerSwap", "EnterPossessedHost", "UseWindblast",
+        "Flying" };   // Flying: Foresight's out-of-body flight (the_eye: UsePower 0.7 s, then Flying; 2026-11-08)
+    constexpr int kPowerStateN = (int)(sizeof kPowerStates / sizeof kPowerStates[0]);
+    constexpr int kPowerCtl = 31;                            // the control frames' label
+    struct PowerLearn { std::atomic<uint64_t> tag{ 0 }; uint64_t h = 0; int label = 0, kind = 0; std::atomic<unsigned> n{ 0 }; };
+    constexpr int kPowerLearnN = 4096;
+    PowerLearn g_PowerLearn[kPowerLearnN];
+    std::atomic<int> g_PowerWin{ -1 };                       // the running power state's index, -1 none
+    std::atomic<bool> g_PowerCtl{ false };
+    std::atomic<unsigned> g_PowerFrames[32];
+    std::atomic<unsigned long long> g_PowerLearnFull{ 0 };
+    void PowerCount(int label, int kind, uint64_t h)
+    {
+        if (!h) return;
+        uint64_t t = (h ^ ((uint64_t)label << 52) ^ ((uint64_t)kind << 60)) * 0x9E3779B97F4A7C15ull; t |= 1;
+        for (int i = 0; i < 64; i++)
+        {
+            PowerLearn& e = g_PowerLearn[(t + (uint64_t)i) % kPowerLearnN];
+            uint64_t v = e.tag.load(std::memory_order_relaxed);
+            if (v == 0 && e.tag.compare_exchange_strong(v, t)) { e.h = h; e.label = label; e.kind = kind; v = t; }
+            if (v != t) continue;
+            e.n.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        g_PowerLearnFull++;
+    }
+    void PowerResProbe(ID3D11DeviceContext* c);   // (below, with PowerTick)
     //! Hide this draw? Only asks the context for its shader while a skip list (or the trail window) is active.
     bool SkippedVs(ID3D11DeviceContext* c)
     {
+        {   // the power watch (before the early return: it counts every draw in its windows)
+            const int pw = g_PowerWin.load(std::memory_order_relaxed);
+            if (pw >= 0 || g_PowerCtl.load(std::memory_order_relaxed))
+            {
+                const int label = pw >= 0 ? pw : kPowerCtl;
+                ID3D11VertexShader* v = nullptr; c->VSGetShader(&v, nullptr, nullptr);
+                if (v) { PowerCount(label, 0, GpuTrace::ShaderHashOf(v)); v->Release(); }
+                ID3D11PixelShader* p = nullptr; c->PSGetShader(&p, nullptr, nullptr);
+                if (p) { PowerCount(label, 1, GpuTrace::ShaderHashOf(p)); p->Release(); }
+                PowerCount(label, 2, (uint64_t)(uintptr_t)PassProfile::PassNow());
+                if (pw >= 0) PowerResProbe(c);
+            }
+        }
         const bool research = g_SkipVsOn.load(std::memory_order_relaxed);
-        const bool trail = g_TrailWindow.load(std::memory_order_relaxed) && g_NoTrail.load(std::memory_order_relaxed);
-        if (!research && !trail) return false;
+        const bool trailWin = g_TrailWindow.load(std::memory_order_relaxed);
+        const bool trail = trailWin && g_NoTrail.load(std::memory_order_relaxed);
+        const bool ctl = g_TrailCtl.load(std::memory_order_relaxed);
+        if (!research && !trail && !ctl) return false;
         ID3D11VertexShader* vs = nullptr; c->VSGetShader(&vs, nullptr, nullptr);
         if (!vs) return false;
         vs->Release();
+        if (trail) PortCheck::Candidate(PortCheck::kSiteTrail, GpuTrace::VsHashOf(vs));   // the DOTO port: the trail's vertex shaders
+        if ((trailWin || ctl) && PortCheck::On()) TrailLearnCount(GpuTrace::VsHashOf(vs), trailWin);
         if (research) for (auto& p : g_SkipVsPtr) if (p.load(std::memory_order_relaxed) == (void*)vs) { g_SkipVsHits++; return true; }
         if (trail) for (auto& p : g_TrailVsPtr) if (p.load(std::memory_order_relaxed) == (void*)vs) { g_TrailHits++; return true; }
         return false;
@@ -896,6 +1009,9 @@ namespace
         float axis[3] = {};           // bind-pose arm axis, unit, from the fingertip towards the shoulder
         float palmN[3] = {};          // bind-pose palm normal, unit, out of the PALM side (see AnalyseArmMesh)
         bool palmNValid = false;
+        // The point of the hand that goes to the controller's grip (the palm's middle): the palm bone's bind centroid,
+        // or on DOTO's arm skeletons a little towards the fingers of it (see AnalyseArmMesh)
+        float pc[3] = {};
         std::bitset<256> collapse;    // not the hand: collapsed onto the palm for the draw
     };
     std::mutex g_ArmBonesM;
@@ -1006,6 +1122,11 @@ namespace
     // open hand, and kept it floating there.
     struct GadgetHold { bool valid = false; Rigid rel, inPalm; unsigned long long frame = 0; float minPalm = 1e9f; };
     GadgetHold g_GadgetHold[2];
+    // DOTO: each hand's palm as the game poses it (world) and the delta that moves the hand this frame, kept from its arm
+    // draw for the draws of things worn on that arm (under g_ArmBonesM)
+    struct PalmLive { bool valid = false; float palm[3] = {}; Rigid dw; unsigned long long frame = 0; };
+    PalmLive g_PalmLive[2];
+    std::atomic<unsigned long long> g_OtherHandDraws[2];
     std::atomic<unsigned long long> g_GadgetDraws[2];
 
     struct MeshCapture
@@ -1085,6 +1206,7 @@ namespace
         float k = 1.f;                            // segment scale (g_ArmLen): upper arm about Sp along Ep-Sp, forearm about Ep along ax
         float S[3] = {}, Sp[3] = {}, W[3] = {}, Wp[3] = {}; float L1 = 0, L2 = 0, reach = 0; bool stretched = false;
         Rigid m2w; float head[3] = {}, ctrl[3] = {};    // for the log: model->world, the head and the controller in world space
+        Rigid bodyVr;                             // the body frame it was made in (ForearmDeltaWorld carries m2w along with it)
         uint64_t srcHash = 0; unsigned long long srcSerial = 0;   // the palette content and the view it was computed from (vr handjit)
     };
     struct RelStat { double n = 0; double mean[3] = {}; double m2 = 0; };
@@ -1149,6 +1271,7 @@ namespace
     void TickArmIdentify()
     {
         g_PresentFrame++;
+        TrailLearnTick(g_PresentFrame);
         const int ph = g_ArmIdPhase.load();
         if (ph == aiIdle)
         {
@@ -1587,9 +1710,339 @@ namespace
              dhGot ? fmt::format("{:.4f}", dhArms[0]) : std::string("none seen"), f.s, f.resid, Det3(mvpBefore.r), Det3(mvpAfter.r),
              RotAngle(mvpBefore.r, mvpAfter.r), gadget ? fmt::format(", in-palm det {:.3f}", inPalmDet) : std::string());
     }
+    // The sword watch (asked 2026-11-07, DOTO: the sword flickers with "odd shading / lighting"). Every draw of the
+    // held sword that is moved, summed per kind of draw -- the render pass it is in, the eye, its instance-buffer size,
+    // what its shader reads (model rows = the lighting's position and normals, previous rows = the TAA's motion
+    // vectors, a joint palette, the first-person depth hack) and its vertex / pixel shaders -- with how often its
+    // lighting rows disagree with where it is drawn (degrees), mirror it (det < 0) or are absent. Written every 30 s
+    // while the sword is out (DebugLogging). A pass that lights the sword from its old pose, a pass that draws it
+    // unmoved (the per-draw detail: `gunparts` lines, switched on for 150 draws each time the sword is drawn), or an
+    // eye that differs from the other is what this is for.
+    bool ForearmDeltaWorld(int side, const float w[3], Rigid& Dw, int* segOut, const Rigid* bodyNow = nullptr, bool* freshOut = nullptr);   // (defined with the HandFx snapshots)
+    // DOTO: the last forearm delta that worked, per side, with the body frame it was made in. The wrist watch (2026-11-08)
+    // showed the launcher's draws in the LEFT eye split about half and half between the forearm and the palm pose (the
+    // right eye's all on the forearm): seen as two launchers, flickering, half transparent. A draw that finds no
+    // forearm delta now keeps the last one, carried along with the body, instead of jumping to another pose.
+    struct WristLast { bool valid = false; Rigid dw, body; unsigned long long frame = 0; };
+    std::mutex g_WristLastM;
+    WristLast g_WristLast[2];
+    std::atomic<unsigned long long> g_WristKept[2], g_WristStaleFixed{ 0 };
+    void WristRemember(int side, const Rigid& dw, const Rigid& body)
+    {
+        std::lock_guard lk(g_WristLastM);
+        WristLast& w = g_WristLast[side & 1]; w.valid = true; w.dw = dw; w.body = body; w.frame = g_PresentFrame;
+    }
+    bool WristRecall(int side, const Rigid& bodyNow, Rigid& dw, bool count = true)
+    {
+        WristLast w; { std::lock_guard lk(g_WristLastM); w = g_WristLast[side & 1]; }
+        if (!w.valid || g_PresentFrame - w.frame > 90) return false;
+        // the engine's arm and the drawn arm both move with the body: Dw' = B_now B_then^-1 Dw B_then B_now^-1
+        const Rigid m = Mul(bodyNow, Inv(w.body));
+        dw = Mul(m, Mul(w.dw, Inv(m)));
+        if (count) g_WristKept[side & 1]++;
+        return true;
+    }
+    // DOTO, 2026-11-08 (the launcher "all over the place ... switches positions so rapidly it looks half transparent",
+    // and its parts -- the bolts, balls, cylinders -- on their own): the watch showed 6 in 10 of its draws in BOTH eyes
+    // recorded before that view's first arm draw, and posed then from the controller with an offset learned from the
+    // rare up-to-date draws (1 in 20), which is not where the drawn forearm is when the wrist bends. Every draw of
+    // something worn on a forearm now takes ONE arm frame per view (WristDelta): the view's own when its arm was drawn
+    // first, else the latest before it, carried to this view by the controller's move since (the drawn forearm rides
+    // the controller) with the game's own move of the arm taken out (its entity then and now: what the draw's matrix
+    // holds is this view's game tick). The first draw of a view picks; every other draw of that view (depth, shadow,
+    // lit, motion vectors) takes the same pick.
+    bool WristDelta(int side, unsigned long long view, const Rigid& handNow, bool handNowOk, const BodyHide::Anchor* anchNow,
+                    bool launcherHeld, const float w[3], Rigid& Dw, int* segOut, bool* exactOut);
+    std::atomic<unsigned long long> g_WristExact[2], g_WristCarried[2], g_WristEntComp[2], g_WristUnclaimed[2], g_WristGateKept{ 0 };
+    // DOTO, 2026-11-08, third pass (the launcher still on the wrist / to its right / to its left from one frame to the
+    // next, its drum and its lightning apart from it, worse with a grenade or a mine in the hand). What the passes before
+    // got wrong, read off that session's log and code:
+    //  1. Every draw of the launcher was posed at ITS OWN model origin. The body (43260 indices) sits on the launcher's
+    //     entity, the drum (12042) 7.5 cm from it, and the forearm's delta is not one rigid move: its twist is spread along
+    //     the forearm and past the wrist the hand's delta takes over. Two parts of one rigid object got two different
+    //     moves (up to the forearm's twist apart), and a part near the wrist flipped between the forearm's and the hand's.
+    //  2. A draw whose own point found no arm delta fell through to other poses: the GADGET palm pose (7 % of the
+    //     launcher's draws in one 30 s window, most of them the drum), the hand's delta, a remembered delta that was only
+    //     remembered from the rare up-to-date frames.
+    //  3. With a grenade or a mine in that hand the launcher's draws were claimed by THAT item and posed as a gadget in
+    //     the palm (the launcher floating by the grenade), or left where the flat game draws them (the forearm bare);
+    //     with a power or nothing there the anchoring gate dropped every one of them (ArmInfo is always passed, so the
+    //     exception for draws with a pose of their own never applied).
+    //  4. Its effects (the shock attachment's lightning, HandFx) were moved with yet another delta, per joint.
+    // Now (vr wristrig 1, default): a draw is the launcher's when the held launcher's entity claims it or when its mesh
+    // was seen as one (index count + vertex buffer, learned while it was held), WHATEVER the hand holds; every such draw
+    // of a view gets ONE rigid pose, made once per view at one point of the forearm's bone line (where the launcher's
+    // own origin projects, learned), and its effects take that same pose. 0 = the pose per draw, as before (A/B).
+    std::atomic<int> g_WristRig{ 1 };
+    bool WristRigDelta(int side, unsigned long long view, const Rigid& handNow, bool handNowOk, const BodyHide::Anchor* anchNow,
+                       bool launcherHeld, const Rigid* bodyNow, const float w[3], Rigid& Dw, int& how,
+                       UINT draw = 0, const void* vb = nullptr, const float* partRot = nullptr);
+    std::atomic<unsigned long long> g_WristNoPose[2], g_WristRigDraws[2];
+    // The meshes worn on a forearm: index count, vertex buffer (0 = any) and side. Lock-free reads (asked by every draw
+    // near the player that is not an arm or the torso); writers under the mutex.
+    constexpr int kWristKeys = 48;
+    std::mutex g_WristKeysM;                      // writers only
+    std::atomic<UINT> g_WristKeyArr[kWristKeys];
+    std::atomic<uintptr_t> g_WristKeyVb[kWristKeys];
+    std::atomic<int> g_WristKeySideArr[kWristKeys];
+    std::atomic<int> g_WristKeyN{ 0 };
+    int WristKeySide(UINT n, const void* vb)
+    {
+        const int k = g_WristKeyN.load(std::memory_order_acquire);
+        for (int i = 0; i < k; i++)
+        {
+            if (g_WristKeyArr[i].load(std::memory_order_relaxed) != n) continue;
+            const uintptr_t v = g_WristKeyVb[i].load(std::memory_order_relaxed);
+            if (!v || v == (uintptr_t)vb) return g_WristKeySideArr[i].load(std::memory_order_relaxed);
+        }
+        return -1;
+    }
+    bool WristKey(UINT n)                         // (the per-draw rule, vr wristrig 0) any mesh of that index count
+    {
+        const int k = g_WristKeyN.load(std::memory_order_acquire);
+        for (int i = 0; i < k; i++) if (g_WristKeyArr[i].load(std::memory_order_relaxed) == n) return true;
+        return false;
+    }
+    void WristKeyPut(UINT n, uintptr_t vb, int side, bool log)   // g_WristKeysM held
+    {
+        const int k = g_WristKeyN.load();
+        for (int i = 0; i < k; i++) if (g_WristKeyArr[i].load() == n && g_WristKeyVb[i].load() == vb) return;
+        if (k >= kWristKeys) return;
+        g_WristKeyArr[k].store(n, std::memory_order_relaxed); g_WristKeyVb[k].store(vb, std::memory_order_relaxed);
+        g_WristKeySideArr[k].store(side, std::memory_order_relaxed);
+        g_WristKeyN.store(k + 1, std::memory_order_release);
+        if (log) LOGI("gpuhands: draws of {} indices (vertex buffer {}) are worn on the {} forearm", n, vb ? fmt::format("{:#x}", vb) : std::string("any"), side ? "right" : "left");
+    }
+    //! A draw of the HELD launcher: its mesh is known as worn from now on (a mesh of 1000+ indices whatever its vertex
+    //! buffer -- they survive a load under another one; smaller ones, the glass and the glow quads, only with this one).
+    void WristKeyAdd(UINT n, const void* vb, int side)
+    {
+        if (n < 3) return;
+        const uintptr_t v = (uintptr_t)vb;
+        {
+            const int k = g_WristKeyN.load(std::memory_order_acquire);
+            for (int i = 0; i < k; i++)
+                if (g_WristKeyArr[i].load(std::memory_order_relaxed) == n && g_WristKeyVb[i].load(std::memory_order_relaxed) == v) return;
+        }
+        std::lock_guard lk(g_WristKeysM);
+        if (v) WristKeyPut(n, v, side, true);
+        if (n >= 1000) WristKeyPut(n, 0, side, true);
+    }
+    //! (vr wristrig 0) the old per-draw rule's learning: any draw it found on a forearm
+    void WristKeyAdd(UINT n)
+    {
+        if (g_WristRig.load() || n < 12 || WristKey(n)) return;
+        std::lock_guard lk(g_WristKeysM);
+        WristKeyPut(n, 0, 0, true);
+    }
+    // Billie's launcher, measured 2026-11-08 (its body and its drum): known before it is first held in a session, so a
+    // grenade equipped first does not take it into the palm
+    const bool g_WristKeysSeeded = [] { std::lock_guard lk(g_WristKeysM); WristKeyPut(43260, 0, 0, false); WristKeyPut(12042, 0, 0, false); return true; }();
+    // vr weaponshadows 0|1 (the sword's flicker, 2026-11-07, an A/B): 0 = a held weapon is not drawn into the shadow maps
+    // (SHADOWS_* passes) -- no shadow of it, and none of it on itself. The sword watch showed its lighting rows right in
+    // every pass; what is left is its shadow: drawn into the lamps' maps (moved there too) as it swings.
+    std::atomic<int> g_WeaponShadows{ 1 };
+    thread_local bool t_DropWeaponShadow = false;
+    std::atomic<unsigned long long> g_WeaponShadowDropped{ 0 };
+    std::atomic<unsigned long long> g_ForearmDraws[2];
+    // DOTO: how this draw of something worn on the forearm (the wrist launcher and its attachments) was posed, for the
+    // watch below: 0 = not one, 1 = with the forearm (this hand's wrist device), 2 = with the forearm (a draw this hand's
+    // held item claimed), 3 = the palm pose (GADGET), 4 = the hand's delta (fallback), 5 = with the other hand
+    thread_local int t_WristDraw = 0;   // ... 6 = the last forearm delta kept (WristRecall), 7 = the view before carried (WristDelta), 8 = unclaimed
+    // ... 9-11 = the one rigid pose of the view (vr wristrig 1): from this view's arm, from the view before carried, the last one kept
+    static const char* const kWristHow[12] = { "-", "forearm (worn)", "forearm (claimed by the held item)", "palm (gadget)", "hand delta (fallback)", "other hand", "forearm (last delta kept)", "forearm of the view before, carried", "forearm (claimed by no item)",
+                                               "RIGID: this view's arm", "RIGID: the view before, carried", "RIGID: the last pose kept" };
+    struct SwordKey
+    {
+        int what, hand; const char* pass; int cls, eye; UINT bytes; bool skinned, model, prev, dh; uint64_t vs, ps;
+        bool operator<(const SwordKey& o) const
+        {
+            return std::tie(what, hand, pass, cls, eye, bytes, skinned, model, prev, dh, vs, ps) < std::tie(o.what, o.hand, o.pass, o.cls, o.eye, o.bytes, o.skinned, o.model, o.prev, o.dh, o.vs, o.ps);
+        }
+    };
+    struct SwordStat { unsigned long long n = 0, angBad = 0, detNeg = 0, noModel = 0; float maxAng = 0.f, sumMoved = 0.f; };
+    std::mutex g_SwordM;
+    std::map<SwordKey, SwordStat> g_Sword;
+    std::atomic<unsigned long long> g_SwordDraws{ 0 };
+    constexpr uint32_t kSwordCpntVtable = 0x1CADA28;   // arkCpntWeaponMeleePlayer (DOTO)
+    void NoteSwordDraw(ID3D11DeviceContext* ctx, int hand, UINT bytes, const InstLayout* L, const float* in, const float* out,
+                       const Factored& f, const Rigid& vinv, const Rigid& dv, bool useModel, bool usePrev)
+    {
+        // the held sword's draws, and (DOTO) every draw of something worn on a forearm (t_WristDraw): the wrist launcher
+        // and its attachments flicker and are lit wrong (reported 2026-11-07/08)
+        if (!::Log::Enabled() || hand < 0 || hand > 1 || (BodyHide::HeldItemClass(hand) != kSwordCpntVtable && t_WristDraw == 0)) return;
+        const Rigid mvpAfter = Mul(vinv, Mul(dv, f.pose));
+        float angA = -1.f, detA = 0.f;
+        if (useModel)
+        {
+            float rm[9]; const int idx[3] = { L->mx, L->my, L->mz };
+            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) rm[i * 3 + j] = out[idx[i] + j];
+            detA = Det3(rm); const float sA = cbrtf(fabsf(detA));
+            if (sA > 1e-6f) { for (float& v : rm) v /= sA; angA = RotAngle(rm, mvpAfter.r); }
+        }
+        (void)in;
+        SwordKey k{};
+        k.what = t_WristDraw; k.hand = hand;
+        k.pass = PassProfile::PassNow(); k.cls = PassProfile::TaskClass(); k.eye = PassProfile::CharEye(); k.bytes = bytes;
+        k.skinned = L->matSlot >= 0; k.model = useModel; k.prev = usePrev; k.dh = L->dh >= 0;
+        ID3D11VertexShader* vs = nullptr; ctx->VSGetShader(&vs, nullptr, nullptr); if (vs) { k.vs = GpuTrace::ShaderHashOf(vs); vs->Release(); }
+        ID3D11PixelShader* ps = nullptr; ctx->PSGetShader(&ps, nullptr, nullptr); if (ps) { k.ps = GpuTrace::ShaderHashOf(ps); ps->Release(); }
+        const float moved = RotAngle(Mul(vinv, f.pose).r, mvpAfter.r);
+        g_SwordDraws++;
+        std::lock_guard lk(g_SwordM);
+        if (g_Sword.size() > 400 && !g_Sword.count(k)) return;
+        SwordStat& st = g_Sword[k];
+        st.n++; st.sumMoved += moved;
+        if (!useModel) st.noModel++;
+        else
+        {
+            if (angA > 3.f) st.angBad++;
+            if (angA > st.maxAng) st.maxAng = angA;
+            if (detA < 0.f) st.detNeg++;
+        }
+    }
+    // DOTO, Foresight ("the world renders double", 2026-11-08): during a power window, which pass last wrote each render
+    // target (and in which Present: 0 = this frame, 1 = the previous one -- in alternating-eye stereo the OTHER eye's
+    // image), and for the first draws of the passes that rework the picture (DISTORTION, DARKVISION, POSTPROC...) which
+    // textures they read and how old those are. A texture written one frame back and read by a full-screen effect shows
+    // the other eye's picture in this eye: the world twice.
+    struct PwRes { const char* pass = nullptr; unsigned long long frame = 0; int eye = -1; };
+    std::mutex g_PwResM;
+    std::unordered_map<void*, PwRes> g_PwRes;
+    std::atomic<int> g_PwSrvLeft{ 0 };
+    void PowerResProbe(ID3D11DeviceContext* c)
+    {
+        const char* pass = PassProfile::PassNow();
+        const int eye = PassProfile::CharEye();
+        const unsigned long long fr = g_PresentFrame;
+        ID3D11RenderTargetView* rtv[4] = {}; c->OMGetRenderTargets(4, rtv, nullptr);
+        {
+            std::lock_guard lk(g_PwResM);
+            for (auto* v : rtv) if (v) { ID3D11Resource* r = nullptr; v->GetResource(&r); if (r) { if (g_PwRes.size() < 4096) g_PwRes[r] = { pass, fr, eye }; r->Release(); } }
+        }
+        for (auto* v : rtv) if (v) v->Release();
+        if (g_PwSrvLeft.load(std::memory_order_relaxed) <= 0 || !pass) return;
+        if (strcmp(pass, "DISTORTION") && strcmp(pass, "DARKVISION") && strcmp(pass, "POSTPROC") && strcmp(pass, "POST_TONEMAP") && strcmp(pass, "EMISSIVE") && strcmp(pass, "ALPHA_LIT")) return;
+        if (g_PwSrvLeft.fetch_sub(1) <= 0) return;
+        ID3D11ShaderResourceView* srv[8] = {}; c->PSGetShaderResources(0, 8, srv);
+        std::string m;
+        for (int i = 0; i < 8; i++)
+        {
+            if (!srv[i]) continue;
+            ID3D11Resource* r = nullptr; srv[i]->GetResource(&r);
+            if (r)
+            {
+                UINT w = 0, h = 0; DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN;
+                ID3D11Texture2D* t = nullptr;
+                if (SUCCEEDED(r->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) && t) { D3D11_TEXTURE2D_DESC d; t->GetDesc(&d); w = d.Width; h = d.Height; f = d.Format; t->Release(); }
+                PwRes pr; bool known; { std::lock_guard lk(g_PwResM); auto it = g_PwRes.find(r); known = it != g_PwRes.end(); if (known) pr = it->second; }
+                m += fmt::format(" t{} {}x{} fmt{} {}", i, w, h, (int)f,
+                                 known ? fmt::format("written by {} {} frame(s) ago (eye {})", pr.pass ? pr.pass : "?", fr - pr.frame, pr.eye) : std::string("not written in a power window"));
+                r->Release();
+            }
+            srv[i]->Release();
+        }
+        ID3D11PixelShader* ps = nullptr; c->PSGetShader(&ps, nullptr, nullptr);
+        const uint64_t ph = ps ? GpuTrace::ShaderHashOf(ps) : 0; if (ps) ps->Release();
+        LOGI("PowerWatch: reads | {} eye {} PS {:016x} |{}", pass, eye, ph, m.empty() ? " none" : m);
+    }
+    //! Present: the power watch's windows, control frames and report (see kPowerStates)
+    void PowerTick()
+    {
+        if (!PortCheck::On() || !::Log::Enabled()) { g_PowerWin = -1; g_PowerCtl = false; return; }
+        static int cur = -1; static double since = 0; static float camStart[3] = {}, camMax = 0.f; static unsigned long long frame = 0;
+        static ULONGLONG nextReport = 0; static unsigned lastFrames[32] = {};
+        static unsigned long long probeAt = 0;
+        frame++;
+        if (probeAt && frame >= probeAt) { probeAt = 0; if (cur >= 0) { g_PwSrvLeft = 60; LOGI("PowerWatch: {}: the textures the picture effects read, for the next 60 of their draws", kPowerStates[cur]); } }
+        int now = -1;
+        for (int i = 0; i < kPowerStateN && now < 0; i++) if (PlayerState::Running(kPowerStates[i])) now = i;
+        float cam[3] = {}; bool camOk;
+        { std::lock_guard lk(g_XfM); camOk = g_GameCamValid; memcpy(cam, g_GameCam, 12); }
+        LARGE_INTEGER qc, qf; QueryPerformanceCounter(&qc); QueryPerformanceFrequency(&qf);
+        const double t = (double)qc.QuadPart / (double)qf.QuadPart;
+        if (now != cur)
+        {
+            if (cur >= 0)
+                LOGI("PowerWatch: {} ends after {:.2f} s; the game camera went up to {:.2f} m from where it started", kPowerStates[cur], t - since, camMax);
+            if (now >= 0)
+            {
+                LOGI("PowerWatch: {} begins: left hand {}, right hand {}; states running: {}; camera ({:.2f},{:.2f},{:.2f})", kPowerStates[now],
+                     Holster::LastItem(1), Holster::LastItem(0), PlayerState::RunningNames(), cam[0], cam[1], cam[2]);
+                static int probes[32] = {};
+                if (probes[now] < 2) { probes[now]++; probeAt = frame + 10; { std::lock_guard lk(g_PwResM); g_PwRes.clear(); } }   // (10 frames in: the targets seen written)
+                since = t; memcpy(camStart, cam, 12); camMax = 0.f;
+            }
+            cur = now;
+        }
+        if (cur >= 0 && camOk)
+        {
+            const float d = sqrtf((cam[0] - camStart[0]) * (cam[0] - camStart[0]) + (cam[1] - camStart[1]) * (cam[1] - camStart[1]) + (cam[2] - camStart[2]) * (cam[2] - camStart[2]));
+            if (d > camMax) camMax = d;
+        }
+        g_PowerWin = cur;
+        const bool ctl = cur < 0 && (frame % 8) == 0;
+        g_PowerCtl = ctl;
+        if (cur >= 0) g_PowerFrames[cur]++; else if (ctl) g_PowerFrames[kPowerCtl]++;
+        const ULONGLONG ms = GetTickCount64();
+        if (!nextReport) nextReport = ms + 60000;
+        if (ms < nextReport) return;
+        nextReport = ms + 60000;
+        const unsigned fo = g_PowerFrames[kPowerCtl].load();
+        if (fo < 10) return;
+        std::map<std::pair<int, uint64_t>, unsigned> ctlN;     // (kind, hash) -> control count
+        for (auto& e : g_PowerLearn) if (e.tag.load() && e.label == kPowerCtl) ctlN[{ e.kind, e.h }] = e.n.load();
+        static const char* kKind[3] = { "VS", "PS", "pass" };
+        for (int l = 0; l < kPowerStateN; l++)
+        {
+            const unsigned fi = g_PowerFrames[l].load();
+            if (fi < 5 || fi == lastFrames[l]) continue;
+            lastFrames[l] = fi;
+            for (int kind = 0; kind < 3; kind++)
+            {
+                struct R { uint64_t h; double ri, ro; bool only; };
+                std::vector<R> r;
+                for (auto& e : g_PowerLearn)
+                {
+                    if (!e.tag.load() || e.label != l || e.kind != kind) continue;
+                    const auto it = ctlN.find({ kind, e.h }); const unsigned o = it == ctlN.end() ? 0 : it->second;
+                    r.push_back({ e.h, (double)e.n.load() / fi, (double)o / fo, o == 0 });
+                }
+                std::sort(r.begin(), r.end(), [](const R& a, const R& b) { return a.ri / (a.ro + 0.05) > b.ri / (b.ro + 0.05); });
+                std::string m;
+                for (size_t k = 0; k < r.size() && k < 10; k++)
+                {
+                    if (kind == 2) m += fmt::format(" [{}] {:.1f}/{:.1f}{}", r[k].h ? (const char*)(uintptr_t)r[k].h : "?", r[k].ri, r[k].ro, r[k].only ? " ONLY-IN-POWER" : "");
+                    else m += fmt::format(" {:016x} {:.2f}/{:.2f}{}", r[k].h, r[k].ri, r[k].ro, r[k].only ? " ONLY-IN-POWER" : "");
+                }
+                LOGI("PowerWatch: {} ({} frames; {} control frames) {} by draws a frame in it / outside:{}", kPowerStates[l], fi, fo, kKind[kind], m.empty() ? " none" : m);
+            }
+        }
+        if (g_PowerLearnFull.load()) LOGI("PowerWatch: the table is full ({} draws not counted)", g_PowerLearnFull.load());
+    }
+    void SwordReport()
+    {
+        std::vector<std::pair<SwordKey, SwordStat>> v;
+        { std::lock_guard lk(g_SwordM); for (auto& e : g_Sword) v.push_back(e); g_Sword.clear(); }
+        if (v.empty()) return;
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.n > b.second.n; });
+        static const char* kCls[4] = { "none", "depth/motion", "static shadow", "eye scene" };
+        LOGI("GpuTrace: sword / wrist watch, last 30 s: {} moved draws in {} kinds (sword, or a forearm draw and how it was posed | hand 0 left 1 right | pass | task class | eye | cb bytes | reads: model rows, previous rows, joint palette, depth hack | VS / PS | count, lighting rows >3 deg off the drawn pose, max deg, mirrored, no model rows, avg moved deg)",
+             g_SwordDraws.exchange(0), v.size());
+        for (size_t i = 0; i < v.size() && i < 40; i++)
+        {
+            const SwordKey& k = v[i].first; const SwordStat& s = v[i].second;
+            LOGI("GpuTrace:   {} {} | hand {} | {} | {} | eye {} | cb{} | model {} prev {} palette {} dh {} | {:016x} / {:016x} | n {} off>3deg {} max {:.1f} mirrored {} nomodel {} moved {:.1f}",
+                 k.what ? "wrist " : "sword", k.what >= 0 && k.what < 12 ? (k.what ? kWristHow[k.what] : "held") : "?", k.hand,
+                 k.pass && *k.pass ? k.pass : "(no task)", k.cls >= 0 && k.cls < 4 ? kCls[k.cls] : "?", k.eye, k.bytes,
+                 k.model ? 1 : 0, k.prev ? 1 : 0, k.skinned ? 1 : 0, k.dh ? 1 : 0, k.vs, k.ps,
+                 s.n, s.angBad, s.maxAng, s.detNeg, s.noModel, s.n ? s.sumMoved / (float)s.n : 0.f);
+        }
+    }
     bool TransformInstanceCb(ID3D11DeviceContext* ctx, const InstLayout* L, const float* in, UINT bytes, float* out, bool byIndex, UINT draw, ArmInfo* ai = nullptr)
     {
         t_DrawProjValid = false;
+        t_WristDraw = 0;
         if (!L || !L->ok) { g_NoLayout++; return false; }
         const bool byAnchor = g_IdMode.load() == 1;
         if (!byIndex && !byAnchor && g_OnlyWeapon.load())
@@ -1704,6 +2157,60 @@ namespace
             float d = 0.f, margin = 0.f;
             const int a = NearestAnchor(anch, worldOrg, &d, &margin);
             if (a < 0) { partsReject("no anchor"); g_NoAnchor++; return false; }
+            // DOTO: something worn on forearm `s` (see WristDelta): this view's arm, or the one before carried to this
+            // view; the HandFx snapshot (ForearmDeltaWorld) when neither is there. how = exactHow, or 7 when carried.
+            auto WristDw = [&](int s, bool launcherHeld, Rigid& fw, int* sg, int& how, int exactHow) -> bool
+            {
+                bool exact = false;
+                if (WristDelta(s, xfSerial, handH[s], targetValid[s], anch, launcherHeld, worldOrg, fw, sg, &exact))
+                {
+                    how = exact ? exactHow : 7;
+                    if (exact) g_WristExact[s & 1]++; else g_WristCarried[s & 1]++;
+                    return true;
+                }
+                if (ForearmDeltaWorld(s, worldOrg, fw, sg, bodyValid ? &bodyVr : nullptr)) { how = exactHow; return true; }
+                return false;
+            };
+            // DOTO (vr wristrig 1, see g_WristRig): a draw of something worn on a forearm -- the HELD launcher's entity
+            // claims it, or its mesh is known as the launcher's -- takes the one rigid pose of its view, whatever that hand
+            // holds and whichever entity is nearest. Before every other rule, so none of them (a grenade's gadget pose, the
+            // other hand's claim, the anchoring gate) ever gets one of its draws.
+            if (!carryDraw && g_WristRig.load() && !((a == BodyHide::aArmL || a == BodyHide::aArmR || a == BodyHide::aPlayer) && d < 0.05f))
+            {
+                const void* wVb = nullptr;
+                if (ctx) { ID3D11Buffer* vb = nullptr; UINT st = 0, of = 0; ctx->IAGetVertexBuffers(0, 1, &vb, &st, &of); wVb = vb; if (vb) vb->Release(); }
+                int wSide = -1; bool wHeld = false;
+                if ((a == BodyHide::aWeaponL || a == BodyHide::aWeaponR) && d <= g_AnchorRadius.load())
+                {
+                    const int o = a == BodyHide::aWeaponL ? 0 : 1;
+                    if (BodyHide::HoldsWristDevice(o)) { wSide = o; wHeld = true; }
+                }
+                if (wSide < 0)
+                {
+                    const int ks = WristKeySide(draw, wVb);
+                    if (ks >= 0)
+                    {   // (a sanity bound: on that side's arm, which has its origin at the shoulder)
+                        const BodyHide::Anchor& am = anch[ks ? BodyHide::aArmR : BodyHide::aArmL];
+                        float q = 0; if (am.valid) for (int i = 0; i < 3; i++) q += (worldOrg[i] - am.org[i]) * (worldOrg[i] - am.org[i]);
+                        if (am.valid && q < 1.f) wSide = ks;
+                    }
+                }
+                if (wSide >= 0)
+                {
+                    Rigid fw; int how = 0;
+                    const Rigid partW = Mul(vinv, f.pose);   // (the piece's own pose, for the per-piece log)
+                    if (!WristRigDelta(wSide, xfSerial, handH[wSide], targetValid[wSide], anch, BodyHide::HoldsWristDevice(wSide), bodyValid ? &bodyVr : nullptr, worldOrg, fw, how, draw, wVb, partW.r))
+                    {   // no arm frame to pose it with (a takedown's own arms, a load): drawn as the game has it -- for a
+                        // takedown that is right, the arm is drawn as animated too
+                        g_WristNoPose[wSide]++; g_NotWeapon++; return false;
+                    }
+                    ownDv = Mul(vw, Mul(fw, Inv(vw))); useOwnDv = true; hand = wSide;
+                    t_WristDraw = how; g_ForearmDraws[wSide]++; g_WristRigDraws[wSide]++;
+                    if (wHeld && d < 0.2f) WristKeyAdd(draw, wVb, wSide);   // (its parts sit within 8 cm of its entity: not a shadow proxy 33 cm off)
+                    else g_WristUnclaimed[wSide]++;
+                    goto wristPlaced;
+                }
+            }
             if (carryDraw)
             {   // the carried item: drawn at hand * rel (or on its way back), the entity left where it is
                 const BodyHide::Anchor& ca = anch[BodyHide::aCarry];
@@ -1834,7 +2341,7 @@ namespace
 
                             Rigid P;                                       // palm frame in MODEL space: R = M.R, t = M * centroid
                             for (int r = 0; r < 3; r++) { P.r[r * 3] = m[r * 4]; P.r[r * 3 + 1] = m[r * 4 + 1]; P.r[r * 3 + 2] = m[r * 4 + 2];
-                                                          P.t[r] = m[r * 4] * ab.c[ab.palm][0] + m[r * 4 + 1] * ab.c[ab.palm][1] + m[r * 4 + 2] * ab.c[ab.palm][2] + m[r * 4 + 3]; }
+                                                          P.t[r] = m[r * 4] * ab.pc[0] + m[r * 4 + 1] * ab.pc[1] + m[r * 4 + 2] * ab.pc[2] + m[r * 4 + 3]; }
                             memcpy(ai->socket, P.t, 12);                   // collapse onto the palm, whatever is equipped
                             const Rigid Pw = Mul(modelToWorld, P);         // palm frame in world space
                             // handrel: the palm frame RELATIVE TO THE CONTROLLER, after this frame's delta. It is
@@ -1857,14 +2364,24 @@ namespace
                             // idle animation tosses it about (measured: a sticky grenade 0.2 m out of an open hand), and
                             // the gadget then keeps the last pose it had IN the palm (see GadgetHold) instead of falling
                             // back to the weapon branch and floating next to the hand.
-                            const bool palmNear = entPalm >= 0.f && entPalm < g_GadgetPalmMax.load();
-                            const bool itemGadget = g_GadgetOn.load() == 2 && BodyHide::HoldsGadget(side) && whits >= 1 && entPalm >= 0.f;
+                            // DOTO: Billie's wrist launcher (arkCpntWeaponGaussGun) is worn on the forearm, not held: as a
+                            // weapon its many draws pinned it to the controller and the hand was posed from it -- reported
+                            // 2026-11-07: the left hand bent as if aiming, 15 cm off the controller (the hold it learned),
+                            // the launcher flickering and turned. As a gadget the hand stays an empty hand and the launcher
+                            // rides with it where the game's animation has it relative to the hand (~15-25 cm: the wrist).
+                            const bool wrist = BodyHide::HoldsWristDevice(side);
+                            const bool palmNear = entPalm >= 0.f && entPalm < (wrist ? 0.30f : g_GadgetPalmMax.load());
+                            const bool itemGadget = g_GadgetOn.load() == 2 && (BodyHide::HoldsGadget(side) || wrist) && whits >= 1 && entPalm >= 0.f;
                             // ...but never a firearm: the pistol's reload brings it into the palm drawing two meshes,
                             // and as a 'gadget' it was posed into the anatomical palm and vanished from the hand for
                             // ~0.85 s of every reload (measured, the development notes)
-                            const bool gadget = g_GadgetOn.load() && !BodyHide::HoldsGun(side) && (((whits >= 1 && whits < 3) && palmNear) || itemGadget);
+                            // DOTO: a power is never a weapon or a gadget, however many meshes its effect draws: Semblance's
+                            // (arkCpntPowerMimic) made the hand a weapon's, a grip was learned from the power's animation and
+                            // the hand turned 90 degrees (reported 2026-11-08). The power hand below poses it by anatomy.
+                            const bool powerItem = BodyHide::HoldsPower(side);
+                            const bool gadget = !powerItem && g_GadgetOn.load() && !BodyHide::HoldsGun(side) && (((whits >= 1 && whits < 3) && palmNear) || itemGadget);
                             const bool gadgetAnat = gadget && g_GadgetOn.load() == 2 && g_UseHold.load() == 2 && ab.palmNValid && wa.valid && targetValid[side];
-                            const bool weaponHeld = ((whits >= 3 || (whits >= 1 && BodyHide::HoldsGun(side))) && !gadgetAnat) || (gadget && !gadgetAnat);
+                            const bool weaponHeld = !powerItem && (((whits >= 3 || (whits >= 1 && BodyHide::HoldsGun(side))) && !gadgetAnat) || (gadget && !gadgetAnat));
                             // Crouched, the game turns the hand round the weapon: the sword goes to a reverse grip by
                             // rotating the WRIST inside the arm model, while the equipment entity (what the weapon
                             // branch pins to the controller) stays put. The hand rode the weapon delta, so it flipped
@@ -2042,6 +2559,10 @@ namespace
                                          dw.t[0], dw.t[1], dw.t[2], Q.t[0], Q.t[1], Q.t[2]);
                                 }
                             }
+                            if (targetValid[side])
+                            {   // where this hand's palm is in the game's pose and how it is moved (the other-hand claim)
+                                PalmLive& pl = g_PalmLive[side]; memcpy(pl.palm, Pw.t, 12); pl.dw = handDeltaW; pl.frame = g_PresentFrame; pl.valid = true;
+                            }
                             if (g_TraceLeft.load() > 0 && targetValid[side])
                             {
                                 HandTraceS s; s.valid = true; s.frame = g_PresentFrame; s.whits = whits; s.weapon = weaponHeld; s.gadget = gadget; s.crouchHold = crouchHold[side]; s.grip = gripApply;
@@ -2057,7 +2578,7 @@ namespace
                                 // silhouette does not work (a fanned black glove has no readable direction, and it
                                 // cost two wrong conclusions), so the palm frame gets drawn into the image instead.
                                 const Rigid pf = Mul(handDeltaW, Pw);
-                                ai->palmTgt = pf; ai->palmTgtValid = true; ai->palm = ab.palm; memcpy(ai->palmC, ab.c[ab.palm], 12);
+                                ai->palmTgt = pf; ai->palmTgtValid = true; ai->palm = ab.palm; memcpy(ai->palmC, ab.pc, 12);
                                 std::lock_guard lp(g_PalmM);
 
                                 g_PalmW[side] = pf; g_PalmSeen[side] = g_PresentFrame;
@@ -2131,6 +2652,23 @@ namespace
             {
                 if ((a != BodyHide::aWeaponL && a != BodyHide::aWeaponR) || d > g_AnchorRadius.load())
                 {
+                    // DOTO (2026-11-08): a draw of something worn on a forearm that no held item claims -- the launcher's
+                    // shadow-map draws, its parts with a grenade or a power in that hand -- was drawn where the flat game
+                    // has it (the launcher seen off the arm, low on the left). Known as worn (WristKey) and on a forearm
+                    // now: it goes with that forearm.
+                    if (!g_WristRig.load() && WristKey(draw))
+                        for (int s = 0; s < 2; s++)
+                        {
+                            const BodyHide::Anchor& am = anch[s ? BodyHide::aArmR : BodyHide::aArmL];
+                            if (!am.valid) continue;
+                            float q = 0; for (int i = 0; i < 3; i++) q += (worldOrg[i] - am.org[i]) * (worldOrg[i] - am.org[i]);
+                            if (q > 1.f) continue;
+                            Rigid fw; int sg = 0, how = 8;
+                            if (!WristDw(s, BodyHide::HoldsWristDevice(s), fw, &sg, how, 8) || sg != sgFore) continue;
+                            ownDv = Mul(vw, Mul(fw, Inv(vw))); useOwnDv = true; hand = s;
+                            g_WristUnclaimed[s]++; g_ForearmDraws[s]++; t_WristDraw = 8;
+                            goto wristPlaced;
+                        }
                     if (g_PartsLeft.load() > 0)
                     {   // vr gunparts: a draw left alone although it sits by a held weapon -- drawn where the flat game has it
                         float dw[2] = { -1.f, -1.f };
@@ -2141,36 +2679,122 @@ namespace
                     g_NotWeapon++; return false;
                 }
                 const int owner = a == BodyHide::aWeaponL ? 0 : 1;
-                g_WeaponHitsLive[owner]++;
-                if (d < 0.03f && !g_JitFrozen.load())
-                {   // vr handjit: the weapon's own draws sit ON its entity -- unless the entity was sampled in another frame
-                    std::lock_guard lk(g_JitWM); JitWeapon& s = g_JitW[owner]; s.n++; s.sum += d; if (d > s.max) s.max = d;
-                }
-                if (hand < 0) hand = owner;
-                // A gadget held in the anatomical hand (gpugadget 2): it takes the hand's pose, not a barrel's.
-                const BodyHide::Anchor& wa = anch[owner == 0 ? BodyHide::aWeaponL : BodyHide::aWeaponR];
-                GadgetHold gh; { std::lock_guard lk(g_ArmBonesM); gh = g_GadgetHold[owner]; }
-                if (g_GadgetOn.load() == 2 && gh.valid && g_PresentFrame - gh.frame <= 3 && wa.valid && targetValid[owner])
-                {
-                    Rigid ent; for (int i = 0; i < 3; i++) { ent.r[i * 3] = wa.axis[i]; ent.r[i * 3 + 1] = wa.axis[3 + i]; ent.r[i * 3 + 2] = wa.axis[6 + i]; ent.t[i] = wa.org[i]; }
-                    const Rigid palmTarget = Mul(Mul(handH[owner], HandGripOffset(owner)), gh.rel);
-                    Rigid held = Mul(palmTarget, gh.inPalm);
-                    // The Timepiece: a quarter turn counter-clockwise as the player sees it, round the controller's
-                    // pointing axis (asked 2026-11-02: the grip was right, the device sideways in it). Only its draws:
-                    // the light in its dome (HandFx, from WeaponTargetPose) was where the turned dome now is.
-                    if (BodyHide::HeldItemClass(owner) == BodyHide::kTimeShiftCpntVtable)
+                bool otherHand = false;
+                {   // DOTO: something worn on the OTHER arm -- Billie's wrist launcher is drawn on her left forearm whether
+                    // it is equipped or not -- was claimed by this hand's weapon when that was the nearest entity:
+                    // reported 2026-11-07, with the sword out the left wrist's launcher followed the sword. A draw nearer
+                    // the other hand's palm (as the game poses it) than this weapon's entity rides with the other hand.
+                    PalmLive o; { std::lock_guard lk(g_ArmBonesM); o = g_PalmLive[owner ^ 1]; }
+                    if (o.valid && g_PresentFrame - o.frame <= 3)
                     {
-                        const float fwd[3] = { handH[owner].r[0], handH[owner].r[3], handH[owner].r[6] };
-                        held = TurnInPlace(held, fwd, -90.f);   // seen from behind, looking along +fwd: -90 is counter-clockwise
+                        float q = 0; for (int i = 0; i < 3; i++) q += (worldOrg[i] - o.palm[i]) * (worldOrg[i] - o.palm[i]);
+                        const float dp = sqrtf(q);
+                        if (dp < d && dp < 0.35f)
+                        {   // (on that arm's forearm when it is there: the launcher; else with the hand)
+                            Rigid fw; int sgO = 0, howO = 5;
+                            const bool fore = WristDw(owner ^ 1, BodyHide::HoldsWristDevice(owner ^ 1), fw, &sgO, howO, 5);
+                            ownDv = Mul(vw, Mul(fore ? fw : o.dw, Inv(vw))); useOwnDv = true;
+                            if (fore) g_ForearmDraws[owner ^ 1]++;
+                            if (fore && sgO == sgFore) WristKeyAdd(draw);
+                            t_WristDraw = 5;
+                            if (hand < 0) hand = owner ^ 1;
+                            g_OtherHandDraws[owner ^ 1]++;
+                            otherHand = true;
+                        }
                     }
-                    const Rigid gdw = Mul(held, Inv(ent));
-                    ownDv = Mul(vw, Mul(gdw, Inv(vw))); useOwnDv = true;
-                    gadgetDraw = true; gadgetInPalmDet = Det3(gh.inPalm.r);
-                    g_GadgetDraws[owner]++;
-                    if (g_PartsLeft.load() > 0) LOGI("gunparts: hand {} draw n={} posed as a GADGET (palm)", owner, draw);
+                }
+                if (!otherHand)
+                {
+                    g_WeaponHitsLive[owner]++;
+                    if (d < 0.03f && !g_JitFrozen.load())
+                    {   // vr handjit: the weapon's own draws sit ON its entity -- unless the entity was sampled in another frame
+                        std::lock_guard lk(g_JitWM); JitWeapon& s = g_JitW[owner]; s.n++; s.sum += d; if (d > s.max) s.max = d;
+                    }
+                    if (hand < 0) hand = owner;
+                    // A gadget held in the anatomical hand (gpugadget 2): it takes the hand's pose, not a barrel's.
+                    const BodyHide::Anchor& wa = anch[owner == 0 ? BodyHide::aWeaponL : BodyHide::aWeaponR];
+                    GadgetHold gh; { std::lock_guard lk(g_ArmBonesM); gh = g_GadgetHold[owner]; }
+                    bool forearmDone = false, claimedNoArm = false;
+                    if (d > 0.05f && !BodyHide::HoldsWristDevice(owner))
+                    {   // DOTO: a draw this hand's item claimed but that sits on the FOREARM, not on the item: the launcher
+                        // worn there while the hand holds a grenade (reported 2026-11-07: it came off the arm and turned
+                        // with the grenade's pose). The item's own draws sit on its entity (d ~ 0) and in the hand. A draw
+                        // known as worn (WristKey) goes with the arm even where it reaches past the wrist.
+                        Rigid fw; int sg = 0, how = 2;
+                        const bool got = WristDw(owner, false, fw, &sg, how, 2);
+                        claimedNoArm = !got;
+                        if (got && (sg == sgFore || WristKey(draw)))
+                        {
+                            if (g_WristRig.load())
+                            {   // (a part on the forearm the keys do not know yet: the view's one pose, not its own point's)
+                                Rigid rw; int h2 = 0;
+                                const void* cVb = nullptr;
+                                if (ctx) { ID3D11Buffer* vb = nullptr; UINT st = 0, of = 0; ctx->IAGetVertexBuffers(0, 1, &vb, &st, &of); cVb = vb; if (vb) vb->Release(); }
+                                const Rigid partW = Mul(vinv, f.pose);
+                                if (WristRigDelta(owner, xfSerial, handH[owner], targetValid[owner], anch, false, bodyValid ? &bodyVr : nullptr, worldOrg, rw, h2, draw, cVb, partW.r)) { fw = rw; how = h2; }
+                            }
+                            ownDv = Mul(vw, Mul(fw, Inv(vw))); useOwnDv = true; forearmDone = true;
+                            if (bodyValid && how == 2) WristRemember(owner, fw, bodyVr);
+                            if (sg == sgFore) WristKeyAdd(draw);
+                            g_ForearmDraws[owner]++; t_WristDraw = how;
+                            if (g_PartsLeft.load() > 0) LOGI("gunparts: hand {} draw n={} {:.2f} m from the held item, on the forearm: posed with the FOREARM", owner, draw, d);
+                        }
+                    }
+                    if (!forearmDone && BodyHide::HoldsWristDevice(owner))
+                    {   // DOTO: the wrist launcher is worn on the forearm and follows it (asked 2026-11-07: riding the palm,
+                        // it swung with every turn of the wrist; and while its palm pose was not learned yet its draws
+                        // fell back to the weapon's delta -- pinned to the controller -- and flickered between the two)
+                        Rigid fw; int how = 1;
+                        if (WristDw(owner, true, fw, nullptr, how, 1))
+                        {
+                            ownDv = Mul(vw, Mul(fw, Inv(vw))); useOwnDv = true; forearmDone = true;
+                            if (bodyValid && how == 1) WristRemember(owner, fw, bodyVr);
+                            WristKeyAdd(draw);
+                            g_ForearmDraws[owner]++; t_WristDraw = how;
+                            if (g_PartsLeft.load() > 0) LOGI("gunparts: hand {} draw n={} posed with the FOREARM (worn on it)", owner, draw);
+                        }
+                    }
+                    // (vr wristrig 1: a draw of the held item that sits on no arm is that item's, not the forearm's -- the
+                    // remembered forearm pose is now kept every view and would carry a grenade's own parts off with it)
+                    if (!forearmDone && bodyValid && (BodyHide::HoldsWristDevice(owner) || (claimedNoArm && !g_WristRig.load())))
+                    {   // no forearm delta for this draw: the last one, not the palm pose (see WristLast)
+                        Rigid fw;
+                        if (WristRecall(owner, bodyVr, fw))
+                        {
+                            ownDv = Mul(vw, Mul(fw, Inv(vw))); useOwnDv = true; forearmDone = true; t_WristDraw = 6;
+                            if (g_PartsLeft.load() > 0) LOGI("gunparts: hand {} draw n={} {:.2f} m from the item: the LAST forearm delta kept", owner, draw, d);
+                        }
+                    }
+                    if (!forearmDone && g_GadgetOn.load() == 2 && gh.valid && g_PresentFrame - gh.frame <= 3 && wa.valid && targetValid[owner])
+                    {
+                        Rigid ent; for (int i = 0; i < 3; i++) { ent.r[i * 3] = wa.axis[i]; ent.r[i * 3 + 1] = wa.axis[3 + i]; ent.r[i * 3 + 2] = wa.axis[6 + i]; ent.t[i] = wa.org[i]; }
+                        const Rigid palmTarget = Mul(Mul(handH[owner], HandGripOffset(owner)), gh.rel);
+                        Rigid held = Mul(palmTarget, gh.inPalm);
+                        // The Timepiece: a quarter turn counter-clockwise as the player sees it, round the controller's
+                        // pointing axis (asked 2026-11-02: the grip was right, the device sideways in it). Only its draws:
+                        // the light in its dome (HandFx, from WeaponTargetPose) was where the turned dome now is.
+                        if (BodyHide::HeldItemClass(owner) == BodyHide::kTimeShiftCpntVtable)
+                        {
+                            const float fwd[3] = { handH[owner].r[0], handH[owner].r[3], handH[owner].r[6] };
+                            held = TurnInPlace(held, fwd, -90.f);   // seen from behind, looking along +fwd: -90 is counter-clockwise
+                        }
+                        const Rigid gdw = Mul(held, Inv(ent));
+                        ownDv = Mul(vw, Mul(gdw, Inv(vw))); useOwnDv = true;
+                        gadgetDraw = true; gadgetInPalmDet = Det3(gh.inPalm.r);
+                        g_GadgetDraws[owner]++;
+                        if (BodyHide::HoldsWristDevice(owner)) t_WristDraw = 3;
+                        if (g_PartsLeft.load() > 0) LOGI("gunparts: hand {} draw n={} posed as a GADGET (palm)", owner, draw);
+                    }
+                    if (!useOwnDv && BodyHide::HoldsWristDevice(owner))
+                    {   // neither the forearm (the arm not drawn this frame) nor the palm pose yet: with the hand, never
+                        // pinned to the controller like a held weapon
+                        PalmLive o; { std::lock_guard lk(g_ArmBonesM); o = g_PalmLive[owner]; }
+                        if (o.valid && g_PresentFrame - o.frame <= 3) { ownDv = Mul(vw, Mul(o.dw, Inv(vw))); useOwnDv = true; t_WristDraw = 4; }
+                    }
                 }
             }
         }
+    wristPlaced:
         // rel is in the camera frame (fwd/left/up), so rel[1] > 0 means drawn to the player's left.
         if (hand < 0) hand = rel[1] > 0.f ? 0 : 1;
 
@@ -2187,7 +2811,18 @@ namespace
             {
                 std::lock_guard lk(g_XfM);
                 // still settling after a weapon change -- which only matters to a draw that rides the weapon's delta
-                if (!carryDraw && !g_RestModelValid[hand] && !(ai && ai->side >= 0 && (ai->full || useOwnDv))) { g_NotWeapon++; return false; }
+                // (a draw with a pose of its own needs no anchored hand: DOTO, 2026-11-08, the launcher's draws with no
+                // equipment entity in that hand -- a power, nothing -- or while it re-anchored were drawn unmoved, where
+                // the flat game has them)
+                // (2026-11-08, third pass: `ai` is passed for EVERY draw, so the earlier test "ai || !useOwnDv" dropped
+                // every launcher draw while that hand had a power or nothing in it -- the forearm bare -- and for the
+                // views of every re-anchoring. What is worn on the forearm has a pose of its own: it is drawn.)
+                if (!carryDraw && !g_RestModelValid[hand] && !(ai && ai->side >= 0 && (ai->full || useOwnDv)))
+                {
+                    const bool ownWrist = useOwnDv && t_WristDraw != 0 && !(ai && ai->side >= 0);
+                    if (!ownWrist) { g_NotWeapon++; return false; }
+                    g_WristGateKept++;
+                }
             }
             if (ai && ai->full)
             {   // Full arm: the draw's own matrix stays exactly as the game made it (the model origin is the shoulder
@@ -2243,7 +2878,16 @@ namespace
                                     + dw.r[i * 3 + 2] * in[idx[2] + j] + (j == 3 ? dw.t[i] : 0.f);
         }
         // (after the rows above are written: the log compares what the lighting gets with where the item is drawn)
-        if (!torso && !carryDraw && !(ai && ai->side >= 0)) LogHeldItemDraw(hand, draw, bytes, L, in, out, f, vinv, dv, gadgetDraw, gadgetInPalmDet, useModel, usePrev);
+        if (!torso && !carryDraw && !(ai && ai->side >= 0))
+        {
+            LogHeldItemDraw(hand, draw, bytes, L, in, out, f, vinv, dv, gadgetDraw, gadgetInPalmDet, useModel, usePrev);
+            NoteSwordDraw(ctx, hand, bytes, L, in, out, f, vinv, dv, useModel, usePrev);
+            if (!g_WeaponShadows.load(std::memory_order_relaxed) && hand >= 0 && BodyHide::HeldItemClass(hand) != 0)
+            {
+                const char* pn = PassProfile::PassNow();
+                if (pn && !strncmp(pn, "SHADOWS", 7)) t_DropWeaponShadow = true;
+            }
+        }
         RealDepth(L, out, bytes);   // (after the carried item took the arms' value: both back to the world's)
         return true;
     }
@@ -2990,7 +3634,7 @@ namespace
         F.dh = dh; F.du = du; F.rf0 = rf0; memcpy(F.ax, ax, 12); F.twist = twist;
         memcpy(F.E, E, 12); memcpy(F.Ep, Ep, 12); memcpy(F.S, S, 12); memcpy(F.Sp, Sp, 12); memcpy(F.W, W, 12); memcpy(F.Wp, Wp, 12);
         F.L1 = L1k; F.L2 = L2k; F.reach = d; F.stretched = stretched; F.k = ks;
-        F.m2w = m2r; memcpy(F.head, bodyVr.t, 12); memcpy(F.ctrl, ai.ctrl, 12);
+        F.m2w = m2r; F.bodyVr = bodyVr; memcpy(F.head, bodyVr.t, 12); memcpy(F.ctrl, ai.ctrl, 12);
         F.srcSerial = ai.serial;
         F.valid = true;
         return true;
@@ -3549,6 +4193,473 @@ namespace
     };
     std::mutex g_FxM;
     FxSnap g_Fx[2];
+    //! The delta the arm's skin gets at model-space point `pos` in arm frame F (see GpuTrace::ArmCorrectJoint).
+    bool ArmJointDeltaF(const ArmFrame& F, float pos[3], float axis[9], int* seg)
+    {
+        constexpr float kOffArm = 0.15f;             // metres from the bone line: not part of the arm
+        float ew[3], se[3], pe[3], ps[3];
+        Sub3(F.W, F.E, ew); Sub3(F.E, F.S, se); Sub3(pos, F.E, pe); Sub3(pos, F.S, ps);
+        const float L2 = Norm3(ew), L1 = Norm3(se);
+        if (!(L2 > 0.05f) || !(L1 > 0.05f)) return false;
+        const float tf = Dot3(pe, ew), tu = Dot3(ps, se);
+        auto radial = [](const float d[3], const float u[3], float t) { const float r[3] = { d[0] - u[0] * t, d[1] - u[1] * t, d[2] - u[2] * t }; return sqrtf(Dot3(r, r)); };
+        Rigid D; int sg = 0;
+        if (tf > L2)
+        {   // the hand: within a hand's length of the wrist
+            float pw[3]; Sub3(pos, F.W, pw);
+            if (sqrtf(Dot3(pw, pw)) > 0.30f) return false;
+            D = F.dh; sg = sgHand;
+        }
+        else if (tf >= 0.f && radial(pe, ew, tf) < kOffArm)
+        {
+            const float k = tf / L2;
+            D = Mul(AxisAngle(F.ax, k * F.twist), F.rf0);
+            float t[3]; Rotate(D, F.E, t); for (int i = 0; i < 3; i++) D.t[i] = F.Ep[i] - t[i];
+            sg = sgFore;
+        }
+        else if (tu >= -0.05f && tu <= L1 && radial(ps, se, tu) < kOffArm) { D = F.du; sg = sgUpper; }
+        else return false;
+        if (seg) *seg = sg;
+        float p[3] = { pos[0], pos[1], pos[2] };
+        {   // the position goes with the lengthened arm (BoneDelta's stretch); the axes keep the rigid rotation
+            Rigid Dp = D;
+            if (F.k != 1.f && sg == sgUpper) { float u[3]; Sub3(F.Ep, F.Sp, u); Dp = Mul(StretchAbout(F.Sp, u, F.k), D); }
+            if (F.k != 1.f && sg == sgFore) Dp = Mul(StretchAbout(F.Ep, F.ax, F.k), D);
+            Xform(Dp, p, pos);
+        }
+        for (int k = 0; k < 3; k++) { const float row[3] = { axis[k * 3], axis[k * 3 + 1], axis[k * 3 + 2] }; Rotate(D, row, axis + k * 3); }
+        return true;
+    }
+    //! DOTO: the world delta the arm's skin gets at world point `w` this frame -- the FOREARM's there, its twist
+    //! interpolated along it as the twist bones are (or the hand's / upper arm's, by where the point is: ArmCorrectJoint's
+    //! rule). For things worn on the forearm (Billie's wrist launcher): they follow the forearm, not the hand.
+    bool ForearmDeltaWorld(int side, const float w[3], Rigid& Dw, int* segOut, const Rigid* bodyNow, bool* freshOut)
+    {
+        Rigid m2w, bodySnap; bool fresh;
+        if (freshOut) *freshOut = false;
+        {
+            std::lock_guard lk(g_FxM);
+            const FxSnap& s = g_Fx[side & 1];
+            if (!s.valid || !s.F.valid || g_PresentFrame - s.frame > 2) return false;
+            m2w = s.F.m2w; bodySnap = s.F.bodyVr; fresh = s.frame == g_PresentFrame;
+        }
+        // A draw recorded before this frame's arm draw finds the previous frame's arm: in the eye whose frame runs the
+        // simulation the player has moved since, and the launcher's point fell off that arm (the left eye's half and
+        // half, 2026-11-08). The first-person arms ride the body: carry the old model->world along with it.
+        if (!fresh && bodyNow) { m2w = Mul(Mul(*bodyNow, Inv(bodySnap)), m2w); g_WristStaleFixed++; }
+        const Rigid w2m = Inv(m2w);
+        float p[3]; Xform(w2m, w, p);
+        float pos[3] = { p[0], p[1], p[2] };
+        float ax[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+        int seg = 0;
+        if (!GpuTrace::ArmCorrectJoint(side, 0, pos, ax, &seg)) return false;
+        Rigid D;   // the rows came back as D's columns (each unit row rotated by D)
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) D.r[i * 3 + j] = ax[j * 3 + i];
+        float rp[3]; Rotate(D, p, rp);
+        for (int i = 0; i < 3; i++) D.t[i] = pos[i] - rp[i];
+        Dw = Mul(m2w, Mul(D, w2m));
+        if (segOut) *segOut = seg;
+        if (freshOut) *freshOut = fresh;
+        return true;
+    }
+    // ---- DOTO: one arm frame per view for what is worn on a forearm (see WristDelta's declaration) ----
+    struct WristSnap { unsigned long long view = 0; ArmFrame F; };
+    constexpr int kWristRing = 6;
+    WristSnap g_WristRing[2][kWristRing];         // under g_FxM: the arm frames of the latest views, by view serial
+    struct WristPick { unsigned long long view = 0, src = 0; };
+    WristPick g_WristPick[2];                     // under g_FxM: the arm frame the draws of a view are posed with
+    void WristRingPut(int side, const ArmFrame& F)   // g_FxM held
+    {
+        if (!F.valid || !F.srcSerial) return;
+        WristSnap* ring = g_WristRing[side & 1]; int slot = 0;
+        for (int i = 0; i < kWristRing; i++)
+        {
+            if (ring[i].view == F.srcSerial) return;      // a view's first arm frame is its own
+            if (ring[i].view < ring[slot].view) slot = i;
+        }
+        ring[slot].view = F.srcSerial; ring[slot].F = F;
+    }
+    bool WristFrame(int side, unsigned long long view, ArmFrame& F, unsigned long long& src)
+    {
+        std::lock_guard lk(g_FxM);
+        const WristSnap* ring = g_WristRing[side & 1]; WristPick& pk = g_WristPick[side & 1];
+        int best = -1;
+        if (pk.view == view)
+            for (int i = 0; i < kWristRing; i++) if (ring[i].view && ring[i].view == pk.src) { best = i; break; }
+        if (best < 0)
+        {
+            for (int i = 0; i < kWristRing; i++)
+            {
+                const unsigned long long v = ring[i].view;
+                if (!v || v > view || view - v > 4) continue;
+                if (best < 0 || v > ring[best].view) best = i;
+            }
+            if (best < 0) return false;
+            pk.view = view; pk.src = ring[best].view;
+        }
+        F = ring[best].F; src = ring[best].view;
+        return true;
+    }
+    Rigid AnchorRigid(const BodyHide::Anchor& a)
+    {
+        Rigid r; for (int i = 0; i < 3; i++) { r.r[i * 3] = a.axis[i]; r.r[i * 3 + 1] = a.axis[3 + i]; r.r[i * 3 + 2] = a.axis[6 + i]; r.t[i] = a.org[i]; }
+        return r;
+    }
+    bool WristDelta(int side, unsigned long long view, const Rigid& handNow, bool handNowOk, const BodyHide::Anchor* anchNow,
+                    bool launcherHeld, const float w[3], Rigid& Dw, int* segOut, bool* exactOut)
+    {
+        if (!view || g_AnimSuspend.load()) return false;
+        ArmFrame F; unsigned long long src = 0;
+        if (!WristFrame(side, view, F, src)) return false;
+        Rigid C, E;                               // the controller's move since the arm frame's view; the game's (entity then * now^-1)
+        const bool exact = src == view;
+        if (!exact)
+        {
+            Rigid handThen; bool ok = false, handOk = false;
+            BodyHide::Anchor then[BodyHide::aCount];
+            {
+                std::lock_guard lk(g_XfM);
+                const XfState& r = g_XfRing[src % kXfRing];
+                if (r.serial == src && r.valid) { handThen = r.hand[side & 1]; handOk = r.targetValid[side & 1]; memcpy(then, r.anch, sizeof then); ok = true; }
+            }
+            if (!ok) return false;
+            if (handOk && handNowOk) C = Mul(handNow, Inv(handThen));
+            // the launcher's own entity when it is the held item (its parts are fixed to it), else the arm's entity
+            const int ids[2] = { launcherHeld ? (side ? BodyHide::aWeaponR : BodyHide::aWeaponL) : -1, side ? BodyHide::aArmR : BodyHide::aArmL };
+            for (int id : ids)
+            {
+                if (id < 0) continue;
+                const BodyHide::Anchor& a = anchNow[id]; const BodyHide::Anchor& b = then[id];
+                if (!a.valid || !b.valid || a.ent != b.ent) continue;
+                E = Mul(AnchorRigid(b), Inv(AnchorRigid(a)));
+                g_WristEntComp[side & 1]++;
+                break;
+            }
+        }
+        float we[3]; Xform(E, w, we);             // where the point was in the arm frame's game tick
+        const Rigid w2m = Inv(F.m2w);
+        float p[3]; Xform(w2m, we, p);
+        float pos[3] = { p[0], p[1], p[2] };
+        float ax[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+        int seg = 0;
+        if (!ArmJointDeltaF(F, pos, ax, &seg)) return false;
+        Rigid D;
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) D.r[i * 3 + j] = ax[j * 3 + i];
+        float rp[3]; Rotate(D, p, rp);
+        for (int i = 0; i < 3; i++) D.t[i] = pos[i] - rp[i];
+        Dw = Mul(C, Mul(Mul(F.m2w, Mul(D, w2m)), E));
+        if (segOut) *segOut = seg;
+        if (exactOut) *exactOut = exact;
+        return true;
+    }
+    // ---- DOTO (vr wristrig 1, see g_WristRig): ONE rigid pose per view for everything worn on a forearm ----
+    // The pose is the drawn forearm's move at ONE point, the reference: on the forearm's bone line (elbow 0 -> wrist 1) at
+    // g_WristRefK, learned from where the held launcher's own origin projects onto it. On the bone line it is always the
+    // forearm's delta (never the hand's), and one point means one rigid move for every part. Made by the first draw of a
+    // view that needs it and handed to every other draw of that view (all passes, both the launcher and its parts).
+    struct WristView { unsigned long long view = 0, src = 0; bool ok = false; int how = 0; Rigid dw; bool haveF = false; ArmFrame F; Rigid C, E; };
+    constexpr int kWristViews = 8;
+    std::mutex g_WristViewM;
+    WristView g_WristView[2][kWristViews];        // by view % kWristViews
+    std::atomic<float> g_WristRefK[2] = { 0.85f, 0.85f };
+    std::atomic<bool> g_WristRefLearned[2];
+    // research, under g_WristViewM: (a) the launcher's origin against the forearm (how far along, how far off the bone
+    // line, how far past the wrist); (b) view to view, where the reference ends up IN THE CONTROLLER'S FRAME (the drawn
+    // forearm rides the controller: a jump here is the pose jumping, not the hand moving), by how many views old the arm
+    // frame was; (c) every 16th draw, what the old per-draw rule would have done with it: the segment its own point fell
+    // in, and how far that pose was from the rigid one at the part.
+    struct WristRefStat { unsigned long long n = 0; double sumK = 0, minK = 9, maxK = -9, sumRad = 0, maxRad = 0, maxPast = 0; };
+    WristRefStat g_WristRefStat[2];
+    struct WristJump { unsigned long long n = 0, big = 0; double sumPos = 0, maxPos = 0, sumAng = 0, maxAng = 0; };
+    WristJump g_WristJump[2][4];                  // [side][view - src: 0, 1, 2, 3+]
+    struct WristLastRel { bool valid = false; unsigned long long view = 0; Rigid rel; };
+    WristLastRel g_WristLastRel[2];
+    struct WristPartStat { unsigned long long n = 0, seg[sgCount] = {}, fail = 0; double sumPos = 0, maxPos = 0, sumAng = 0, maxAng = 0; };
+    WristPartStat g_WristPart[2];
+    std::atomic<unsigned long long> g_WristViews[2][4];   // [side][0 own arm, 1 carried, 2 kept, 3 none]
+    std::atomic<unsigned> g_WristPartTick{ 0 };
+    // ---- DOTO (2026-11-08, fourth pass): every piece worn on a forearm, one by one ----
+    // Per mesh (index count + vertex buffer): where the GAME has it relative to the game's own animated forearm (the arm
+    // frame its pose is made from, in that frame's tick): how far along elbow -> wrist (k), how far off the bone line,
+    // the angle of its x axis to the forearm, and how far from the launcher's entity; view to view, whether that changes.
+    // A worn piece the game draws ON its forearm keeps these constant; GpuTrace moves every piece by the same rigid pose,
+    // so a piece seen off the drawn arm is a piece the game (or HandFx) had off the game's arm. Lines `wristpiece` (30 s)
+    // and `wristpiece detail` (each piece off the arm, or jumping, with everything known about that draw).
+    struct WristPiece
+    {
+        unsigned long long draws = 0, unposed = 0, eye[3] = {}, how[3] = {}, nEnt = 0, jumps = 0, offArm = 0;
+        double sumK = 0, minK = 9, maxK = -9, sumRad = 0, maxRad = 0, sumAng = 0, sumEnt = 0, maxEnt = 0, maxJumpCm = 0, maxJumpDeg = 0;
+        float lastK = 0, lastRad = 0, lastAng = 0; unsigned long long lastView = 0; bool lastValid = false;
+        std::map<std::string, unsigned> passes;
+    };
+    std::mutex g_WristPieceM;
+    std::map<std::pair<UINT, uintptr_t>, WristPiece> g_WristPieces;   // under g_WristPieceM
+    std::atomic<int> g_WristPieceDetail{ 40 }, g_WristPieceDetailTotal{ 0 };
+    void WristPieceNote(int side, UINT draw, const void* vb, const float w[3], const float* partRot, const WristView* got, int how, bool launcherHeld,
+                        const BodyHide::Anchor* anchNow, unsigned long long view)
+    {
+        if (!::Log::Enabled() || !draw) return;
+        const int e = PassProfile::CharEye(); const int ei = (e == 0 || e == 1) ? e : 2;
+        const char* pass = PassProfile::PassNow();
+        float k = 0, rad = 0, ang = -1, L2 = 0, entD = -1;
+        bool geo = false;
+        if (got && got->haveF)
+        {
+            const ArmFrame& F = got->F;
+            float ew[3]; Sub3(F.W, F.E, ew); L2 = Norm3(ew);
+            if (L2 > 0.05f)
+            {
+                const Rigid w2m = Inv(F.m2w);
+                float we[3], p[3]; Xform(got->E, w, we); Xform(w2m, we, p);
+                float pe[3]; Sub3(p, F.E, pe);
+                const float tf = Dot3(pe, ew);
+                const float r[3] = { pe[0] - ew[0] * tf, pe[1] - ew[1] * tf, pe[2] - ew[2] * tf };
+                k = tf / L2; rad = sqrtf(Dot3(r, r)); geo = true;
+                if (partRot)
+                {
+                    const float xw[3] = { partRot[0], partRot[3], partRot[6] };
+                    float xe[3], xm[3]; Rotate(got->E, xw, xe); Rotate(w2m, xe, xm);
+                    const float n = sqrtf(Dot3(xm, xm));
+                    if (n > 1e-6f) ang = acosf(std::clamp(Dot3(xm, ew) / n, -1.f, 1.f)) * 57.2958f;
+                }
+            }
+        }
+        const BodyHide::Anchor& la = anchNow[side ? BodyHide::aWeaponR : BodyHide::aWeaponL];
+        if (launcherHeld && la.valid) { float q = 0; for (int i = 0; i < 3; i++) q += (w[i] - la.org[i]) * (w[i] - la.org[i]); entD = sqrtf(q); }
+        std::string why;
+        float jumpCm = 0, jumpDeg = 0;
+        {
+            std::lock_guard lk(g_WristPieceM);
+            if (g_WristPieces.size() >= 64 && !g_WristPieces.count({ draw, (uintptr_t)vb })) return;
+            WristPiece& s = g_WristPieces[{ draw, (uintptr_t)vb }];
+            s.draws++; s.eye[ei]++;
+            if (!got || !got->ok) { s.unposed++; why = "NO POSE (drawn where the game has it)"; }
+            else s.how[how == 9 ? 0 : how == 10 ? 1 : 2]++;
+            if (pass && s.passes.size() < 24) s.passes[pass]++;
+            if (geo)
+            {
+                s.sumK += k; s.minK = std::min<double>(s.minK, k); s.maxK = std::max<double>(s.maxK, k);
+                s.sumRad += rad; s.maxRad = std::max<double>(s.maxRad, rad); if (ang >= 0) s.sumAng += ang;
+                const bool off = rad > 0.10f || k < -0.15f || k > 1.25f;
+                if (off) { s.offArm++; if (why.empty()) why = "OFF THE GAME'S FOREARM"; }
+                if (s.lastValid && view != s.lastView)
+                {
+                    const float dk = (k - s.lastK) * L2, dr = rad - s.lastRad;
+                    jumpCm = sqrtf(dk * dk + dr * dr) * 100.f; jumpDeg = (ang >= 0 && s.lastAng >= 0) ? fabsf(ang - s.lastAng) : 0.f;
+                    if (jumpCm > s.maxJumpCm) s.maxJumpCm = jumpCm; if (jumpDeg > s.maxJumpDeg) s.maxJumpDeg = jumpDeg;
+                    if (jumpCm > 3.f || jumpDeg > 8.f) { s.jumps++; if (why.empty()) why = "JUMPED on the game's forearm since its last view"; }
+                }
+                s.lastK = k; s.lastRad = rad; s.lastAng = ang; s.lastView = view; s.lastValid = true;
+            }
+            if (entD >= 0) { s.nEnt++; s.sumEnt += entD; s.maxEnt = std::max<double>(s.maxEnt, entD); }
+        }
+        if (!why.empty() && g_WristPieceDetailTotal.load() < 600 && g_WristPieceDetail.fetch_sub(1) > 0)
+        {
+            g_WristPieceDetailTotal++;
+            LOGI("wristpiece detail: {} | {} n={} vb {} | view {} arm frame of view {} eye {} pass {} how {} | on the game forearm k {:.2f} off its bone line {:.1f} cm, x axis {:.0f} deg to it, jump {:.1f} cm {:.0f} deg | {} | game origin ({:.3f},{:.3f},{:.3f}) | hand item exe+0x{:X}{}",
+                 why, side ? "R" : "L", draw, vb, view, got ? got->src : 0, ei, pass ? pass : "?", how, k, rad * 100.f, ang, jumpCm, jumpDeg,
+                 entD >= 0 ? fmt::format("{:.1f} cm from the held launcher's entity", entD * 100.f) : std::string(launcherHeld ? "launcher entity not anchored" : "the launcher is not the held item"),
+                 w[0], w[1], w[2], BodyHide::HeldItemClass(side), BodyHide::HoldsWristDevice(side) ? " (the launcher)" : "");
+        }
+    }
+    void WristPieceReport()
+    {
+        std::lock_guard lk(g_WristPieceM);
+        for (auto& [key, s] : g_WristPieces)
+        {
+            if (!s.draws) continue;
+            std::vector<std::pair<unsigned, std::string>> ps; for (auto& [n, c] : s.passes) ps.push_back({ c, n });
+            std::sort(ps.rbegin(), ps.rend());
+            std::string pl; for (size_t i = 0; i < ps.size() && i < 6; i++) pl += fmt::format(" {}:{}", ps[i].second, ps[i].first);
+            const unsigned long long g = s.draws - s.unposed;
+            LOGI("wristpiece: n={} vb {:#x}: draws {} (eye0 {} eye1 {} other {}), unposed {}, posed from the view's own arm {} / the view before {} / kept {} | on the game forearm k {:.2f} [{:.2f}..{:.2f}], off its bone line mean {:.1f} max {:.1f} cm, x axis {:.0f} deg to it, OFF THE ARM {} | from the held launcher's entity mean {:.1f} max {:.1f} cm ({}) | view-to-view jumps {} (max {:.1f} cm {:.0f} deg) | passes{}",
+                 key.first, key.second, s.draws, s.eye[0], s.eye[1], s.eye[2], s.unposed, s.how[0], s.how[1], s.how[2],
+                 g ? s.sumK / g : 0.0, s.minK < 9 ? s.minK : 0.0, s.maxK > -9 ? s.maxK : 0.0, g ? s.sumRad / g * 100.0 : 0.0, s.maxRad * 100.0, g ? s.sumAng / g : 0.0, s.offArm,
+                 s.nEnt ? s.sumEnt / s.nEnt * 100.0 : 0.0, s.maxEnt * 100.0, s.nEnt, s.jumps, s.maxJumpCm, s.maxJumpDeg, pl);
+            const float lk = s.lastK, lr = s.lastRad, la = s.lastAng; const unsigned long long lv = s.lastView; const bool lval = s.lastValid;
+            s = WristPiece(); s.lastK = lk; s.lastRad = lr; s.lastAng = la; s.lastView = lv; s.lastValid = lval;
+        }
+        g_WristPieceDetail = 40;
+    }
+    bool WristRigDelta(int side, unsigned long long view, const Rigid& handNow, bool handNowOk, const BodyHide::Anchor* anchNow,
+                       bool launcherHeld, const Rigid* bodyNow, const float w[3], Rigid& Dw, int& how, UINT draw, const void* vb, const float* partRot)
+    {
+        side &= 1;
+        if (g_AnimSuspend.load()) return false;   // a takedown: the arms are drawn as animated, and so is what they wear
+        const bool sample = (g_WristPartTick.fetch_add(1, std::memory_order_relaxed) & 15) == 0 && ::Log::Enabled();
+        WristView got; bool have = false;
+        if (view)
+        {
+            std::lock_guard lk(g_WristViewM);
+            const WristView& c = g_WristView[side][view % kWristViews];
+            if (c.view == view)
+            {
+                have = true; got.ok = c.ok; got.how = c.how; got.dw = c.dw;
+                if (c.haveF) { got.haveF = true; got.F = c.F; got.C = c.C; got.E = c.E; got.src = c.src; }
+            }
+        }
+        if (!have)
+        {   // the first draw of this view: make its pose
+            WristView m; m.view = view;
+            ArmFrame F; unsigned long long src = 0;
+            if (view && WristFrame(side, view, F, src))
+            {
+                Rigid C, E; bool ok = true;
+                const bool exact = src == view;
+                if (!exact)
+                {   // the controller's move since that view, and the game's own move of the forearm since its tick
+                    Rigid handThen; bool handOk = false; BodyHide::Anchor then[BodyHide::aCount];
+                    {
+                        std::lock_guard lk(g_XfM);
+                        const XfState& r = g_XfRing[src % kXfRing];
+                        if (r.serial == src && r.valid) { handThen = r.hand[side]; handOk = r.targetValid[side]; memcpy(then, r.anch, sizeof then); }
+                        else ok = false;
+                    }
+                    if (ok)
+                    {
+                        if (handOk && handNowOk) C = Mul(handNow, Inv(handThen));
+                        const int ids[2] = { launcherHeld ? (side ? BodyHide::aWeaponR : BodyHide::aWeaponL) : -1, side ? BodyHide::aArmR : BodyHide::aArmL };
+                        for (int id : ids)
+                        {
+                            if (id < 0) continue;
+                            const BodyHide::Anchor& a = anchNow[id]; const BodyHide::Anchor& b = then[id];
+                            if (!a.valid || !b.valid || a.ent != b.ent) continue;
+                            E = Mul(AnchorRigid(b), Inv(AnchorRigid(a)));
+                            g_WristEntComp[side]++;
+                            break;
+                        }
+                    }
+                }
+                float ew[3]; Sub3(F.W, F.E, ew); const float L2 = Norm3(ew);   // ew: unit, elbow -> wrist
+                if (ok && L2 > 0.05f)
+                {
+                    const Rigid w2m = Inv(F.m2w);
+                    // (a) learn the reference from the held launcher's own origin (its entity), in that frame's tick
+                    if (launcherHeld)
+                    {
+                        const BodyHide::Anchor& la = anchNow[side ? BodyHide::aWeaponR : BodyHide::aWeaponL];
+                        if (la.valid)
+                        {
+                            float we[3], p[3]; Xform(E, la.org, we); Xform(w2m, we, p);
+                            float pe[3]; Sub3(p, F.E, pe);
+                            const float tf = Dot3(pe, ew);
+                            const float r[3] = { pe[0] - ew[0] * tf, pe[1] - ew[1] * tf, pe[2] - ew[2] * tf };
+                            const float rad = sqrtf(Dot3(r, r)), k = tf / L2;
+                            if (std::isfinite(k) && k > 0.f && k < 1.6f && rad < 0.25f)
+                            {
+                                const float kc = std::clamp(k, 0.2f, 0.97f);
+                                const float old = g_WristRefK[side].load();
+                                g_WristRefK[side] = g_WristRefLearned[side].load() ? old + (kc - old) * 0.02f : kc;
+                                if (!g_WristRefLearned[side].exchange(true))
+                                    LOGI("gpuhands: wrist launcher (side {}) worn {:.2f} of the way from the elbow to the wrist ({:.3f} m of a {:.3f} m forearm{}), {:.3f} m off its bone line: posed as one rigid piece from that point",
+                                         side, k, tf, L2, k > 1.f ? fmt::format(", {:.3f} m PAST the wrist", tf - L2) : std::string(), rad);
+                            }
+                            std::lock_guard lk(g_WristViewM);
+                            WristRefStat& s = g_WristRefStat[side];
+                            if (std::isfinite(k)) { s.n++; s.sumK += k; s.minK = std::min<double>(s.minK, k); s.maxK = std::max<double>(s.maxK, k); s.sumRad += rad; s.maxRad = std::max<double>(s.maxRad, rad); s.maxPast = std::max<double>(s.maxPast, tf - L2); }
+                        }
+                    }
+                    const float kr = std::clamp(g_WristRefK[side].load(), 0.f, 0.97f);
+                    float ref[3]; for (int i = 0; i < 3; i++) ref[i] = F.E[i] + ew[i] * (kr * L2);
+                    float pos[3] = { ref[0], ref[1], ref[2] };
+                    float ax[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+                    int seg = 0;
+                    if (ArmJointDeltaF(F, pos, ax, &seg) && seg == sgFore)
+                    {
+                        Rigid D;   // the rows came back as D's columns; D.t from where the reference went
+                        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) D.r[i * 3 + j] = ax[j * 3 + i];
+                        float rp[3]; Rotate(D, ref, rp);
+                        for (int i = 0; i < 3; i++) D.t[i] = pos[i] - rp[i];
+                        m.dw = Mul(C, Mul(Mul(F.m2w, Mul(D, w2m)), E));
+                        m.ok = true; m.how = exact ? 9 : 10; m.src = src;
+                        m.haveF = true; m.F = F; m.C = C; m.E = E;
+                        g_WristViews[side][exact ? 0 : 1]++;
+                        if (exact) g_WristExact[side]++; else g_WristCarried[side]++;
+                        // (b) the reference, drawn, in the controller's frame, against the previous view's
+                        if (handNowOk)
+                        {
+                            Rigid refW; refW.r[0] = refW.r[4] = refW.r[8] = 1.f; memcpy(refW.t, ref, 12);
+                            const Rigid drawn = Mul(C, Mul(F.m2w, Mul(D, refW)));
+                            const Rigid rel = Mul(Inv(handNow), drawn);
+                            std::lock_guard lk(g_WristViewM);
+                            WristLastRel& lr = g_WristLastRel[side];
+                            if (lr.valid && view > lr.view && view - lr.view <= 2)
+                            {
+                                const double dp = PosDiffCm(rel, lr.rel), da = RotAngleDeg(rel, lr.rel);
+                                WristJump& j = g_WristJump[side][std::min<unsigned long long>(view - src, 3)];
+                                j.n++; j.sumPos += dp; j.sumAng += da; if (dp > j.maxPos) j.maxPos = dp; if (da > j.maxAng) j.maxAng = da;
+                                if (dp > 1.0 || da > 3.0) j.big++;
+                            }
+                            lr.valid = true; lr.view = view; lr.rel = rel;
+                        }
+                    }
+                }
+            }
+            if (!m.ok && bodyNow && WristRecall(side, *bodyNow, m.dw)) { m.ok = true; m.how = 11; g_WristViews[side][2]++; }
+            if (!m.ok) g_WristViews[side][3]++;
+            if (m.ok && m.how != 11 && bodyNow) WristRemember(side, m.dw, *bodyNow);
+            {   // the first pose stored for a view is the view's: a draw that made its own meanwhile takes the stored one
+                std::lock_guard lk(g_WristViewM);
+                WristView& c = g_WristView[side][view % kWristViews];
+                if (view && c.view == view) { got.ok = c.ok; got.how = c.how; got.dw = c.dw; got.src = c.src; if (c.haveF) { got.haveF = true; got.F = c.F; got.C = c.C; got.E = c.E; } }
+                else { if (view) c = m; got = m; }
+            }
+        }
+        WristPieceNote(side, draw, vb, w, partRot, &got, got.how, launcherHeld, anchNow, view);
+        if (!got.ok) return false;
+        Dw = got.dw; how = got.how;
+        if (sample && got.haveF)
+        {   // (c) what the old rule (each draw posed at its own origin) would have given this draw
+            const Rigid w2m = Inv(got.F.m2w);
+            float we[3], p[3]; Xform(got.E, w, we); Xform(w2m, we, p);
+            float pos[3] = { p[0], p[1], p[2] }, ax[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+            int seg = 0;
+            const bool okPart = ArmJointDeltaF(got.F, pos, ax, &seg);
+            std::lock_guard lk(g_WristViewM);
+            WristPartStat& s = g_WristPart[side];
+            s.n++;
+            if (!okPart) s.fail++;
+            else
+            {
+                s.seg[seg < sgCount ? seg : 0]++;
+                Rigid D; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) D.r[i * 3 + j] = ax[j * 3 + i];
+                float rp[3]; Rotate(D, p, rp); for (int i = 0; i < 3; i++) D.t[i] = pos[i] - rp[i];
+                const Rigid oldDw = Mul(got.C, Mul(Mul(got.F.m2w, Mul(D, w2m)), got.E));
+                Rigid at; at.r[0] = at.r[4] = at.r[8] = 1.f; memcpy(at.t, w, 12);
+                const Rigid a = Mul(oldDw, at), b = Mul(Dw, at);
+                const double dp = PosDiffCm(a, b), da = RotAngleDeg(a, b);
+                s.sumPos += dp; s.sumAng += da; if (dp > s.maxPos) s.maxPos = dp; if (da > s.maxAng) s.maxAng = da;
+            }
+        }
+        return true;
+    }
+    //! The 30 s line of the research above (and its reset).
+    std::string WristRigReport()
+    {
+        std::lock_guard lk(g_WristViewM);
+        std::string s;
+        for (int side = 0; side < 2; side++)
+        {
+            const unsigned long long v0 = g_WristViews[side][0].exchange(0), v1 = g_WristViews[side][1].exchange(0), v2 = g_WristViews[side][2].exchange(0), v3 = g_WristViews[side][3].exchange(0);
+            const WristRefStat& r = g_WristRefStat[side]; const WristPartStat& p = g_WristPart[side];
+            if (!(v0 + v1 + v2 + v3) && !r.n && !p.n) continue;
+            s += fmt::format(" | {}: views posed from their own arm {}, from the view before {}, kept {}, none {}; draws {} unposed {}; reference {:.2f} along the forearm",
+                             side ? "R" : "L", v0, v1, v2, v3, g_WristRigDraws[side].exchange(0), g_WristNoPose[side].exchange(0), g_WristRefK[side].load());
+            if (r.n) s += fmt::format(" (launcher origin {:.2f} [{:.2f}..{:.2f}], {:.1f} cm off the bone line, max {:.1f}; past the wrist by at most {:.1f} cm)",
+                                      r.sumK / r.n, r.minK, r.maxK, r.sumRad / r.n * 100.0, r.maxRad * 100.0, r.maxPast * 100.0);
+            s += "; view to view in the controller's frame (by the arm frame's age):";
+            for (int k = 0; k < 4; k++)
+            {
+                const WristJump& j = g_WristJump[side][k];
+                if (j.n) s += fmt::format(" {}{}: n {} mean {:.2f} cm {:.2f} deg max {:.1f} cm {:.1f} deg, >1 cm or >3 deg {}", k, k == 3 ? "+" : "", j.n, j.sumPos / j.n, j.sumAng / j.n, j.maxPos, j.maxAng, j.big);
+            }
+            if (p.n) s += fmt::format("; the old per-draw rule on {} sampled draws: own point on the hand {} forearm {} upper arm {} none {}, off the rigid pose by mean {:.1f} cm {:.1f} deg, max {:.1f} cm {:.1f} deg",
+                                      p.n, p.seg[sgHand], p.seg[sgFore], p.seg[sgUpper], p.fail + p.seg[sgNone], p.n - p.fail ? p.sumPos / (p.n - p.fail) : 0.0, p.n - p.fail ? p.sumAng / (p.n - p.fail) : 0.0, p.maxPos, p.maxAng);
+            g_WristRefStat[side] = WristRefStat(); g_WristPart[side] = WristPartStat();
+            for (int k = 0; k < 4; k++) g_WristJump[side][k] = WristJump();
+        }
+        return s;
+    }
     // The price of the frame of latency: an effect placed with frame N-1's hand delta and drawn in frame N sits
     // |dh_N * p - dh_(N-1) * p| from the drawn hand, p the animated palm. Measured here, on the render thread, from
     // two consecutive frames of the same arm -- no mixing of frames from different threads.
@@ -3557,6 +4668,7 @@ namespace
     void FxPublish(int side, const float* pal, UINT bones, const SegTable& T, const ArmFrame& F)
     {
         std::lock_guard lk(g_FxM);
+        WristRingPut(side, F);
         FxSnap& s = g_Fx[side & 1];
         const unsigned long long gap = g_PresentFrame - s.frame;
         if (s.valid && s.F.valid && gap >= 1 && gap <= 3 && F.valid)
@@ -4020,6 +5132,8 @@ namespace
         // the spyglass up: the player's arms and what they hold are not drawn (their projection was noted above first:
         // the reticle still projects with it)
         if (transformed && g_HideFp.load(std::memory_order_relaxed)) { sw.drop = true; g_FpDropped++; }
+        if (transformed && t_DropWeaponShadow) { sw.drop = true; g_WeaponShadowDropped++; }
+        t_DropWeaponShadow = false;
         if (!moved)
         {
             if (!eyeFixed) { cur->Release(); return; }
@@ -4112,7 +5226,7 @@ namespace
         ID3D11PixelShader* ps = nullptr; c->PSGetShader(&ps, nullptr, nullptr);
         if (!ps) return;
         thread_local const void* lastPs = nullptr; thread_local bool lastHit = false;
-        if (ps != lastPs) { lastPs = ps; lastHit = GpuTrace::ShaderHashOf(ps) == 0x48f2037fd43d86c8ull; }   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
+        if (ps != lastPs) { lastPs = ps; const uint64_t h = GpuTrace::ShaderHashOf(ps); PortCheck::Candidate(PortCheck::kSiteDepthOnly, h); lastHit = h == 0x48f2037fd43d86c8ull; }   // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
         if (!lastHit) { ps->Release(); return; }
         ID3D11RenderTargetView* rtv[8] = {}; ID3D11DepthStencilView* dsv = nullptr;
         c->OMGetRenderTargets(8, rtv, &dsv);
@@ -4212,7 +5326,7 @@ namespace
     // any draw into (or depth-tested against) its source or target, any copy, update or clear of either; a copy equal to
     // it (views, viewport, depth-stencil state and reference, rasterizer state) while it still holds is not made. And
     // with the depth of field and the game's fog both off, the depth downsample only the autofocus then reads (below).
-    constexpr uint64_t kPsDepthCopy = 0x904e7f2d94d6f085ull, kPsDofDepth = 0xb152af85c03cbbafull;   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
+    constexpr uint64_t kPsDepthCopy = 0x904e7f2d94d6f085ull, kPsDofDepth = 0xb152af85c03cbbafull;   // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
     std::atomic<unsigned long long> g_CopiesSeen{ 0 }, g_CopiesSkipped{ 0 }, g_DofDepthSkipped{ 0 };
     std::atomic<bool> g_ClearHooked{ false };
     struct DCopy
@@ -4238,7 +5352,7 @@ namespace
     //! between the eyes. The draw-by-draw frames crouched / standing differ by this one full-screen draw (PS
     //! 2ee2b9822f61d7d1, VS 6b73f68586d24765, reads only ro_fx_opacity, written just before by DISTORTION's PS
     //! 7f0150a21f29e29c): the game's sneak overlay, laid over the flat screen; in the eyes only the square was left.
-    constexpr uint64_t kPsSneakOverlay = 0x2ee2b9822f61d7d1ull;   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
+    constexpr uint64_t kPsSneakOverlay = 0x2ee2b9822f61d7d1ull;   // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
     std::atomic<unsigned long long> g_SneakFxSkipped{ 0 };
     bool SneakFxSkip(ID3D11DeviceContext* c)
     {
@@ -4248,6 +5362,7 @@ namespace
         thread_local const void* lastPs = nullptr; thread_local uint64_t lastHash = 0;
         if (ps != lastPs) { lastPs = ps; lastHash = GpuTrace::ShaderHashOf(ps); }
         ps->Release();
+        PortCheck::Candidate(PortCheck::kSiteSneakOverlay, lastHash);   // the DOTO port: which PS is the sneak overlay here
         if (lastHash != kPsSneakOverlay) return false;
         if (g_SneakFxSkipped.fetch_add(1, std::memory_order_relaxed) == 0) LOGI("GpuTrace: SkipSneakOverlay: the sneak mode's screen overlay not drawn over an eye's picture (from now on)");
         return true;
@@ -4259,7 +5374,7 @@ namespace
     //! 0.115 with it on). The fill's packed depth is read later, so the fill stays. Skipped only once the fill has been
     //! seen 60 times to cover the AO draw entirely (same target, depth-stencil state and reference, no blending, all
     //! channels written); a skipped AO draw that no fill follows twice stops the skip.
-    constexpr uint64_t kPsDwao = 0x7012fd32e80f486eull, kPsAoFill = 0xea85def507442b03ull;   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
+    constexpr uint64_t kPsDwao = 0x7012fd32e80f486eull, kPsAoFill = 0xea85def507442b03ull;   // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
     constexpr int kDwaoNeed = 60;
     std::atomic<int> g_DwaoOk{ 0 };
     std::atomic<unsigned long long> g_DwaoSkipped{ 0 }, g_DwaoConfirmed{ 0 };
@@ -4268,14 +5383,20 @@ namespace
     thread_local DwaoSeen t_Dwao;
     bool DwaoSkip(ID3D11DeviceContext* c)
     {
-        if (!PassProfile::SsaoTaskNow()) return false;
+        if (AoGtao::InDraw()) return false;            // the mod's own AO draw: through
+        const bool skipTask = PassProfile::SsaoTaskNow(), gtao = AoGtao::Active() && PassProfile::SsaoAnyNow();
+        if (!skipTask && !gtao) return false;
         ID3D11PixelShader* ps = nullptr; c->PSGetShader(&ps, nullptr, nullptr);
         if (!ps) return false;
         thread_local const void* lastPs = nullptr; thread_local uint64_t lastHash = 0;
         if (ps != lastPs) { lastPs = ps; lastHash = GpuTrace::ShaderHashOf(ps); }
         ps->Release();
         const uint64_t h = lastHash;
+        PortCheck::Candidate(PortCheck::kSiteAo, h);   // the DOTO port: the SSAO task's pixel shaders
         if (h != kPsDwao && h != kPsAoFill) return false;
+        // AmbientOcclusionQuality = high: GTAO drawn in the game's AO draw's place (AoGtao)
+        if (h == kPsDwao && gtao && Settings::AmbientOcclusion() && AoGtao::Replace(c)) return true;
+        if (!skipTask) return false;
         ID3D11RenderTargetView* rtv = nullptr; c->OMGetRenderTargets(1, &rtv, nullptr);
         const void* rt = ResOf(rtv); if (rtv) rtv->Release();
         ID3D11DepthStencilState* dss = nullptr; UINT ref = 0; c->OMGetDepthStencilState(&dss, &ref);
@@ -4334,6 +5455,7 @@ namespace
         if (ps != lastPs) { lastPs = ps; lastHash = ps ? GpuTrace::ShaderHashOf(ps) : 0; }
         const uint64_t h = ps ? lastHash : 0;
         if (ps) ps->Release();
+        PortCheck::Candidate(PortCheck::kSiteDepthCopy, h);   // the DOTO port: the depth copies' pixel shaders
         bool skip = false;
         // The depth downsample PS b152af85c03cbbaf (an RG16F) is not made with the depth of field off AND the game's fog
         // off: then only DOF_AUTOFOCUS reads it. With the game's fog on (the Void: FogMaps, or Fog = 1) the FOG pass reads
@@ -4542,6 +5664,7 @@ namespace
         {
             Record(c, KIND, eDrawIndexed, n);
             PassProfile::NoteDraw(c, n, 1, false, s, b);
+            StereoFeedback::OnDraw(c);   // Foresight's distortion image, per eye
             if (DepthCopySkip(c, n) || SneakFxSkip(c) || DwaoSkip(c)) return;   // DepthPassSkipRedundantCopies
             if (PostShare::Active() && PostShare::AtDraw(c)) return;   // SkipEmptyOutlines
             if (Fog::ExposureSearching()) Fog::AtWork(c, false);
@@ -4564,6 +5687,7 @@ namespace
             // and a weapon pass left out here would stay behind and clip the moved geometry against its own depth
             Record(c, KIND, eDraw, n);
             PassProfile::NoteDraw(c, n, 1, false, s, 0);
+            StereoFeedback::OnDraw(c);   // Foresight's distortion image, per eye
             if (DepthCopySkip(c, n) || SneakFxSkip(c) || DwaoSkip(c)) return;   // DepthPassSkipRedundantCopies
             if (PostShare::Active() && PostShare::AtDraw(c)) return;   // SkipEmptyOutlines
             if (Fog::ExposureSearching()) Fog::AtWork(c, false);
@@ -4585,6 +5709,7 @@ namespace
         {
             Record(c, KIND, eDrawIndexedInstanced, n);
             PassProfile::NoteDraw(c, n, i, false, s, b);
+            StereoFeedback::OnDraw(c);   // Foresight's distortion image, per eye
             if (DepthCopySkip(c, n) || SneakFxSkip(c) || DwaoSkip(c)) return;   // DepthPassSkipRedundantCopies
             if (PostShare::Active() && PostShare::AtDraw(c)) return;   // SkipEmptyOutlines
             if (Fog::ExposureSearching()) Fog::AtWork(c, false);
@@ -4606,6 +5731,7 @@ namespace
         {
             Record(c, KIND, eDrawInstanced, n);
             PassProfile::NoteDraw(c, n, i, false, s, 0);
+            StereoFeedback::OnDraw(c);   // Foresight's distortion image, per eye
             if (DepthCopySkip(c, n) || SneakFxSkip(c) || DwaoSkip(c)) return;   // DepthPassSkipRedundantCopies
             if (PostShare::Active() && PostShare::AtDraw(c)) return;   // SkipEmptyOutlines
             if (Fog::ExposureSearching()) Fog::AtWork(c, false);
@@ -4874,6 +6000,29 @@ namespace
         auto crowd = [&](int e) { int c = 0; for (int b = 0; b < ab.bones; b++) if (cw[b] > 0 && dist(b, e) < 0.08f) c++; return c; };
         ab.tip = crowd(e0) >= crowd(e1) ? e0 : e1;
         const int prox = ab.tip == e0 ? e1 : e0;
+        bool palmInHand = false;   // DOTO: the palm was moved into the hand (below): its point goes to the palm's middle
+        {   // DOTO: the palm is a bone IN THE HAND. Billie's arm skins (69 bones) carry most of their vertices on forearm
+            // bones -- bone 64 (340 vertices, 41 cm from the fingertips) on the left, bone 3 (2103, 45 cm) on the drawn
+            // right -- which the rules above took for the palm: the hand was posed from the forearm, so the game's hand
+            // sat a forearm's length beyond the real one and the right one turned round (2026-11-07). Her 68-bone skins
+            // and the rig (reps) have the hand at bone 4. So a palm farther than 24 cm from the fingertip bone is
+            // replaced by the bone with the most vertices within 24 cm of it (bone 4: 255 / 996 vertices, 18 / 21 cm).
+            // (A first try took 15 cm from the far end and landed on a finger -- bone 40 --, which mangled the arm.)
+            constexpr float kHandReach = 0.24f;
+            palmInHand = true;
+            if (ab.bones >= 60 && dist(palm, ab.tip) > kHandReach)
+            {
+                int best = -1;
+                for (int b = 0; b < ab.bones; b++)
+                    if (cw[b] > 0 && b != ab.tip && dist(b, ab.tip) <= kHandReach && (best < 0 || ab.n[b] > ab.n[best])) best = b;
+                if (best >= 0)
+                {
+                    LOGI("gpuhands: side {} palm bone {} ({} vertices) is {:.0f} cm from the fingertip bone {}: bone {} ({} vertices, {:.0f} cm) is the palm",
+                         mc.side, palm, ab.n[palm], dist(palm, ab.tip) * 100.f, ab.tip, best, ab.n[best], dist(best, ab.tip) * 100.f);
+                    palm = best;
+                }
+            }
+        }
         float axis[3]; float al = 0; for (int i = 0; i < 3; i++) { axis[i] = ab.c[prox][i] - ab.c[ab.tip][i]; al += axis[i] * axis[i]; }
         al = sqrtf(al); if (al < 1e-3f) { g_MeshRejected++; return; }
         for (int i = 0; i < 3; i++) axis[i] /= al;
@@ -4890,6 +6039,17 @@ namespace
         }
         for (int b = ab.bones; b < 256; b++) ab.collapse.set(b);
         ab.palm = palm; ab.valid = true; ab.verts = n; memcpy(ab.axis, axis, 12);
+        memcpy(ab.pc, ab.c[palm], 12);
+        if (palmInHand && ab.bones >= 60)
+        {   // DOTO: bone 4's vertices are the back of the hand and the wrist -- its centroid sits ~18-21 cm from the
+            // fingertips, at the heel of the hand. Put on the controller's grip (the middle of the real palm), it left
+            // the game's fingers several cm past the real ones (reported 2026-11-07, after bone 4 became the palm).
+            // The point used is 30% of the way to the fingertip bone (~6 cm on): the middle of the palm.
+            constexpr float kPalmToFingers = 0.30f;
+            for (int i = 0; i < 3; i++) ab.pc[i] += kPalmToFingers * (ab.c[ab.tip][i] - ab.c[palm][i]);
+            LOGI("gpuhands: side {} the hand's grip point is {:.1f} cm from bone {}'s centroid towards the fingertips", mc.side,
+                 kPalmToFingers * sqrtf((ab.c[ab.tip][0] - ab.c[palm][0]) * (ab.c[ab.tip][0] - ab.c[palm][0]) + (ab.c[ab.tip][1] - ab.c[palm][1]) * (ab.c[ab.tip][1] - ab.c[palm][1]) + (ab.c[ab.tip][2] - ab.c[palm][2]) * (ab.c[ab.tip][2] - ab.c[palm][2])) * 100.f, palm);
+        }
         {   // The PALM NORMAL, in the bind pose: a hand is a flat plate, so the direction of least spread of its
             // bones IS the normal of the palm. Which of the two ways it points is decided by the THUMB -- the one
             // bone that leaves the plate, and it leaves it on the palm's side. Two power iterations give the two
@@ -4952,7 +6112,16 @@ namespace
                                 const float d = (ab.c[b][0] - (float)C[0]) * nrm[0] + (ab.c[b][1] - (float)C[1]) * nrm[1] + (ab.c[b][2] - (float)C[2]) * nrm[2];
                                 if (fabsf(d) > fabsf(offPlane)) { offPlane = d; offBone = b; }
                             }
-                            if (offBone >= 0 && offPlane > 0) for (int i = 0; i < 3; i++) nrm[i] = -nrm[i];
+                            if (offBone >= 0 && offPlane > 0) for (int i = 0; i < 3; i++) nrm[i] = -nrm[i];
+                            // DOTO: in the bind pose (a T pose: x along the arm, y up, z forward) Billie's palms face DOWN. The thumb
+                            // rule above gave her drawn right-arm skin (7031 vertices) a normal pointing up -- the hand drawn 180
+                            // degrees round -- where her left skin and her other right skin point down (0.13,-0.96,-0.23) and are
+                            // drawn right (2026-11-07). On her arm skeletons the normal is taken downwards.
+                            if (ab.bones >= 60 && nrm[1] > 0.f)
+                            {
+                                for (int i = 0; i < 3; i++) nrm[i] = -nrm[i];
+                                LOGI("gpuhands: side {} palm normal turned round: it pointed up in the bind pose (palms face down)", mc.side);
+                            }
                             memcpy(ab.palmN, nrm, 12); ab.palmNValid = offBone >= 0 && fabsf(offPlane) > 0.002f;
                             LOGI("gpuhands: side {} palm normal (bind) ({:.3f},{:.3f},{:.3f}), away from bone {} which is {:.1f} mm off the palm plane, valid {}",
                                  mc.side, nrm[0], nrm[1], nrm[2], offBone, fabsf(offPlane) * 1000.f, ab.palmNValid ? 1 : 0);
@@ -4984,6 +6153,14 @@ namespace
                 g_HandHold[mc.side] = HandHold();    // and so does the hold
                 main = true;
             }
+        }
+        int skinBones = 0;
+        { std::lock_guard lk(g_ArmBonesM); if (g_ArmBones[mc.side].valid) skinBones = g_ArmBones[mc.side].bones; }
+        if (!main && !rekey && skinBones > 0 && ab.bones > skinBones)
+        {   // DOTO: a mesh on a skeleton bigger than the arm skin's is not part of the arm (a cutscene's hand models on a
+            // 245-bone skeleton put their bones over the arm's in the rig: the right hand stretched, 2026-11-07)
+            LOGI("gpubody: side {} mesh {} on palette {} has a {}-bone skeleton, the arm skin {}: left out of the rig", mc.side, n, mc.palKey, ab.bones, skinBones);
+            return;
         }
         {   // The full-arm rig: EVERY mesh contributes where its bones sit in the bind pose (the sleeves are the
             // only meshes rigged to the upper-arm bones), the skin defines the axis and the palm.
@@ -5125,6 +6302,7 @@ namespace
                 g_ShaderBytes += len - slot.size();      // an address reused after a level load replaces its entry
                 slot.assign((const uint8_t*)code, (const uint8_t*)code + len);
                 const uint64_t h = DxbcHash(code, len);
+                PortCheck::OnShaderCreated(h);   // the DOTO port's shader census
                 g_VsHash[(void*)*out] = h;
                 g_PsCsHash.erase((void*)*out);
                 // an address reused by another shader must not inherit the old one's skip
@@ -5174,7 +6352,7 @@ namespace
     }
     void LogResearchDisasm(uint64_t h, const void* code, SIZE_T len)
     {
-        static const uint64_t kWanted[] = { 0x6b05662764a19199ull, 0x7012fd32e80f486eull, 0xea85def507442b03ull, 0x2d11c3a17106ea42ull, 0xe5ac297cc6e8593full };   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
+        static const uint64_t kWanted[] = { 0x6b05662764a19199ull, 0x7012fd32e80f486eull, 0xea85def507442b03ull, 0x2d11c3a17106ea42ull, 0xe5ac297cc6e8593full };   // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
         if (std::find(std::begin(kWanted), std::end(kWanted), h) != std::end(kWanted)) DisasmToLog(h, code, len);
     }
     void KeepShader(void* sh, const void* code, SIZE_T len)
@@ -5184,6 +6362,7 @@ namespace
         g_ShaderBytes += len - slot.size();
         slot.assign((const uint8_t*)code, (const uint8_t*)code + len);
         g_PsCsHash[sh] = DxbcHash(code, len);
+        PortCheck::OnShaderCreated(g_PsCsHash[sh]);   // the DOTO port's shader census
         g_VsHash.erase(sh);                               // the address was a vertex shader before (a level load)
         LogResearchDisasm(g_PsCsHash[sh], code, len);
     }
@@ -5547,6 +6726,40 @@ namespace
 void GpuTrace::OnPresent()
 {
     RehookImmediate();
+    AoGtao::OnPresent(g_Device);
+    if (::Log::Enabled())
+    {   // the sword watch's per-draw detail: each time the sword comes into a hand (at most every 2 minutes), the next
+        // 150 weapon draws as `gunparts` lines -- where each is drawn in the sword's frame, and the draws by a held
+        // weapon that were NOT moved (UNCLAIMED), which the game then draws, and lights, at the flat game's pose
+        static bool had = false, hadWrist = false; static ULONGLONG nextParts = 0, nextWrist = 0;
+        const bool has = BodyHide::HeldItemClass(1) == kSwordCpntVtable || BodyHide::HeldItemClass(0) == kSwordCpntVtable;
+        const ULONGLONG t = GetTickCount64();
+        if (has && !had && t >= nextParts)
+        {
+            nextParts = t + 120000;
+            if (g_PartsLeft.load() < 150) g_PartsLeft = 150;
+            LOGI("GpuTrace: sword watch: the sword is in a hand -- the next 150 weapon draws in detail (gunparts lines)");
+        }
+        had = has;
+        // DOTO: the same when the wrist launcher comes into a hand (each attachment is a new equip: at most every minute)
+        const bool wrist = BodyHide::HoldsWristDevice(0) || BodyHide::HoldsWristDevice(1);
+        if (wrist && !hadWrist && t >= nextWrist)
+        {
+            nextWrist = t + 60000;
+            if (g_PartsLeft.load() < 150) g_PartsLeft = 150;
+            LOGI("GpuTrace: wrist watch: the wrist launcher is equipped (left hand {}) -- the next 150 weapon draws in detail (gunparts lines)", Holster::LastItem(1));
+        }
+        hadWrist = wrist;
+        PowerTick();
+        if (PortCheck::On())
+        {   // DOTO: what the engine anchors to the arms and to their equipment (the shock attachment's lightning, the powers'
+            // hand effects): HandFx's research, on with PortCheck, its report every 60 s (callers, joints, bound entity,
+            // how far each lands from the drawn hand)
+            static ULONGLONG nextFx = 0;
+            if (!nextFx) { nextFx = t + 60000; HandFx::LogReport(); }   // (the first call switches the bookkeeping on)
+            else if (t >= nextFx) { nextFx = t + 60000; HandFx::LogReport(); }
+        }
+    }
     if (::Log::Enabled())
     {   // where the player's moved draws are (which passes the per-draw work has to cover), every 30 s
         static ULONGLONG next = 0; const ULONGLONG now = GetTickCount64();
@@ -5554,6 +6767,14 @@ void GpuTrace::OnPresent()
         if (now >= next && g_Patched.load())
         {
             next = now + 30000;
+            SwordReport();
+            LOGI("gpuhands: draws posed with the forearm (worn on it: the wrist launcher) L {} R {}: with the arm of their own view L {} R {}, of the view before, carried L {} R {} (the game's move taken out by an entity L {} R {}), claimed by no item L {} R {}; with the last forearm delta kept L {} R {}; HandFx snapshots carried along with the body {}; kept although the hand was not anchored {}; draws taken from the other hand's weapon L {} R {}",
+                 g_ForearmDraws[0].load(), g_ForearmDraws[1].load(), g_WristExact[0].load(), g_WristExact[1].load(), g_WristCarried[0].load(), g_WristCarried[1].load(),
+                 g_WristEntComp[0].load(), g_WristEntComp[1].load(), g_WristUnclaimed[0].load(), g_WristUnclaimed[1].load(), g_WristKept[0].load(), g_WristKept[1].load(),
+                 g_WristStaleFixed.load(), g_WristGateKept.load(), g_OtherHandDraws[0].load(), g_OtherHandDraws[1].load());
+            { const std::string wr = WristRigReport(); if (!wr.empty()) LOGI("gpuhands: wrist rig (vr wristrig {}){}", g_WristRig.load(), wr); }
+            WristPieceReport();
+            LOGI("gpuhands: HandFx {}", HandFx::Stats());
             LOGI("gpu6dof: the player's moved draws by pass kind: depth / motion-vector passes {}, other eye passes {}, static-world shadows {}, outside a known task {}; "
                  "previous rows corrected (the TAA's motion vectors) {}", g_MovedByClass[1].load(), g_MovedByClass[3].load(), g_MovedByClass[2].load(),
                  g_MovedByClass[0].load(), g_EyeFixed.load());
@@ -5608,7 +6829,9 @@ void GpuTrace::OnPresent()
         // (UsePower too: Shadow Walk's claws can be on screen the frame its cast starts, before ShadowWalk reports)
         // (not the menu screen's suspend: the arms there are the player's own, drawn as the flat game draws them)
         if ((g_AnimSuspend.load() && !ScreenMode::FlatRender()) || PlayerState::Running("ShadowWalk") || PlayerState::Running("ShadowHide") || PlayerState::Running("UsePower") ||
-            PlayerState::Running("EnterPossessedHost")) { if (g_ArmForeignOn.load()) g_ArmForeignUntil = g_PresentFrame + 135; }
+            PlayerState::Running("EnterPossessedHost") || PlayerState::Running("Cinematic")) { if (g_ArmForeignOn.load()) g_ArmForeignUntil = g_PresentFrame + 135; }
+        // (Cinematic, DOTO 2026-11-07: a cutscene's own hand models -- 2747 and 3633 vertices on a 245-bone skeleton --
+        // were taken for the right arm as it ended, and the right hand stayed stretched for the rest of the session)
         if (g_GripSavePending.exchange(false)) SaveGrips();
     }
     if (g_CensusLeft.load() > 0 && g_CensusLeft.fetch_sub(1) == 1)
@@ -5886,6 +7109,32 @@ void GpuTrace::SetHoldMode(int mode)
     LOGI("gpu6dof: hold = {}", mode == 1 ? "controller-aligned (deterministic)" : "captured at anchor time");
 }
 int GpuTrace::HoldMode() { return g_HoldMode.load(); }
+bool GpuTrace::ForearmDelta(int side, const float w[3], float r[9], float t[3])
+{
+    Rigid body; bool bv;
+    { std::lock_guard lk(g_XfM); body = g_BodyVr; bv = g_BodyValid; }
+    Rigid D;
+    if (!ForearmDeltaWorld(side, w, D, nullptr, bv ? &body : nullptr)) return false;
+    memcpy(r, D.r, 36); memcpy(t, D.t, 12);
+    return true;
+}
+bool GpuTrace::WristDeviceDelta(int side, float r[9], float t[3])
+{   // HandFx (the launcher's effects): the pose its draws got in the latest view, carried along with the body to now
+    if (!g_WristRig.load() || g_AnimSuspend.load()) return false;
+    Rigid body; bool bv;
+    { std::lock_guard lk(g_XfM); body = g_BodyVr; bv = g_BodyValid; }
+    if (!bv) return false;
+    Rigid D;
+    if (!WristRecall(side, body, D, false)) return false;
+    memcpy(r, D.r, 36); memcpy(t, D.t, 12);
+    return true;
+}
+void GpuTrace::SetWristRig(int on)
+{
+    g_WristRig = on;
+    { std::lock_guard lk(g_WristViewM); for (auto& s : g_WristView) for (auto& v : s) v = WristView(); }
+    LOGI("gpuhands: wrist rig {} ({})", on, on ? "everything worn on a forearm takes one rigid pose per view" : "each draw posed at its own origin, as before");
+}
 bool GpuTrace::WeaponTargetPose(int hand, float org[3], float axis[9])
 {
     const int h = hand & 1;
@@ -6293,6 +7542,11 @@ void GpuTrace::SetHandRest(int mode, float curl, int grip)
     LOGI("gpuhands: empty hand {}, curl {:.2f}, grip {}", mode ? "keeps one pose" : "as the game animates it", g_RestCurl.load(), g_RestGrip.load() ? "closes it" : "ignored");
 }
 void GpuTrace::ForgetHandRest() { g_RestForget = true; }
+void GpuTrace::SetWeaponShadows(bool on)
+{
+    g_WeaponShadows = on ? 1 : 0;
+    LOGI("GpuTrace: the held weapon {} the shadow maps ({} of its shadow draws dropped so far)", on ? "drawn into" : "left out of", g_WeaponShadowDropped.load());
+}
 void GpuTrace::SetHandDepth(bool real)
 {
     g_RealHandDepth = real;
@@ -6473,39 +7727,7 @@ bool GpuTrace::ArmCorrectJoint(int side, int /*joint*/, float pos[3], float axis
         if (!s.valid || !s.F.valid || g_PresentFrame - s.frame > 2) return false;
         F = s.F;
     }
-    constexpr float kOffArm = 0.15f;             // metres from the bone line: not part of the arm
-    float ew[3], se[3], pe[3], ps[3];
-    Sub3(F.W, F.E, ew); Sub3(F.E, F.S, se); Sub3(pos, F.E, pe); Sub3(pos, F.S, ps);
-    const float L2 = Norm3(ew), L1 = Norm3(se);
-    if (!(L2 > 0.05f) || !(L1 > 0.05f)) return false;
-    const float tf = Dot3(pe, ew), tu = Dot3(ps, se);
-    auto radial = [](const float d[3], const float u[3], float t) { const float r[3] = { d[0] - u[0] * t, d[1] - u[1] * t, d[2] - u[2] * t }; return sqrtf(Dot3(r, r)); };
-    Rigid D; int sg = 0;
-    if (tf > L2)
-    {   // the hand: within a hand's length of the wrist
-        float pw[3]; Sub3(pos, F.W, pw);
-        if (sqrtf(Dot3(pw, pw)) > 0.30f) return false;
-        D = F.dh; sg = sgHand;
-    }
-    else if (tf >= 0.f && radial(pe, ew, tf) < kOffArm)
-    {
-        const float k = tf / L2;
-        D = Mul(AxisAngle(F.ax, k * F.twist), F.rf0);
-        float t[3]; Rotate(D, F.E, t); for (int i = 0; i < 3; i++) D.t[i] = F.Ep[i] - t[i];
-        sg = sgFore;
-    }
-    else if (tu >= -0.05f && tu <= L1 && radial(ps, se, tu) < kOffArm) { D = F.du; sg = sgUpper; }
-    else return false;
-    if (seg) *seg = sg;
-    float p[3] = { pos[0], pos[1], pos[2] };
-    {   // the position goes with the lengthened arm (BoneDelta's stretch); the axes keep the rigid rotation
-        Rigid Dp = D;
-        if (F.k != 1.f && sg == sgUpper) { float u[3]; Sub3(F.Ep, F.Sp, u); Dp = Mul(StretchAbout(F.Sp, u, F.k), D); }
-        if (F.k != 1.f && sg == sgFore) Dp = Mul(StretchAbout(F.Ep, F.ax, F.k), D);
-        Xform(Dp, p, pos);
-    }
-    for (int k = 0; k < 3; k++) { const float row[3] = { axis[k * 3], axis[k * 3 + 1], axis[k * 3 + 2] }; Rotate(D, row, axis + k * 3); }
-    return true;
+    return ArmJointDeltaF(F, pos, axis, seg);
 }
 unsigned long long GpuTrace::PresentFrame() { return g_PresentFrame; }
 void GpuTrace::ArmFxLag(int side, double& mean, double& max, unsigned long long& n)

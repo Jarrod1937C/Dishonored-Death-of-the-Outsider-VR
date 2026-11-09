@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "PostShare.h"
+#include "PortCheck.h"
 #include "GpuTrace.h"
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -9,8 +10,8 @@
 
 namespace
 {
-    constexpr uint64_t kPsMask = 0x075df32c84f09477ull, kPsBlur = 0x2d11c3a17106ea42ull, kPsCompose = 0xd18f70002e2ca13aull;   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
-    constexpr uint64_t kCsHist = 0xdc6d8bbce02a1266ull, kCsHistMerge = 0x9ba51c0d902365b7ull, kCsAdapt = 0x577946c9f0ee49c9ull;   // TODO(DOTO): shader hash (DXBC checksum) measured on Dishonored 2: unverified in DOTO (its shader cache is compressed); check with the gpudump / hudprobe logs
+    constexpr uint64_t kPsMask = 0x075df32c84f09477ull, kPsBlur = 0x2d11c3a17106ea42ull, kPsCompose = 0xd18f70002e2ca13aull;   // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
+    constexpr uint64_t kCsHist = 0xdc6d8bbce02a1266ull, kCsHistMerge = 0x9ba51c0d902365b7ull, kCsAdapt = 0x577946c9f0ee49c9ull;   // shader hash (DXBC checksum) measured on Dishonored 2: the same in DOTO (PortCheck's shader census, 2026-11-07)
 
     std::atomic<bool> g_Outlines{ true }, g_Exposure{ true };
     std::atomic<unsigned long long> g_OutPred{ 0 }, g_OutNoMask{ 0 }, g_ExpSkipped{ 0 }, g_ExpCopies{ 0 }, g_ExpShared{ 0 };
@@ -162,6 +163,7 @@ bool PostShare::AtDraw(ID3D11DeviceContext* c)
     ID3D11PixelShader* ps = nullptr; c->PSGetShader(&ps, nullptr, nullptr);
     const uint64_t h = HashOf(ps);
     if (ps) ps->Release();
+    PortCheck::Candidate(PortCheck::kSitePostDraw, h);   // the DOTO port: the outline pass's pixel shaders
     if (h == kPsMask)
     {   // an object to outline: counted (a new group after a finished one starts again)
         ID3D11Predicate* p = PredFor(c, t->eye);
@@ -189,6 +191,7 @@ bool PostShare::AtDispatch(ID3D11DeviceContext* c)
     if (!t || t->what != 2 || c != t->c || t->eye < 0 || t->eye > 1) return false;
     ID3D11ComputeShader* cs = nullptr; c->CSGetShader(&cs, nullptr, nullptr);
     const uint64_t h = HashOf(cs);
+    PortCheck::Candidate(PortCheck::kSitePostDispatch, h);   // the DOTO port: the exposure pass's compute shaders
     if (h != kCsAdapt) { if (cs) cs->Release(); }
     if (t->eye == 1 && t->skipHist && (h == kCsHist || h == kCsHistMerge)) { g_ExpSkipped.fetch_add(1, std::memory_order_relaxed); return true; }
     if (h != kCsAdapt) return false;

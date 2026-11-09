@@ -10,6 +10,7 @@
 #include "CVars.h"
 #include "PlayerState.h"
 #include "BodyHide.h"
+#include "Collision.h"
 #include <detours/detours.h>
 #include <cmath>
 #include <sstream>
@@ -22,6 +23,12 @@ namespace
     constexpr uint32_t kRangedInit = 0x68EEE0;       //!< the ranged base's init (slot 3 of Gun/Crossbow calls it first)
     constexpr uint32_t kWeaponAimPoint = 0x68E710;   //!< idVec3* (weapon, out): GetAimPoint(provider #9, out, decl+0x1F8; D2 +0x198)
     constexpr uint32_t kVtGun = 0x1C63C58, kVtCrossbow = 0x1CAD088;
+    // DOTO: Billie's wrist launcher (arkCpntWeaponGaussGun), her crossbow: an arkCpntWeaponRanged like the two above (its
+    // init, slot 3 exe+0x3C2530, calls the ranged base's exe+0x68EEE0 first), worn on the left forearm. A gun to GunRay
+    // (2026-11-08: "it needs to behave like the crossbow did in DH2"): its ray traced by the aim sensor (people, props)
+    // and the sweep (the world), the reticle on what it hits, the shot along it. The ray: from its muzzle where it is
+    // DRAWN on the forearm (LauncherMuzzle), along the controller.
+    constexpr uint32_t kVtGauss = 0x1C45768;
     // DOTO offsets (ported 2026-11-05 from Dishonored 2 by matching the code; D2 values in brackets)
     constexpr uint32_t kCpntEntity = 0x10, kCpntDecl = 0x8, kSpawnPos = 0x104 /*0xF4*/, kDeclMaxRange = 0x1F8 /*0x198*/;
     constexpr uint32_t kEntOrigin = 0x310 /*0x300*/, kEntAxis = 0x31C /*0x30C*/;
@@ -74,8 +81,9 @@ namespace
     {
         if (!w || !Readable(w, 0x200)) return false;
         const uintptr_t vt = *(uintptr_t*)w, base = GameInfo::Base();
-        return vt == base + kVtGun || vt == base + kVtCrossbow;
+        return vt == base + kVtGun || vt == base + kVtCrossbow || vt == base + kVtGauss;
     }
+    bool IsLauncher(void* w) { return w && Readable(w, 8) && *(uintptr_t*)w == GameInfo::Base() + kVtGauss; }
     void Register(void* w)
     {
         if (!IsGunImpl(w)) return;
@@ -93,6 +101,62 @@ namespace
         for (int i = g_NComps - 1; i >= 0; i--)
             if (IsGunImpl(g_Comps[i]) && *(void**)((uint8_t*)g_Comps[i] + kCpntEntity) == ent) return g_Comps[i];
         return nullptr;
+    }
+
+    // ---- the wrist launcher's muzzle, where it is drawn ----
+    // The launcher is not held in the hand: its draws follow the forearm (GpuTrace's forearm delta). Its muzzle as the
+    // game has it (entity origin + axis rows * the component's muzzle offset) carried by that same delta is the muzzle
+    // the player sees; false (the muzzle left as computed, at the hand) when the arm's delta is not there.
+    // 2026-11-08 ("the reticle jumping around between frames, as if there were several"; "it didn't seem to trace
+    // people"): the forearm's delta is the render's, read from the game thread a frame or so apart from it, and in
+    // the session it was missing or off for 6 calls in 10 -- the ray then left from the hand's muzzle instead, 15 cm
+    // away: the sweep flipped frame by frame between two depths (3.3 / 10.9 m past a railing), the ring with it, and
+    // the aim sensor's hit on a person (traced along the ray of a frame before) fell off the current ray and was not
+    // used. The muzzle is now kept in the weapon's frame (the pose the hand's weapon is placed at: the controller and
+    // the grip), learned from the calls that found the forearm (smoothed; a lasting change taken over after half a
+    // second), and the ray always leaves from there: one origin, frame after frame.
+    std::atomic<unsigned long long> g_LauncherMuzzles{ 0 }, g_LauncherNoArm{ 0 }, g_LauncherFromRel{ 0 };
+    struct LaunchRel { bool valid = false; float off[3] = {}; int misses = 0; };
+    std::mutex g_LaunchM;
+    LaunchRel g_LaunchRel[2];                     // under g_LaunchM: the drawn muzzle in the weapon frame, per hand
+    bool LauncherMuzzle(void* comp, int hand, const float sp[3], const float fo[3], const float fa[9], float muzzle[3])
+    {
+        bool ok = false; float m[3] = {};
+        uint8_t* e = *(uint8_t**)((uint8_t*)comp + 0x10 /*kCpntEntity*/);
+        if (Readable(e + 0x310, 48))
+        {
+            float eo[3], ea[9], off[3], gm[3], r[9], t[3];
+            memcpy(eo, e + 0x310 /*kEntOrigin*/, 12); memcpy(ea, e + 0x31C /*kEntAxis*/, 36);
+            RowsMul(ea, sp, off);
+            for (int i = 0; i < 3; i++) gm[i] = eo[i] + off[i];
+            if (std::isfinite(gm[0] + gm[1] + gm[2]) && GpuTrace::ForearmDelta(hand, gm, r, t))
+            {
+                for (int i = 0; i < 3; i++) m[i] = r[i * 3] * gm[0] + r[i * 3 + 1] * gm[1] + r[i * 3 + 2] * gm[2] + t[i];
+                const float d[3] = { m[0] - muzzle[0], m[1] - muzzle[1], m[2] - muzzle[2] };
+                ok = std::isfinite(m[0] + m[1] + m[2]) && Dot(d, d) <= 0.5f * 0.5f;   // (else not where the hand is: an old or wrong delta)
+            }
+        }
+        if (ok) g_LauncherMuzzles++; else g_LauncherNoArm++;
+        std::lock_guard lk(g_LaunchM);
+        LaunchRel& L = g_LaunchRel[hand & 1];
+        if (ok)
+        {
+            const float d[3] = { m[0] - fo[0], m[1] - fo[1], m[2] - fo[2] };
+            const float loc[3] = { Dot(d, fa), Dot(d, fa + 3), Dot(d, fa + 6) };
+            const float e3[3] = { loc[0] - L.off[0], loc[1] - L.off[1], loc[2] - L.off[2] };
+            if (!L.valid) { memcpy(L.off, loc, 12); L.valid = true; L.misses = 0; }
+            else if (Dot(e3, e3) < 0.06f * 0.06f) { for (int i = 0; i < 3; i++) L.off[i] += e3[i] * 0.1f; L.misses = 0; }
+            else if (++L.misses > 45) { memcpy(L.off, loc, 12); L.misses = 0; }   // a lasting change (the grip, another pose)
+        }
+        if (!L.valid)
+        {   // (the hand's muzzle until one is learned)
+            if (ok) memcpy(muzzle, m, 12);
+            return ok;
+        }
+        float w[3]; RowsMul(fa, L.off, w);
+        for (int i = 0; i < 3; i++) muzzle[i] = fo[i] + w[i];
+        g_LauncherFromRel++;
+        return true;
     }
 
     // ---- the gun ray ----
@@ -118,6 +182,7 @@ namespace
         for (int i = 0; i < 3; i++) muzzle[i] = torg[i] + off[i];
         memcpy(axis, tax, 36);
         if (entOrg) memcpy(entOrg, torg, 12);
+        if (IsLauncher(comp)) LauncherMuzzle(comp, hand, sp, torg, tax, muzzle);
         {
             std::lock_guard lk(g_RegM);
             Cache& c = g_Cache[hand & 1];
@@ -240,8 +305,13 @@ namespace
     std::atomic<uint32_t> g_SweepMask{ 0x20000 };
     std::atomic<float> g_MaxRange{ 100.f };
     struct Trace { bool valid = false, hit = false, sensor = false; float t = 0; float o[3] = {}, f[3] = {}; ULONGLONG at = 0;
-                   float sweepT = 0; bool sweepHit = false; } g_Trace;   // under g_SensM
+                   float sweepT = 0; bool sweepHit = false; float sensorOff = -1.f; bool person = false; float personT = -1.f; } g_Trace;   // under g_SensM
     std::atomic<unsigned long long> g_Sweeps{ 0 }, g_SweepHits{ 0 }, g_SensorUsed{ 0 };
+    // DOTO: the aim sensor's hits on anything but the world (characters, props): its point is the target's, off the ray
+    // by up to a body's half-width (see Tick). `vr sensortol <m>` sets the reach (default 0.35 m).
+    constexpr int32_t kWorldEntId = 0x3FFE0000;   // 'world' (idWorldspawn), as the depth log names it
+    std::atomic<float> g_SensorBodyTol{ 0.35f };
+    std::atomic<unsigned long long> g_SensorBodyUsed{ 0 }, g_SensorBodyMissed{ 0 };
     float WeaponRange(void* w)
     {
         uint8_t* decl = *(uint8_t**)((uint8_t*)w + kCpntDecl);
@@ -263,6 +333,127 @@ namespace
                                  : ((FnSweep)(GameInfo::Base() + kTraceRay))(w, o, to, mask, &d);
         hit = !clear; t = hit ? d : range;
         return std::isfinite(t) && t >= 0.f;
+    }
+    // ---- DOTO: the hand's own ray, for a hand with no gun pose (2026-11-08: "the left hand reticle doesn't trace depth
+    // for the weapons, it just appears at a fixed depth"). Billie's ranged weapon is the wrist launcher
+    // (arkCpntWeaponGaussGun): not a gun or crossbow, so no gun ray, no sweep, no aim sensor -- the ring sat at the fixed
+    // 8 m. The reticle's ray (the controller's, GpuTrace::HandRay) is traced against the world with the engine's ray
+    // test (exe+0x68D5D0: its first argument is not used -- rcx is replaced by the physics world at once), once a frame
+    // on the game thread, like the gun's sweep. Static collision (walls, floors, furniture).
+    struct HandTrace { bool valid = false, hit = false, person = false; float t = 0; float o[3] = {}, f[3] = {}; ULONGLONG at = 0; };
+    HandTrace g_HandTrace[2];                 // under g_SensM
+    std::atomic<unsigned long long> g_HandTraces{ 0 }, g_HandTraceHits{ 0 };
+
+    // ---- DOTO: PEOPLE on a ray (2026-11-08, the second report: the left hand's ring "still is not changing depth when
+    // tracing to people") ----
+    // Two holes. (1) With anything but the launcher in the left hand (a power, a grenade, a mine: 13 of the session's 19
+    // minutes) the ring came from TraceHandRay -- the engine's ray test, STATIC collision only -- so a person was never
+    // there at all. (2) With the launcher, the aim sensor's hit on a person is the TARGET's point (his body), and on the
+    // people the player pointed at it lay 46-75 cm off the ray (a guard 6.5-8 m out), past the 35 cm / 4% reach: not used.
+    // Both rays are now tested against the characters themselves: every standing character (the entity table, every
+    // 0.3 s, within 60 m) as an upright cylinder from his origin (the feet) up 1.85 m, radius 0.30 m -- the ray's entry
+    // into it is his depth, when that is nearer than the wall. Game thread (GunRay::Tick, TraceHandRay).
+    constexpr uint32_t kGamePtr = 0x3A72280, kEntTable = 0x327770, kEntSlots = 0x4000;   // (as NpcGestures)
+    constexpr uint32_t kEntFlagsD1 = 0xD9, kEntHidden = 0xD8, kEntIdOff = 0xB0;
+    constexpr float kPersonR = 0.30f, kPersonH = 1.85f, kPeopleScanR = 60.f;
+    struct Person { void* ent = nullptr; int id = 0; float org[3] = {}; };
+    std::vector<Person> g_People; ULONGLONG g_PeopleAt = 0;   // game thread
+    std::atomic<unsigned long long> g_PeopleScans{ 0 }, g_PersonGun{ 0 }, g_PersonHand{ 0 };
+    std::atomic<int> g_PeopleN{ 0 }, g_PersonLogLeft{ 30 };
+    bool RdMem(void* d, const void* s, size_t n) { __try { memcpy(d, s, n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+    //! standing, alive, shown: his origin now
+    bool ReadPerson(Person& p)
+    {
+        uint8_t d1 = 0, hid = 0;
+        if (!RdMem(&d1, (uint8_t*)p.ent + kEntFlagsD1, 1) || (d1 & 0x28) || !RdMem(&hid, (uint8_t*)p.ent + kEntHidden, 1) || (hid & 1)) return false;
+        if (!RdMem(p.org, (uint8_t*)p.ent + kEntOrigin, 12) || !RdMem(&p.id, (uint8_t*)p.ent + kEntIdOff, 4)) return false;
+        return std::isfinite(p.org[0] + p.org[1] + p.org[2]);
+    }
+    void ScanPeople(const float o[3])
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (g_PeopleAt && now - g_PeopleAt < 300)
+        {   // this frame's positions (or gone: dead, down, hidden)
+            for (size_t i = 0; i < g_People.size();) { if (ReadPerson(g_People[i])) i++; else { g_People[i] = g_People.back(); g_People.pop_back(); } }
+            return;
+        }
+        g_PeopleAt = now; g_PeopleScans++;
+        g_People.clear();
+        uint8_t* game = nullptr;
+        if (!RdMem(&game, (void*)(GameInfo::Base() + kGamePtr), 8) || !game) { g_PeopleN = 0; return; }
+        uint8_t** table = (uint8_t**)(game + kEntTable);
+        BodyHide::Anchor an[BodyHide::aCount]; BodyHide::GetAnchors(an);
+        for (uint32_t i = 0; i < kEntSlots; i++)
+        {
+            void* e = nullptr;
+            if (!RdMem(&e, table + i, 8) || !e) continue;
+            bool own = false; for (int k = 0; k < BodyHide::aCount; k++) if (an[k].valid && an[k].ent == e) own = true;
+            if (own) continue;
+            float p[3]; if (!RdMem(p, (uint8_t*)e + kEntOrigin, 12)) continue;
+            const float d[3] = { p[0] - o[0], p[1] - o[1], p[2] - o[2] };
+            if (!(Dot(d, d) < kPeopleScanR * kPeopleScanR)) continue;
+            if (!Collision::IsCharacterEnt(e)) continue;
+            Person q; q.ent = e; if (ReadPerson(q)) g_People.push_back(q);
+        }
+        g_PeopleN = (int)g_People.size();
+    }
+    //! The nearest standing character the ray o + f s (f unit) enters before maxT: its entry distance.
+    bool PersonOnRay(const float o[3], const float f[3], float maxT, float& t, const Person** who)
+    {
+        ScanPeople(o);
+        bool any = false; float best = maxT;
+        for (const Person& p : g_People)
+        {
+            const float d[3] = { o[0] - p.org[0], o[1] - p.org[1], o[2] - p.org[2] };
+            float s0 = -1e30f, s1 = 1e30f;
+            const float a = f[0] * f[0] + f[1] * f[1], b = 2.f * (d[0] * f[0] + d[1] * f[1]), c = d[0] * d[0] + d[1] * d[1] - kPersonR * kPersonR;
+            if (a < 1e-8f) { if (c > 0.f) continue; }           // straight up or down: inside his circle or not at all
+            else
+            {
+                const float disc = b * b - 4.f * a * c;
+                if (disc < 0.f) continue;
+                const float sq = sqrtf(disc);
+                s0 = (-b - sq) / (2.f * a); s1 = (-b + sq) / (2.f * a);
+            }
+            if (fabsf(f[2]) < 1e-6f) { if (d[2] < 0.f || d[2] > kPersonH) continue; }   // level: between his feet and his head
+            else
+            {
+                float z0 = -d[2] / f[2], z1 = (kPersonH - d[2]) / f[2];
+                if (z0 > z1) std::swap(z0, z1);
+                s0 = std::max(s0, z0); s1 = std::min(s1, z1);
+            }
+            if (s0 > s1 || s1 < 0.25f) continue;              // (not the hand's own reach: nobody stands inside it)
+            const float e = std::max(s0, 0.25f);
+            if (e < best) { best = e; any = true; if (who) *who = &p; }
+        }
+        if (any) t = best;
+        return any;
+    }
+    void NotePerson(const char* ray, const Person* p, const float o[3], const float f[3], float t, float wall, bool wallHit)
+    {
+        if (!p || g_PersonLogLeft.load() <= 0 || g_PersonLogLeft.fetch_sub(1) <= 0) return;
+        const float at[3] = { o[0] + f[0] * t, o[1] + f[1] * t, o[2] + f[2] * t };
+        LOGI("GunRay: the {} ray meets {} (id {:#x}) at {:.2f} m, {:.2f} m above his feet{} -- the ring goes to him",
+             ray, Collision::Describe(p->ent), (uint32_t)p->id, t, at[2] - p->org[2],
+             wallHit ? fmt::format(" (the wall behind at {:.2f} m)", wall) : std::string(" (nothing behind within range)"));
+    }
+    void TraceHandRay(int h)
+    {
+        float o[3], f[3];
+        if (!GpuTrace::HandRay(h, o, f) || !std::isfinite(o[0] + o[1] + o[2] + f[0] + f[1] + f[2])) { std::lock_guard lk(g_SensM); g_HandTrace[h & 1].valid = false; return; }
+        Normalize(f);
+        const float range = g_MaxRange.load();
+        const float to[3] = { o[0] + f[0] * range, o[1] + f[1] * range, o[2] + f[2] * range };
+        float d = -1.f;
+        const bool clear = ((FnSweep)(GameInfo::Base() + kTraceRay))(nullptr, o, to, g_SweepMask.load(), &d);
+        bool hit = !clear && std::isfinite(d) && d >= 0.f;
+        g_HandTraces++; if (hit) g_HandTraceHits++;
+        float t = hit ? d : range, pt = 0; const Person* who = nullptr;
+        const bool person = PersonOnRay(o, f, t, pt, &who);
+        if (person) { NotePerson("hand's", who, o, f, pt, t, hit); t = pt; hit = true; g_PersonHand++; }
+        std::lock_guard lk(g_SensM);
+        HandTrace& ht = g_HandTrace[h & 1];
+        ht.valid = true; ht.hit = hit; ht.person = person; ht.t = t; memcpy(ht.o, o, 12); memcpy(ht.f, f, 12); ht.at = GetTickCount64();
     }
     bool SensorHitImpl(float& t, bool& hit)
     {
@@ -488,6 +679,77 @@ namespace
         }
         return true;
     }
+    // ---- DOTO: what hangs off the WRIST LAUNCHER, where the launcher is DRAWN ----
+    // 2026-11-08 (after the launcher's pieces were fixed: "the electric effect still renders to the side and follows
+    // the headset, not the hands" -- where the flat game's arm holds the launcher). The launcher's draws and its
+    // cartridge's are posed on the drawn forearm by GpuTrace (one rigid pose per view, GpuTrace::WristDeviceDelta);
+    // both entities keep the animated pose, since moving them as well moved their draws twice. But the engine places
+    // its EFFECTS (particles: nothing the GPU pass moves) by those entities: an FX bound to a joint of the launcher or
+    // of the cartridge is re-placed every frame through the world joint query below (exe+0x58D380), an FX bound to
+    // the entity itself copies its origin (FxUpdateHook), a new one starts where the entity is (FxStartHook) -- all
+    // the flat pose, beside the head. The HandFx log of the session: the launcher's own joints were asked for directly
+    // only in bursts at the equip (306 times), while the cartridge's bind asked for them every frame -- the effect
+    // hangs off the cartridge, whose model HandFx does not know. Now every world pose the engine asks on the launcher's
+    // entity, or on an entity hung off it (learned from their binds), is carried by that same rigid pose. Not inside
+    // the bind of an entity with a model (the cartridge's own placement: its draws are moved on the GPU), and not when
+    // HandFx already moved the joint (the launcher's model-space query, while it is the held item).
+    std::atomic<void*> g_WristKid[2][4] = {};       // entities hung off the launcher's joints (the cartridge), per arm
+    std::mutex g_WristKidM; int g_WristKidNext[2] = {};
+    std::atomic<unsigned long long> g_WristJointMoved{ 0 }, g_WristKidJointMoved{ 0 }, g_WristJointByHandFx{ 0 }, g_WristNoPose{ 0 },
+                                    g_WristFxMoved{ 0 }, g_WristFxStarts{ 0 }, g_WristKidBinds{ 0 };
+    std::atomic<float> g_WristGap{ 0.f };
+    std::atomic<int> g_WristLogLeft{ 24 };
+    //! The arm whose worn launcher this entity is, or hangs off; -1 when neither.
+    int WristOwner(const void* ent)
+    {
+        if (!ent) return -1;
+        for (int s = 0; s < 2; s++) if (ent == HandFx::WristLauncherEntity(s)) return s;
+        for (int s = 0; s < 2; s++) for (int k = 0; k < 4; k++) if (ent == g_WristKid[s][k].load(std::memory_order_relaxed)) return s;
+        return -1;
+    }
+    void NoteWristKid(int side, void* ent, const void* parent, int joint)
+    {
+        std::lock_guard lk(g_WristKidM);
+        for (int k = 0; k < 4; k++) if (g_WristKid[side][k].load() == ent) return;
+        g_WristKid[side][g_WristKidNext[side]++ & 3].store(ent);
+        LOGI("GunRay: entity {} (vt exe+{:#x}) is bound to joint {} of {} ({}): it hangs off the {} wrist launcher -- the effects placed by it go where the launcher is drawn",
+             ent, Readable(ent, 8) ? *(uintptr_t*)ent - GameInfo::Base() : 0, joint, parent, parent == HandFx::WristLauncherEntity(side) ? "the launcher" : "a piece on it",
+             side ? "right" : "left");
+    }
+    //! A world pose, carried by the rigid pose the launcher's draws got (p' = R p + T, the axis rows turned by R).
+    bool OntoWrist(int side, const float* p, const float* a, float* po, float* ao)
+    {
+        float R[9], T[3];
+        if (!GpuTrace::WristDeviceDelta(side, R, T)) return false;
+        float np[3], na[9];
+        for (int i = 0; i < 3; i++) np[i] = R[i * 3] * p[0] + R[i * 3 + 1] * p[1] + R[i * 3 + 2] * p[2] + T[i];
+        if (a) for (int r = 0; r < 3; r++) for (int i = 0; i < 3; i++) na[r * 3 + i] = R[i * 3] * a[r * 3] + R[i * 3 + 1] * a[r * 3 + 1] + R[i * 3 + 2] * a[r * 3 + 2];
+        if (!std::isfinite(np[0] + np[1] + np[2])) return false;
+        memcpy(po, np, 12); if (a && ao) memcpy(ao, na, 36);
+        return true;
+    }
+    //! The world joint query on the launcher or on something hung off it (see above). True = answered here.
+    void WristJoint(int side, void* owner, int joint, float* pos, float* axis, unsigned fixesBefore, uintptr_t caller)
+    {
+        const bool kid = owner != HandFx::WristLauncherEntity(side);
+        if (void* be = HandFx::BoundEntity(); be && be != owner && Readable((uint8_t*)be + kEntModel, 8) && *(void* const*)((uint8_t*)be + kEntModel))
+        {   // an entity with a model placed on this joint (the cartridge): its draws go with the launcher's on the GPU
+            if (WristOwner(be) < 0) NoteWristKid(side, be, owner, joint);
+            g_WristKidBinds++; g_JointBoundLeft++;
+            return;
+        }
+        if (HandFx::WristFixesOnThread() != fixesBefore) { g_WristJointByHandFx++; return; }   // already on the drawn forearm
+        const float before[3] = { pos[0], pos[1], pos[2] };
+        if (!OntoWrist(side, pos, axis, pos, axis)) { g_WristNoPose++; return; }
+        const float g[3] = { pos[0] - before[0], pos[1] - before[1], pos[2] - before[2] };
+        const float gap = sqrtf(Dot(g, g));
+        g_WristGap = gap;
+        (kid ? g_WristKidJointMoved : g_WristJointMoved)++;
+        if (g_WristLogLeft.load() > 0 && g_WristLogLeft.fetch_sub(1) > 0)
+            LOGI("GunRay: a world pose asked on joint {} of the {} wrist launcher's {} {}{} (from exe+{:#x}): carried {:.3f} m onto the launcher as drawn",
+                 joint, side ? "right" : "left", kid ? "piece" : "entity", owner, HandFx::BoundEntity() ? fmt::format(" in the bind of {}", HandFx::BoundEntity()) : std::string(),
+                 caller, gap);
+    }
     // ---- the SWORD's joints (SwordContact research, the development notes): the melee weapon's world-space joint queries ----
     std::atomic<int> g_SwordJoints{ 0 };       // 1 = answer the right-hand sword entity's world joint queries as drawn
     std::atomic<int> g_SwordJointLog{ 0 };     // research: log the next n sword joint queries
@@ -530,10 +792,17 @@ namespace
     }
     bool JointWorldHook(void* cp, int space, int joint, const float* offPos, const float* offAxis, float* pos, float* axis)
     {
+        const unsigned fixes = HandFx::WristFixesOnThread();
         const bool r = g_RealJointWorld(cp, space, joint, offPos, offAxis, pos, axis);
         if (r && space == 3 && pos && axis && cp && SwordJoint(cp, joint, pos, axis)) return r;
         if (!r || space != 3 || !pos || !axis || !cp || !(g_Mode.load() & 32)) return r;
         void* owner = *(void**)((uint8_t*)cp + kCpntOwner);
+        if (HandAimHook::Mode() >= 2)
+            if (const int ws = WristOwner(owner); ws >= 0)
+            {   // DOTO: the wrist launcher, or something hung off it (above) -- never the hand's weapon pose (OntoDrawn)
+                WristJoint(ws, owner, joint, pos, axis, fixes, (uintptr_t)_ReturnAddress() - GameInfo::Base());
+                return r;
+            }
         if (t_InShoot && g_JointDiag.load() > 0)
         {
             g_JointDiag--;
@@ -567,8 +836,18 @@ namespace
         if (!(g_Mode.load() & 32) || pos || axis || HandAimHook::Mode() < 2 || !Readable(s, 0x28) || *(int32_t*)s == -1 || *(uint16_t*)(s + 0x24) != 0xFFFF)
         { g_RealFxUpdate(slot, pos, axis, a4, a5, vel, ang); return; }
         int hand = -1; uint8_t* ent = nullptr;
-        void* comp = GunByEntity(nullptr, *(uint32_t*)(s + 4), hand, ent);
         float np[3], na[9];
+        if (HandFx::WristLauncherEntity(0) || HandFx::WristLauncherEntity(1))
+        {   // DOTO: an FX on the wrist launcher's entity or on something hung off it: where the launcher is drawn
+            uint8_t* we = (uint8_t*)BodyHide::EntityById(*(int32_t*)(s + 4));
+            if (const int ws = WristOwner(we); ws >= 0 && Readable(we + kEntOrigin, 48))
+            {
+                if (OntoWrist(ws, (const float*)(we + kEntOrigin), (const float*)(we + kEntAxis), np, na)) { g_WristFxMoved++; g_RealFxUpdate(slot, np, na, a4, a5, vel, ang); }
+                else { g_WristNoPose++; g_RealFxUpdate(slot, pos, axis, a4, a5, vel, ang); }
+                return;
+            }
+        }
+        void* comp = GunByEntity(nullptr, *(uint32_t*)(s + 4), hand, ent);
         if (!comp || !OntoDrawn(hand, comp, ent, (const float*)(ent + kEntOrigin), (const float*)(ent + kEntAxis), np, na)) { g_RealFxUpdate(slot, pos, axis, a4, a5, vel, ang); return; }
         g_FxMoved++;
         g_RealFxUpdate(slot, np, na, a4, a5, vel, ang);
@@ -645,7 +924,7 @@ namespace
     using FnGetCpnt = void* (*)(void*, void*, int);
     using FnJointWorldByRef = bool (*)(void*, int, const void*, float*, float*);
     FnFxStart g_RealFxStart = nullptr;
-    struct FxSpawnCtx { uint8_t* ent = nullptr; const void* joint = nullptr; int hand = -1; void* comp = nullptr; };
+    struct FxSpawnCtx { uint8_t* ent = nullptr; const void* joint = nullptr; int hand = -1; void* comp = nullptr; int wrist = -1; };
     thread_local FxSpawnCtx t_FxSpawn;
     std::atomic<unsigned long long> g_FxStartsPlaced{ 0 };
     std::atomic<int> g_FxBlock{ 0 };           // research: the k-th FX created in the next shot is never started
@@ -662,11 +941,13 @@ namespace
             if (c.joint)
                 if (void* cp = ((FnGetCpnt)(base + kGetCpnt))(c.ent, (void*)(base + kFxJointCpnt), 2))
                     ok = ((FnJointWorldByRef)(base + kJointWorldByRef))(cp, 3, c.joint, p, a);   // drawn (the 0x58D380 hook)
-            if (!ok) ok = OntoDrawn(c.hand, c.comp, c.ent, (const float*)(c.ent + kEntOrigin), (const float*)(c.ent + kEntAxis), p, a);
+            if (!ok)
+                ok = c.wrist >= 0 ? OntoWrist(c.wrist, (const float*)(c.ent + kEntOrigin), (const float*)(c.ent + kEntAxis), p, a)
+                                  : OntoDrawn(c.hand, c.comp, c.ent, (const float*)(c.ent + kEntOrigin), (const float*)(c.ent + kEntAxis), p, a);
             if (ok)
             {
                 memcpy((uint8_t*)inst + 0x38, p, 12); memcpy((uint8_t*)inst + 0x44, a, 36);
-                g_FxStartsPlaced++;
+                g_FxStartsPlaced++; if (c.wrist >= 0) g_WristFxStarts++;
             }
         }
         return g_RealFxStart(world, inst, a3, a4, a5);
@@ -679,7 +960,8 @@ namespace
         if ((g_Mode.load() & 32) && HandAimHook::Mode() >= 2 && ent)
         {
             int hand = -1; uint8_t* e = nullptr;
-            if (void* comp = GunByEntity(ent, 0, hand, e)) t_FxSpawn = { e, joint, hand, comp };
+            if (const int ws = WristOwner(ent); ws >= 0 && Readable((uint8_t*)ent + kEntOrigin, 48)) t_FxSpawn = { (uint8_t*)ent, joint, -1, nullptr, ws };   // DOTO: on the wrist launcher
+            else if (void* comp = GunByEntity(ent, 0, hand, e)) t_FxSpawn = { e, joint, hand, comp };
         }
         const bool r = g_RealFxSpawn(slot, decl, ent, joint, a5, a6, a7, a8);
         t_FxSpawn = prevCtx;
@@ -993,6 +1275,7 @@ void GunRay::FreezeAfterShot(int ms) { g_FreezeMs = ms; LOGI("GunRay: the next s
 void GunRay::BlockFx(int k) { g_FxBlock = k; LOGI("GunRay: the next shot does not start its fx #{}", k); }
 void GunRay::LogFx(int n) { g_FxLogArm = n; g_JointDiag = 12; LOGI("GunRay: the next shot logs the next {} fx created", n); }
 void GunRay::WatchFx(int hits) { g_FxWatch = hits; LOGI("GunRay: the next muzzle fx arms a write watchpoint on its origin ({} hits)", hits); }
+void GunRay::SetSensorTolerance(float m) { if (m > 0.f && m < 2.f) g_SensorBodyTol = m; LOGI("GunRay: the aim sensor's hit on a target counts within {:.2f} m of the ray", g_SensorBodyTol.load()); }
 void GunRay::SetNoLock(int on) { g_NoLock = on; LOGI("GunRay: fire target lock {}", on ? "DROPPED" : "kept"); }
 void GunRay::Tick()
 {
@@ -1006,24 +1289,60 @@ void GunRay::Tick()
     if (!(g_Mode.load() & 10) || HandAimHook::Mode() < 2) return;
     float m[3], ax[9];
     void* w = nullptr;
-    if (!PoseImpl(HandAimHook::GunHand(), m, ax)) { std::lock_guard lk(g_SensM); g_Trace.valid = false; return; }
+    if (!PoseImpl(HandAimHook::GunHand(), m, ax)) { { std::lock_guard lk(g_SensM); g_Trace.valid = false; } TraceHandRay(HandAimHook::GunHand()); return; }
     { std::lock_guard lk(g_RegM); w = g_Cache[HandAimHook::GunHand() & 1].comp; }
     float t = 0; bool hit = false;
     if (!SweepImpl(w, m, ax, WeaponRange(w), g_SweepMask.load(), true, t, hit)) { std::lock_guard lk(g_SensM); g_Trace.valid = false; return; }
     g_Sweeps++; if (hit) g_SweepHits++;
+    float pt = 0; const Person* who = nullptr;
+    const bool person = PersonOnRay(m, ax, t, pt, &who);   // (before the lock: it reads the entity table)
     std::lock_guard lk(g_SensM);
     // The sweep sees only STATIC collision (any mask: measured, a bottle standing 0.71 m out was not there, the table
     // behind it at 1.41 was). Props and characters live in the dynamic physics world, which is what the aim sensor
     // queries -- along this same ray, one frame late. Its hit counts while it still lies on the current ray (a hand that
-    // has moved off the bottle must not keep the ring on it): within 2 cm, or 1% of the distance, of the ray.
-    g_Trace.sensor = false; g_Trace.sweepT = t; g_Trace.sweepHit = hit;
+    // has moved off the bottle must not keep the ring on it): within 3 cm, or 1.5% of the distance, of the ray (DOTO,
+    // 2026-11-08: was 2 cm / 1%; a person 3 m out was found by the sensor and still lost to the wall behind with the
+    // hand moving -- the sensor traces the ray of a frame before).
+    // DOTO, 2026-11-08 (the left hand's ring "stays at the depth as if the person isn't there"): the session's depth log
+    // had the sensor hitting people on 3255 sampled frames -- a guard at 0.2-0.8 m with the wall behind at 4.6-10.5 m, an
+    // aristocrat at 4.8 m before a wall at 8.5 -- and 2661 of them NOT used. For a character DOTO's ranged-target sensor
+    // (arkCpntPlayerSensorRangedTarget) reports the TARGET's point (its body), not where the ray meets its surface: it
+    // lies off the ray by up to a body's half-width, and the 3 cm test threw it out. The world's hits (entity 0x3ffe0000)
+    // are on the ray, measured equal to the sweep's to the cm, and keep the tight test; anything else the sensor reports
+    // counts while it is within a body's reach of the ray (35 cm, or 4% of the distance). The ring then sits at the
+    // target's depth along the ray.
+    g_Trace.sensor = false; g_Trace.sweepT = t; g_Trace.sweepHit = hit; g_Trace.sensorOff = -1.f;
     if (g_Hit.valid && g_Hit.has && GetTickCount64() - g_Hit.at <= 200)
     {
         const float d[3] = { g_Hit.point[0] - m[0], g_Hit.point[1] - m[1], g_Hit.point[2] - m[2] };
         const float along = Dot(d, ax), off = LineDist(g_Hit.point, m, ax);
-        if (along > 0.f && along < t && off < fmaxf(0.02f, 0.01f * along)) { t = along; hit = true; g_Trace.sensor = true; g_SensorUsed++; }
+        const bool world = g_Hit.ent == kWorldEntId || g_Hit.ent == -1;
+        const float tol = world ? fmaxf(0.03f, 0.015f * along) : fmaxf(g_SensorBodyTol.load(), 0.04f * along);
+        g_Trace.sensorOff = off;
+        if (along > 0.f && along < t && off < tol) { t = along; hit = true; g_Trace.sensor = true; g_SensorUsed++; if (!world) g_SensorBodyUsed++; }
+        else if (!world && along > 0.f && along < t) g_SensorBodyMissed++;
+    }
+    g_Trace.person = false; g_Trace.personT = -1.f;
+    if (person && pt < t)
+    {   // a standing character the ray passes through, nearer than the wall and than the sensor's answer
+        NotePerson("gun", who, m, ax, pt, t, hit);
+        t = pt; hit = true; g_Trace.person = true; g_Trace.personT = pt; g_PersonGun++;
     }
     g_Trace.valid = true; g_Trace.hit = hit; g_Trace.t = t; memcpy(g_Trace.o, m, 12); memcpy(g_Trace.f, ax, 12); g_Trace.at = GetTickCount64();
+}
+bool GunRay::HandHit(int hand, float& dist, bool& hit, bool* person)
+{
+    std::lock_guard lk(g_SensM);
+    const HandTrace& ht = g_HandTrace[hand & 1];
+    if (!ht.valid || GetTickCount64() - ht.at > 300) return false;
+    dist = ht.t; hit = ht.hit; if (person) *person = ht.person;
+    return true;
+}
+std::string GunRay::HandTraceStatus()
+{
+    return fmt::format("handtrace {} hits {} | launcher muzzle on the forearm {} not {}, from the learned muzzle {} | sensor on a target (not the world) used {} too far off the ray {} (reach {:.2f} m) | people: {} standing near (scans {}), the ring on one: gun ray {} hand ray {}",
+                       g_HandTraces.load(), g_HandTraceHits.load(), g_LauncherMuzzles.load(), g_LauncherNoArm.load(), g_LauncherFromRel.load(),
+                       g_SensorBodyUsed.load(), g_SensorBodyMissed.load(), g_SensorBodyTol.load(), g_PeopleN.load(), g_PeopleScans.load(), g_PersonGun.load(), g_PersonHand.load());
 }
 void GunRay::Probe()
 {
@@ -1073,6 +1392,8 @@ GunRay::TraceDbg GunRay::LastTrace()
     d.t = d.fromTrace ? g_Trace.t : g_Hit.t; d.hit = d.fromTrace ? g_Trace.hit : g_Hit.has;
     d.sweepT = g_Trace.sweepT; d.sweepHit = g_Trace.sweepHit; d.sensorUsed = g_Trace.sensor;
     d.sensorHas = g_Hit.has; d.sensorT = g_Hit.t; memcpy(d.sensorPoint, g_Hit.point, 12); d.sensorEnt = g_Hit.has ? g_Hit.ent : -1;
+    d.sensorOff = g_Trace.sensorOff;
+    d.person = d.fromTrace && g_Trace.person; d.personT = g_Trace.personT;
     d.traceAgeMs = g_Trace.valid ? (unsigned)std::min<ULONGLONG>(99999, now - g_Trace.at) : 99999;
     d.sensorAgeMs = g_Hit.valid ? (unsigned)std::min<ULONGLONG>(99999, now - g_Hit.at) : 99999;
     return d;
@@ -1088,15 +1409,16 @@ bool GunRay::DrawnRay(int hand, float muzzle[3], float fwd[3])
         const float zo[3] = {}, ia[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }; float d1[3], d2[9];
         if (!GpuTrace::WeaponFromHand(hand, zo, ia, d1, d2, &ent)) return false;
     }
-    float sp[3];
+    float sp[3]; void* comp = nullptr;
     {
         std::lock_guard lk(g_RegM);
         const Cache& c = g_Cache[hand & 1];
         if (!c.valid || GetTickCount64() - c.at > 1000 || c.ent != ent || !IsGunImpl(c.comp)) return false;
-        memcpy(sp, c.sp, 12);
+        memcpy(sp, c.sp, 12); comp = c.comp;
     }
     float off[3]; RowsMul(axis, sp, off);
     for (int i = 0; i < 3; i++) muzzle[i] = org[i] + off[i];
+    if (IsLauncher(comp)) LauncherMuzzle(comp, hand, sp, org, axis, muzzle);   // (DOTO: where it is drawn, on the forearm)
     memcpy(fwd, axis, 12);
     return true;
 }
@@ -1221,7 +1543,7 @@ void GunRay::Report(void* weapon, int hand, const Shot* s, const float* spawn, c
     }
     gun += fmt::format(" | ring px {:.4f} {:.4f}", g_RingX.load(), g_RingY.load());
     LOGI("GunShot: {} hand {} weapon {} {} ent {} sp ({:.3f},{:.3f},{:.3f}) spawn ({:.3f},{:.3f},{:.3f}) aim ({:.3f},{:.3f},{:.3f}) bolt ({:.3f},{:.3f},{:.3f}) | gun {} | oldreticle {} | firecam ({:.3f},{:.3f},{:.3f}) | eye ({:.3f},{:.3f},{:.3f}) | gamespread {}",
-         s && s->valid ? "NEW" : "OLD", hand, weapon, IsGunImpl(weapon) ? (*(uintptr_t*)weapon == GameInfo::Base() + kVtGun ? "gun" : "crossbow") : "other", (void*)ent,
+         s && s->valid ? "NEW" : "OLD", hand, weapon, IsGunImpl(weapon) ? (*(uintptr_t*)weapon == GameInfo::Base() + kVtGun ? "gun" : IsLauncher(weapon) ? "wrist launcher" : "crossbow") : "other", (void*)ent,
          sp[0], sp[1], sp[2], spawn[0], spawn[1], spawn[2], aimPoint[0], aimPoint[1], aimPoint[2], bolt[0], bolt[1], bolt[2], gun, old,
          oldOrg ? oldOrg[0] : 0.f, oldOrg ? oldOrg[1] : 0.f, oldOrg ? oldOrg[2] : 0.f, cam ? eye[0] : 0.f, cam ? eye[1] : 0.f, cam ? eye[2] : 0.f, spread);
     (void)oldAxis;
@@ -1264,5 +1586,9 @@ std::string GunRay::Stats()
                        g_Mode.load(), g_Spread.load(), g_Submits.load(), g_Aimed.load(), g_Results.load(), g_Hits.load(), g_Sweeps.load(), g_SweepHits.load(), g_SensorUsed.load(),
                        sens ? (hit ? "hit" : "range") : "none", t, g_AimSet.load(), g_ShotsNew.load(), g_ShotsOld.load(), g_NoPose.load(), g_NComps,
                        g_Cache[0].valid ? fmt::format("({:.3f},{:.3f},{:.3f})", g_Cache[0].sp[0], g_Cache[0].sp[1], g_Cache[0].sp[2]) : std::string("-"),
-                       g_Cache[1].valid ? fmt::format("({:.3f},{:.3f},{:.3f})", g_Cache[1].sp[0], g_Cache[1].sp[1], g_Cache[1].sp[2]) : std::string("-"));
+                       g_Cache[1].valid ? fmt::format("({:.3f},{:.3f},{:.3f})", g_Cache[1].sp[0], g_Cache[1].sp[1], g_Cache[1].sp[2]) : std::string("-"))
+           + " | " + HandTraceStatus()
+           + fmt::format(" | wrist fx: joints carried onto the drawn launcher {} (on pieces hung off it {}), already moved by HandFx {}, no pose {}, last gap {:.3f} m; fx re-placed {}, started {}; binds of pieces left to the GPU {}; pieces L {} {} R {} {}",
+                         g_WristJointMoved.load(), g_WristKidJointMoved.load(), g_WristJointByHandFx.load(), g_WristNoPose.load(), g_WristGap.load(),
+                         g_WristFxMoved.load(), g_WristFxStarts.load(), g_WristKidBinds.load(), g_WristKid[0][0].load(), g_WristKid[0][1].load(), g_WristKid[1][0].load(), g_WristKid[1][1].load());
 }

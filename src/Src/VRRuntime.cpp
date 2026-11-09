@@ -407,7 +407,12 @@ void VRRuntime::OnPresent(IDXGISwapChain* sc)
                 // its right view is already built (the pipeline: view N+1 is built before image N is presented); when
                 // it is not (the hold was refused), this left image goes to both eyes now instead of waiting for nothing
                 const ViewMatrixHook::XrPose next = rp.valid ? ViewMatrixHook::RenderPoseXr(rp.serial + 1) : ViewMatrixHook::XrPose();
-                const bool rightComing = next.valid && next.eye == 1 && next.pair == rp.pair;
+                // DOTO: the game presents an image BEFORE it builds the next frame's view (Dishonored 2 built view N+1 first),
+                // so at the left image's Present its right view usually does not exist yet: then StereoSync's pending right
+                // (the next RunFrame will be held for this pair; rp is the latest view) says it is coming. If it then does not
+                // come, the next image goes out alone (mono) as before and this staged left is never paired.
+                const bool rightComing = (next.valid && next.eye == 1 && next.pair == rp.pair)
+                                      || (!next.valid && StereoSync::PendingRight());
                 // (vr syncdbg 256, test of the health check: no left image is ever staged, so no pair forms)
                 if (rp.valid && rp.eye == 0 && rp.pair && !rp.flat && g_Session.OrthoReady() && !g_DropThis && rightComing && !(StereoSync::Debug() & 256))
                 {
